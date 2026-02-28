@@ -443,6 +443,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentium"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "client",
+ "clock",
+ "db",
+ "fs",
+ "gpui",
+ "http_client",
+ "language",
+ "node_runtime",
+ "parking_lot",
+ "project",
+ "release_channel",
+ "semver",
+ "session",
+ "settings",
+ "terminal",
+ "terminal_view",
+ "theme",
+ "ui",
+ "util",
+ "uuid",
+ "workspace",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
