@@ -437,8 +437,28 @@ dependencies = [
 name = "agentium"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "client",
+ "clock",
+ "db",
+ "fs",
  "gpui",
  "gpui_platform",
+ "http_client",
+ "language",
+ "node_runtime",
+ "project",
+ "release_channel",
+ "semver",
+ "session",
+ "settings",
+ "terminal",
+ "terminal_view",
+ "theme",
+ "ui",
+ "util",
+ "uuid",
+ "workspace",
 ]
 
 [[package]]

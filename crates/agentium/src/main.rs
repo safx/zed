@@ -1,35 +1,110 @@
+use std::sync::Arc;
+
 use gpui::*;
 use gpui_platform::application;
-
-struct AgentiumApp;
-
-impl Render for AgentiumApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .size_full()
-            .justify_center()
-            .items_center()
-            .bg(rgb(0x1e1e2e))
-            .text_color(rgb(0xcdd6f4))
-            .child(agentium::app_name())
-    }
-}
+use util::ResultExt as _;
 
 fn main() {
     application().run(|cx: &mut App| {
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(800.0), px(600.0)),
-                    cx,
-                ))),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| AgentiumApp),
-        )
-        .expect("failed to open window");
-        cx.activate(true);
+        release_channel::init(semver::Version::new(0, 1, 0), cx);
+        settings::init(cx);
+        theme::init(theme::LoadThemes::JustBase, cx);
+
+        let clock = Arc::new(clock::RealSystemClock);
+        let http = Arc::new(http_client::HttpClientWithUrl::new(
+            Arc::new(http_client::BlockedHttpClient::new()),
+            "https://localhost",
+            None,
+        ));
+        let client = client::Client::new(clock, http, cx);
+        client::init(&client, cx);
+        project::Project::init(&client, cx);
+
+        let fs = Arc::new(fs::RealFs::new(
+            None,
+            cx.background_executor().clone(),
+        ));
+        <dyn fs::Fs>::set_global(fs.clone(), cx);
+
+        let languages =
+            Arc::new(language::LanguageRegistry::new(cx.background_executor().clone()));
+        let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
+        let node_runtime = node_runtime::NodeRuntime::unavailable();
+
+        let client_for_window = client.clone();
+        let user_store_for_window = user_store.clone();
+        let languages_for_window = languages.clone();
+        let fs_for_window = fs.clone();
+        let node_runtime_for_window = node_runtime.clone();
+
+        cx.spawn(async move |cx| {
+            let session =
+                session::Session::new(uuid::Uuid::new_v4().to_string()).await;
+
+            cx.update(|cx| {
+                let app_session = cx.new(|cx| session::AppSession::new(session, cx));
+                let workspace_store =
+                    cx.new(|cx| workspace::WorkspaceStore::new(client.clone(), cx));
+
+                let app_state = Arc::new(workspace::AppState {
+                    languages: languages.clone(),
+                    client: client.clone(),
+                    user_store: user_store.clone(),
+                    workspace_store,
+                    fs: fs.clone(),
+                    build_window_options: |_, _| Default::default(),
+                    node_runtime: node_runtime.clone(),
+                    session: app_session,
+                });
+
+                workspace::init(app_state.clone(), cx);
+                terminal_view::init(cx);
+
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                            None,
+                            size(px(1200.0), px(800.0)),
+                            cx,
+                        ))),
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        let project = project::Project::local(
+                            client_for_window,
+                            node_runtime_for_window,
+                            user_store_for_window,
+                            languages_for_window,
+                            fs_for_window,
+                            None,
+                            project::LocalProjectFlags::default(),
+                            cx,
+                        );
+                        let workspace_entity = cx.new(|cx| {
+                            workspace::Workspace::new(
+                                None,
+                                project.clone(),
+                                app_state.clone(),
+                                window,
+                                cx,
+                            )
+                        });
+                        cx.new(|cx| {
+                            agentium::AgentiumApp::new(
+                                workspace_entity,
+                                project,
+                                app_state,
+                                window,
+                                cx,
+                            )
+                        })
+                    },
+                )
+                .log_err();
+
+                cx.activate(true);
+            });
+        })
+        .detach();
     });
 }
