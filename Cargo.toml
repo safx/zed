@@ -6,6 +6,7 @@ members = [
     "crates/action_log",
     "crates/activity_indicator",
     "crates/agent",
+    "crates/agentium",
     "crates/agent_servers",
     "crates/agent_settings",
     "crates/agent_skills",
