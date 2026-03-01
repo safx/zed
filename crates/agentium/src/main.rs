@@ -4,6 +4,11 @@ use gpui::*;
 use util::ResultExt as _;
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--printenv") {
+        util::shell_env::print_env();
+        return;
+    }
+
     Application::new()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
@@ -56,7 +61,6 @@ fn main() {
                     });
 
                     workspace::init(app_state.clone(), cx);
-                    terminal_view::init(cx);
 
                     cx.open_window(
                         WindowOptions {
@@ -87,6 +91,7 @@ fn main() {
                                     cx,
                                 )
                             });
+                            window.set_window_title("Agentium");
                             cx.new(|cx| {
                                 agentium::AgentiumApp::new(
                                     workspace_entity,
