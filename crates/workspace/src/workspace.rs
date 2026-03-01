@@ -5418,7 +5418,13 @@ impl Workspace {
                 });
             }
 
-            self.activate_item(&item, activate_pane, focus_item, window, cx);
+            if !self.activate_item(&item, activate_pane, focus_item, window, cx) {
+                if let Some(ix) = pane.read(cx).index_for_item(&item) {
+                    pane.update(cx, |pane, cx| {
+                        pane.activate_item(ix, activate_pane, focus_item, window, cx);
+                    });
+                }
+            }
             if !allow_new_preview {
                 pane.update(cx, |pane, _| {
                     pane.unpreview_item_if_preview(item.item_id());
@@ -6042,6 +6048,10 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn set_last_active_center_pane(&mut self, pane: &Entity<Pane>) {
+        self.last_active_center_pane = Some(pane.downgrade());
+    }
+
     fn set_active_pane(
         &mut self,
         pane: &Entity<Pane>,
@@ -6338,6 +6348,13 @@ impl Workspace {
 
     pub fn active_pane(&self) -> &Entity<Pane> {
         &self.active_pane
+    }
+
+    pub fn pane_for_open(&self) -> Entity<Pane> {
+        self.last_active_center_pane
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .unwrap_or_else(|| self.active_pane.clone())
     }
 
     pub fn focused_pane(&self, window: &Window, cx: &App) -> Entity<Pane> {
