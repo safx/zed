@@ -367,7 +367,7 @@ impl ProjectDiff {
         })
     }
 
-    fn new(
+    pub fn new(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
         window: &mut Window,
