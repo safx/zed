@@ -14,7 +14,11 @@ fn main() {
         .run(|cx: &mut App| {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
             settings::init(cx);
-            theme::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            
+            *theme::SystemAppearance::global_mut(cx) =
+                theme::SystemAppearance(theme::Appearance::Dark);
+            theme::GlobalTheme::reload_theme(cx);
             load_embedded_fonts(cx);
             let clock = Arc::new(clock::RealSystemClock);
             let http = Arc::new(http_client::HttpClientWithUrl::new(
@@ -61,6 +65,8 @@ fn main() {
                     });
 
                     workspace::init(app_state.clone(), cx);
+                    editor::init(cx);
+                    git_ui::init(cx);
 
                     cx.open_window(
                         WindowOptions {
@@ -82,6 +88,13 @@ fn main() {
                                 project::LocalProjectFlags::default(),
                                 cx,
                             );
+                            if let Ok(cwd) = std::env::current_dir() {
+                                project
+                                    .update(cx, |project, cx| {
+                                        project.find_or_create_worktree(&cwd, true, cx)
+                                    })
+                                    .detach_and_log_err(cx);
+                            }
                             let workspace_entity = cx.new(|cx| {
                                 workspace::Workspace::new(
                                     None,
