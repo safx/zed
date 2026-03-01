@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use gpui::*;
+use settings::{KeymapFile, DEFAULT_KEYMAP_PATH};
 use util::ResultExt as _;
 
 fn main() {
@@ -67,6 +68,13 @@ fn main() {
                     workspace::init(app_state.clone(), cx);
                     editor::init(cx);
                     git_ui::init(cx);
+
+                    if let Some(bindings) =
+                        KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP_PATH, cx)
+                            .log_err()
+                    {
+                        cx.bind_keys(bindings);
+                    }
 
                     cx.open_window(
                         WindowOptions {
