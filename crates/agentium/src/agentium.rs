@@ -417,6 +417,11 @@ impl AgentiumWorkspace {
             },
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, _cx| {
+                        workspace.set_last_active_center_pane(pane);
+                    });
+                }
                 cx.notify();
             }
             _ => {}
