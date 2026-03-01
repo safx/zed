@@ -188,7 +188,7 @@ impl ProjectDiff {
         self.diff.update(cx, |diff, cx| diff.autoscroll(cx));
     }
 
-    fn new(
+    pub fn new(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
         window: &mut Window,
