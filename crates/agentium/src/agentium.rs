@@ -5,15 +5,18 @@ use std::sync::Arc;
 use gpui::{prelude::*, *};
 use project::Project;
 use terminal_view::TerminalView;
-use ui::ActiveTheme;
+use ui::{ActiveTheme, ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     pane, move_active_item, move_item, ActivePaneDecorator, ActivateNextPane, ActivatePane,
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
     AppState, DraggedTab, MoveItemToPane, MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft,
-    MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, SplitDirection, SplitMode,
-    SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, Workspace,
+    MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, SplitDirection, SplitDown,
+    SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown, SwapPaneLeft, SwapPaneRight,
+    SwapPaneUp, ToggleZoom, Workspace,
 };
+
+actions!(agentium, [NewDiffView]);
 
 pub struct AgentiumApp {
     workspaces: Vec<Entity<AgentiumWorkspace>>,
@@ -272,6 +275,23 @@ impl AgentiumWorkspace {
         .detach_and_log_err(cx);
     }
 
+    fn add_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project_diff = cx.new(|cx| {
+            git_ui::project_diff::ProjectDiff::new(
+                self.project.clone(),
+                workspace,
+                window,
+                cx,
+            )
+        });
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(project_diff), true, true, None, window, cx);
+        });
+    }
+
     fn new_pane_with_terminal(
         &mut self,
         clone: bool,
@@ -466,6 +486,11 @@ impl Render for AgentiumWorkspace {
                     .on_action(
                         cx.listener(|this, _: &NewTerminal, window, cx| {
                             this.add_terminal(window, cx);
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &NewDiffView, window, cx| {
+                            this.add_diff_view(window, cx);
                         }),
                     )
                     .on_action(
@@ -715,6 +740,77 @@ fn new_agentium_pane(
         });
 
         pane
+    });
+
+    pane.update(cx, |pane, cx| {
+        pane.set_render_tab_bar_buttons(cx, |pane, _window, cx| {
+            let focus_handle = pane.focus_handle(cx);
+            let right_children = h_flex()
+                .gap(DynamicSpacing::Base02.rems(cx))
+                .child(
+                    PopoverMenu::new("agentium-tab-bar-popover-menu")
+                        .trigger_with_tooltip(
+                            IconButton::new("plus", IconName::Plus)
+                                .icon_size(IconSize::Small),
+                            Tooltip::text("New…"),
+                        )
+                        .anchor(Corner::TopRight)
+                        .with_handle(pane.new_item_context_menu_handle.clone())
+                        .menu(move |_window, cx| {
+                            let focus_handle = focus_handle.clone();
+                            Some(ContextMenu::build(_window, cx, |menu, _, _| {
+                                menu.context(focus_handle.clone())
+                                    .action(
+                                        "New Terminal",
+                                        NewTerminal::default().boxed_clone(),
+                                    )
+                                    .action(
+                                        "New Diff View",
+                                        NewDiffView.boxed_clone(),
+                                    )
+                            }))
+                        }),
+                )
+                .child(
+                    PopoverMenu::new("agentium-pane-tab-bar-split")
+                        .trigger_with_tooltip(
+                            IconButton::new("agentium-pane-split", IconName::Split)
+                                .icon_size(IconSize::Small),
+                            Tooltip::text("Split Pane"),
+                        )
+                        .anchor(Corner::TopRight)
+                        .with_handle(pane.split_item_context_menu_handle.clone())
+                        .menu(|window, cx| {
+                            ContextMenu::build(window, cx, |menu, _, _| {
+                                menu.action("Split Right", SplitRight::default().boxed_clone())
+                                    .action("Split Left", SplitLeft::default().boxed_clone())
+                                    .action("Split Up", SplitUp::default().boxed_clone())
+                                    .action("Split Down", SplitDown::default().boxed_clone())
+                            })
+                            .into()
+                        }),
+                )
+                .child({
+                    let zoomed = pane.is_zoomed();
+                    IconButton::new("toggle_zoom", IconName::Maximize)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(zoomed)
+                        .selected_icon(IconName::Minimize)
+                        .on_click(cx.listener(|pane, _, window, cx| {
+                            pane.toggle_zoom(&ToggleZoom, window, cx);
+                        }))
+                        .tooltip(move |_window, cx| {
+                            Tooltip::for_action(
+                                if zoomed { "Zoom Out" } else { "Zoom In" },
+                                &ToggleZoom,
+                                cx,
+                            )
+                        })
+                })
+                .into_any_element()
+                .into();
+            (None, right_children)
+        });
     });
 
     cx.subscribe_in(&pane, window, AgentiumWorkspace::handle_pane_event)
