@@ -473,10 +473,16 @@ impl Focusable for AgentiumWorkspace {
 
 impl Render for AgentiumWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let search_actions_div = cx
+            .try_global::<workspace::PaneSearchBarCallbacks>()
+            .map(|callbacks| {
+                (callbacks.wrap_div_with_search_actions)(div(), self.active_pane.clone())
+            })
+            .unwrap_or_else(div);
         self.workspace
             .update(cx, |workspace, cx| {
                 let decorator = ActivePaneDecorator::new(&self.active_pane, &self.workspace);
-                div()
+                search_actions_div
                     .size_full()
                     .child(self.center.render(
                         workspace.zoomed_item(),
@@ -670,6 +676,12 @@ fn new_agentium_pane(
                 false
             },
         )));
+
+        let toolbar = pane.toolbar().clone();
+        if let Some(callbacks) = cx.try_global::<workspace::PaneSearchBarCallbacks>() {
+            let languages = Some(project.read(cx).languages().clone());
+            (callbacks.setup_search_bar)(languages, &toolbar, window, cx);
+        }
 
         let drop_project = project.downgrade();
         let drop_agentium_workspace = agentium_workspace.clone();
