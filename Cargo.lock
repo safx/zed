@@ -457,6 +457,7 @@ dependencies = [
  "gpui",
  "http_client",
  "language",
+ "languages",
  "node_runtime",
  "parking_lot",
  "project",
