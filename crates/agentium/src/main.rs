@@ -68,6 +68,18 @@ fn main() {
                     workspace::init(app_state.clone(), cx);
                     editor::init(cx);
                     git_ui::init(cx);
+                    search::init(cx);
+                    cx.set_global(workspace::PaneSearchBarCallbacks {
+                        setup_search_bar: |languages, toolbar, window, cx| {
+                            let search_bar =
+                                cx.new(|cx| search::BufferSearchBar::new(languages, window, cx));
+                            toolbar.update(cx, |toolbar, cx| {
+                                toolbar.add_item(search_bar, window, cx);
+                            });
+                        },
+                        wrap_div_with_search_actions:
+                            search::buffer_search::register_pane_search_actions,
+                    });
 
                     if let Some(bindings) =
                         KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP_PATH, cx)
