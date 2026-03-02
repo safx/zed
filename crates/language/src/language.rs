@@ -79,7 +79,10 @@ use std::{
     ops::{DerefMut, Range},
     path::{Path, PathBuf},
     str,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst},
+    },
 };
 use syntax_map::{QueryCursorHandle, SyntaxSnapshot};
 use task::RunnableTag;
@@ -128,6 +131,15 @@ pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings:
 
 static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
 static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
+static WASM_PARSERS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Disables WASM support for tree-sitter parsers. Must be called before any
+/// parsing occurs. When disabled, parsers are created without a WASM store,
+/// avoiding wasmtime/cranelift initialization that can cause stack overflows
+/// on background threads. Native grammars work without WASM support.
+pub fn disable_wasm_parsers() {
+    WASM_PARSERS_ENABLED.store(false, Ordering::Relaxed);
+}
 
 #[ztracing::instrument(skip_all)]
 pub fn with_parser<F, R>(func: F) -> R
@@ -136,9 +148,11 @@ where
 {
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
         let mut parser = Parser::new();
-        parser
-            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
-            .unwrap();
+        if WASM_PARSERS_ENABLED.load(Ordering::Relaxed) {
+            parser
+                .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+                .unwrap();
+        }
         parser
     });
     // Tree-sitter auto-resets the parser at the end of a successful parse,
