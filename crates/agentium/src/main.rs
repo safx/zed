@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpui::*;
 use settings::{KeymapFile, DEFAULT_KEYMAP_PATH};
+use ui::ActiveTheme;
 use util::ResultExt as _;
 
 fn main() {
@@ -39,6 +40,9 @@ fn main() {
             ));
             let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
             let node_runtime = node_runtime::NodeRuntime::unavailable();
+            
+            language::disable_wasm_parsers();
+            languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
 
             let client_for_window = client.clone();
             let user_store_for_window = user_store.clone();
@@ -69,6 +73,7 @@ fn main() {
                     editor::init(cx);
                     git_ui::init(cx);
                     search::init(cx);
+
                     cx.set_global(workspace::PaneSearchBarCallbacks {
                         setup_search_bar: |languages, toolbar, window, cx| {
                             let search_bar =
@@ -80,6 +85,8 @@ fn main() {
                         wrap_div_with_search_actions:
                             search::buffer_search::register_pane_search_actions,
                     });
+
+                    app_state.languages.set_theme(cx.theme().clone());
 
                     if let Some(bindings) =
                         KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP_PATH, cx)
