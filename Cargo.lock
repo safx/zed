@@ -481,6 +481,7 @@ dependencies = [
  "parking_lot",
  "project",
  "release_channel",
+ "search",
  "semver",
  "session",
  "settings",
