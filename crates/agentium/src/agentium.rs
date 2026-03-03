@@ -796,8 +796,8 @@ fn new_agentium_pane(
                         } else {
                             tab.pane.read(cx).item_for_index(tab.ix)
                         };
-                        if let Some(item) = item {
-                            return item.downcast::<TerminalView>().is_some();
+                        if item.is_some() {
+                            return true;
                         }
                     }
                 }
@@ -831,7 +831,7 @@ fn new_agentium_pane(
                     tab.pane.read(cx).item_for_index(tab.ix)
                 };
                 if let Some(item) = item {
-                    if item.downcast::<TerminalView>().is_some() {
+                    {
                         let source = tab.pane.clone();
                         let item_id_to_move = item.item_id();
 
