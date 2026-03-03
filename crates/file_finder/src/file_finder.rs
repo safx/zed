@@ -121,7 +121,7 @@ impl FileFinder {
         );
     }
 
-    fn open(
+    pub fn open(
         workspace: &mut Workspace,
         separate_history: bool,
         window: &mut Window,

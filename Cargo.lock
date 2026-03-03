@@ -472,6 +472,7 @@ dependencies = [
  "clock",
  "db",
  "editor",
+ "file_finder",
  "fs",
  "git",
  "git_ui",
