@@ -108,7 +108,7 @@ impl FileFinder {
         );
     }
 
-    fn open(
+    pub fn open(
         workspace: &mut Workspace,
         separate_history: bool,
         include_ignored: Option<bool>,
