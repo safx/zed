@@ -6,6 +6,8 @@ use gpui::{prelude::*, *};
 use project::Project;
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
 use markdown_preview::{OpenPreview, OpenPreviewToTheSide};
+use search::ProjectSearchView;
+use search::project_search::{ProjectSearch, ProjectSearchBar};
 use terminal_view::TerminalView;
 use ui::{ActiveTheme, ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -18,7 +20,7 @@ use workspace::{
     SwapPaneUp, ToggleZoom, Workspace,
 };
 
-actions!(agentium, [NewDiffView]);
+actions!(agentium, [NewDiffView, NewProjectSearch]);
 
 pub struct AgentiumApp {
     workspaces: Vec<Entity<AgentiumWorkspace>>,
@@ -292,6 +294,16 @@ impl AgentiumWorkspace {
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(project_diff), true, true, None, window, cx);
+        });
+    }
+
+    fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project_search = cx.new(|cx| ProjectSearch::new(self.project.clone(), cx));
+        let view = cx.new(|cx| {
+            ProjectSearchView::new(self.workspace.clone(), project_search, window, cx, None)
+        });
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(view), true, true, None, window, cx);
         });
     }
 
@@ -599,6 +611,11 @@ impl Render for AgentiumWorkspace {
                         }),
                     )
                     .on_action(
+                        cx.listener(|this, _: &NewProjectSearch, window, cx| {
+                            this.add_project_search(window, cx);
+                        }),
+                    )
+                    .on_action(
                         cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                             this.activate_pane_in_direction(SplitDirection::Left, window, cx);
                         }),
@@ -777,6 +794,11 @@ fn new_agentium_pane(
             (callbacks.setup_search_bar)(languages, &toolbar, window, cx);
         }
 
+        let project_search_bar = cx.new(|_| ProjectSearchBar::new());
+        toolbar.update(cx, |toolbar, cx| {
+            toolbar.add_item(project_search_bar, window, cx);
+        });
+
         let drop_project = project.downgrade();
         let drop_agentium_workspace = agentium_workspace.clone();
         let drop_workspace = workspace.clone();
@@ -878,6 +900,10 @@ fn new_agentium_pane(
                                     .action(
                                         "New Diff View",
                                         NewDiffView.boxed_clone(),
+                                    )
+                                    .action(
+                                        "New Project Search",
+                                        NewProjectSearch.boxed_clone(),
                                     )
                             }))
                         }),
