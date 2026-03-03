@@ -24,6 +24,7 @@ client.workspace = true
 db.workspace = true
 editor.workspace = true
 fs.workspace = true
+git.workspace = true
 git_ui.workspace = true
 gpui.workspace = true
 http_client.workspace = true
