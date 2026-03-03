@@ -28,3 +28,11 @@ languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
 ```
 
 A Cargo feature flag approach (gating `tree-sitter/wasm` behind a `language` crate feature) would be cleaner but requires changes across 5 files (workspace Cargo.toml, language, languages, agentium Cargo.toml) due to feature unification in the dependency chain.
+
+## Workspace entity is not in the element tree
+
+Agentium's rendering hierarchy is `AgentiumApp` → `AgentiumWorkspace` → `PaneGroup` → `Pane`. The `Workspace` entity exists but is **not rendered** — it is used only as a data store (project, languages, etc.).
+
+Many Zed crates register action handlers on `Workspace` via `workspace.register_action(...)` inside `cx.observe_new`. These handlers are unreachable in agentium because GPUI dispatches actions by bubbling up through the element tree, which does not include `Workspace`.
+
+When integrating a Zed crate that registers workspace actions (e.g. `markdown_preview::init`), you must also register equivalent action handlers on `AgentiumWorkspace`'s rendered element via `.on_action(cx.listener(...))` in its `render` method. Use `self.workspace.upgrade()` and `workspace_entity.update(cx, ...)` to access `Workspace` state (project, languages, weak handle) needed by the crate's public API.

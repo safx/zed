@@ -73,6 +73,7 @@ fn main() {
                     editor::init(cx);
                     git_ui::init(cx);
                     search::init(cx);
+                    markdown_preview::init(cx);
 
                     cx.set_global(workspace::PaneSearchBarCallbacks {
                         setup_search_bar: |languages, toolbar, window, cx| {
