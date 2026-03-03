@@ -17,10 +17,10 @@ use workspace::notifications::NotifyResultExt as _;
 use workspace::{
     Item, pane, move_active_item, move_item, ActivePaneDecorator, ActivateNextPane, ActivatePane,
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
-    AppState, DraggedTab, MoveItemToPane, MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft,
-    MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, SplitDirection, SplitDown,
-    SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown, SwapPaneLeft, SwapPaneRight,
-    SwapPaneUp, ToggleZoom, Workspace,
+    AppState, DraggedTab, ModalLayer, MoveItemToPane, MoveItemToPaneInDirection, MovePaneDown,
+    MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, SplitDirection,
+    SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown, SwapPaneLeft,
+    SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
 };
 
 actions!(agentium, [NewDiffView, NewProjectSearch, NewGitStatus]);
@@ -43,6 +43,7 @@ struct AgentiumWorkspace {
     center: PaneGroup,
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
+    modal_layer: Entity<ModalLayer>,
 }
 
 impl AgentiumApp {
@@ -70,9 +71,10 @@ impl AgentiumApp {
         let name = format!("Workspace {}", workspace_id + 1);
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
+        let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
 
         let workspace_entity = cx.new(|cx| {
-            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, window, cx)
+            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, modal_layer, window, cx)
         });
 
         self.workspaces.push(workspace_entity.clone());
@@ -210,6 +212,7 @@ impl AgentiumWorkspace {
         name: String,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
+        modal_layer: Entity<ModalLayer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -250,6 +253,7 @@ impl AgentiumWorkspace {
             center,
             workspace,
             project,
+            modal_layer,
         }
     }
 
@@ -601,7 +605,38 @@ impl Render for AgentiumWorkspace {
             })
             .ok()
             .map(|pane_group| {
-                pane_group
+                let mut context = KeyContext::new_with_defaults();
+                context.add("Workspace");
+
+                div()
+                    .key_context(context)
+                    .relative()
+                    .size_full()
+                    .on_action(
+                        cx.listener(|this, action: &ToggleFileFinder, window, cx| {
+                            let Some(workspace) = this.workspace.upgrade() else {
+                                return;
+                            };
+                            workspace.update(cx, |workspace, cx| {
+                                if workspace
+                                    .active_modal::<file_finder::FileFinder>(cx)
+                                    .is_some()
+                                {
+                                    workspace.hide_modal(window, cx);
+                                } else {
+                                    file_finder::FileFinder::open(
+                                        workspace,
+                                        action.separate_history,
+                                        window,
+                                        cx,
+                                    )
+                                    .detach();
+                                }
+                            });
+                        }),
+                    )
+                    .child(
+                        pane_group
                     .on_action(
                         cx.listener(|this, _: &OpenPreview, window, cx| {
                             this.open_markdown_preview(false, window, cx);
@@ -745,6 +780,8 @@ impl Render for AgentiumWorkspace {
                             }
                         },
                     ))
+                    )
+                    .child(self.modal_layer.clone())
             })
             .unwrap_or_else(|| div().size_full())
     }
