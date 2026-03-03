@@ -449,6 +449,7 @@ dependencies = [
  "http_client",
  "language",
  "languages",
+ "markdown_preview",
  "node_runtime",
  "parking_lot",
  "project",
