@@ -137,7 +137,7 @@ impl MarkdownPreviewView {
         });
     }
 
-    fn find_existing_independent_preview_item_idx(
+    pub fn find_existing_independent_preview_item_idx(
         pane: &Pane,
         editor: &Entity<Editor>,
         cx: &App,
