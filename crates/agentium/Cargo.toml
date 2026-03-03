@@ -28,6 +28,7 @@ git_ui.workspace = true
 gpui.workspace = true
 http_client.workspace = true
 language.workspace = true
+markdown_preview.workspace = true
 languages = { workspace = true, features = ["load-grammars"] }
 node_runtime.workspace = true
 parking_lot.workspace = true

@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use gpui::{prelude::*, *};
 use project::Project;
+use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
+use markdown_preview::{OpenPreview, OpenPreviewToTheSide};
 use terminal_view::TerminalView;
 use ui::{ActiveTheme, ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -106,6 +108,7 @@ impl Render for AgentiumApp {
             .flex_row()
             .size_full()
             .bg(colors.background)
+            .text_color(colors.text)
             .child(
                 div()
                     .flex()
@@ -453,6 +456,73 @@ impl AgentiumWorkspace {
         }
     }
 
+    fn open_markdown_preview(
+        &mut self,
+        side: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_entity) = self.workspace.upgrade() else {
+            return;
+        };
+        let active_pane = self.active_pane.clone();
+        let Some(editor) = active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.act_as::<editor::Editor>(cx))
+        else {
+            return;
+        };
+        if !MarkdownPreviewView::is_markdown_file(&editor, cx) {
+            return;
+        }
+
+        let target_pane = if side {
+            let right_pane = self
+                .center
+                .find_pane_in_direction(&self.active_pane, SplitDirection::Right, cx)
+                .cloned();
+            match right_pane {
+                Some(pane) => pane,
+                None => {
+                    let new_pane = new_agentium_pane(
+                        self.workspace.clone(),
+                        self.project.clone(),
+                        window,
+                        cx,
+                    );
+                    self.center
+                        .split(&active_pane, &new_pane, SplitDirection::Right, cx)
+                        .log_err();
+                    new_pane
+                }
+            }
+        } else {
+            active_pane.clone()
+        };
+
+        workspace_entity.update(cx, |workspace, cx| {
+            let language_registry = workspace.project().read(cx).languages().clone();
+            let workspace_handle = workspace.weak_handle();
+            let view = MarkdownPreviewView::new(
+                MarkdownPreviewMode::Default,
+                editor.clone(),
+                workspace_handle,
+                language_registry,
+                window,
+                cx,
+            );
+            target_pane.update(cx, |pane, cx| {
+                let focus = !side;
+                pane.add_item(Box::new(view), focus, focus, None, window, cx);
+            });
+        });
+
+        if side {
+            editor.focus_handle(cx).focus(window, cx);
+        }
+    }
+
     fn move_pane_to_border(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
         if self
             .center
@@ -494,6 +564,16 @@ impl Render for AgentiumWorkspace {
             .ok()
             .map(|pane_group| {
                 pane_group
+                    .on_action(
+                        cx.listener(|this, _: &OpenPreview, window, cx| {
+                            this.open_markdown_preview(false, window, cx);
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &OpenPreviewToTheSide, window, cx| {
+                            this.open_markdown_preview(true, window, cx);
+                        }),
+                    )
                     .on_action(
                         cx.listener(|this, _: &NewTerminal, window, cx| {
                             this.add_terminal(window, cx);
