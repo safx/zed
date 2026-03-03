@@ -501,6 +501,20 @@ impl AgentiumWorkspace {
             active_pane.clone()
         };
 
+        let existing_preview_idx =
+            MarkdownPreviewView::find_existing_independent_preview_item_idx(
+                target_pane.read(cx),
+                &editor,
+                cx,
+            );
+
+        if let Some(existing_idx) = existing_preview_idx {
+            target_pane.update(cx, |pane, cx| {
+                pane.activate_item(existing_idx, true, true, window, cx);
+            });
+            return;
+        }
+
         workspace_entity.update(cx, |workspace, cx| {
             let language_registry = workspace.project().read(cx).languages().clone();
             let workspace_handle = workspace.weak_handle();
