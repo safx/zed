@@ -473,6 +473,7 @@ dependencies = [
  "db",
  "editor",
  "fs",
+ "git",
  "git_ui",
  "gpui",
  "http_client",
