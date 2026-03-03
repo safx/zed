@@ -8107,6 +8107,10 @@ impl Workspace {
         })
     }
 
+    pub fn modal_layer(&self) -> &Entity<ModalLayer> {
+        &self.modal_layer
+    }
+
     pub fn hide_modal(&mut self, window: &mut Window, cx: &mut App) -> bool {
         self.modal_layer
             .update(cx, |modal_layer, cx| modal_layer.hide_modal(window, cx))

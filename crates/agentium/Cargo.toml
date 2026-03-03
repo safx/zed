@@ -23,6 +23,7 @@ clock.workspace = true
 client.workspace = true
 db.workspace = true
 editor.workspace = true
+file_finder.workspace = true
 fs.workspace = true
 git.workspace = true
 git_ui.workspace = true
