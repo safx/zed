@@ -18,9 +18,10 @@ use workspace::{
     Item, pane, move_active_item, move_item, ActivePaneDecorator, ActivateNextPane, ActivatePane,
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
     AppState, DraggedTab, ModalLayer, MoveItemToPane, MoveItemToPaneInDirection, MovePaneDown,
-    MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, SplitDirection,
-    SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown, SwapPaneLeft,
-    SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
+    MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, Save, SaveAs,
+    SaveIntent, SaveWithoutFormat, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight,
+    SplitUp, SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom,
+    Workspace,
 };
 
 actions!(agentium, [NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
@@ -282,6 +283,26 @@ impl AgentiumWorkspace {
                     pane.add_item(terminal_view, true, true, None, window, cx);
                 });
             })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn save_active_item(
+        &self,
+        save_intent: SaveIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.project.clone();
+        let pane = self.active_pane.downgrade();
+        let item = self.active_pane.read(cx).active_item();
+        cx.spawn_in(window, async move |_this, cx| {
+            if let Some(item) = item {
+                Pane::save_item(project, &pane, item.as_ref(), save_intent, cx)
+                    .await
+                    .map(|_| ())?;
+            }
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -657,6 +678,29 @@ impl Render for AgentiumWorkspace {
                                     .detach();
                                 }
                             });
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, action: &Save, window, cx| {
+                            this.save_active_item(
+                                action.save_intent.unwrap_or(SaveIntent::Save),
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &SaveWithoutFormat, window, cx| {
+                            this.save_active_item(
+                                SaveIntent::SaveWithoutFormat,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &SaveAs, window, cx| {
+                            this.save_active_item(SaveIntent::SaveAs, window, cx);
                         }),
                     )
                     .child(
