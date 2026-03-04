@@ -66,7 +66,30 @@ impl AgentiumApp {
         }
     }
 
+    pub fn add_workspace_with_path(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(&path, true, cx)
+            })
+            .detach_and_log_err(cx);
+        self.add_workspace_inner(Some(path), window, cx);
+    }
+
     fn add_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_workspace_inner(None, window, cx);
+    }
+
+    fn add_workspace_inner(
+        &mut self,
+        working_directory: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let workspace_id = self.next_workspace_id;
         self.next_workspace_id += 1;
         let name = format!("Workspace {}", workspace_id + 1);
@@ -75,7 +98,7 @@ impl AgentiumApp {
         let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
 
         let workspace_entity = cx.new(|cx| {
-            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, modal_layer, window, cx)
+            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, modal_layer, working_directory, window, cx)
         });
 
         self.workspaces.push(workspace_entity.clone());
@@ -214,6 +237,7 @@ impl AgentiumWorkspace {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         modal_layer: Entity<ModalLayer>,
+        working_directory: Option<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -221,7 +245,7 @@ impl AgentiumWorkspace {
         let center = PaneGroup::new(pane.clone());
 
         let terminal_task = project.update(cx, |project, cx| {
-            project.create_terminal_shell(None, cx)
+            project.create_terminal_shell(working_directory, cx)
         });
         let workspace_weak = workspace.clone();
         let project_weak = project.downgrade();
