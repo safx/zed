@@ -76,6 +76,13 @@ fn main() {
                     file_finder::init(cx);
                     markdown_preview::init(cx);
 
+                    settings::SettingsStore::update_global(cx, |store, cx| {
+                        _ = store.set_user_settings(
+                            r#"{"active_pane_modifiers": {"inactive_opacity": 0.65}}"#,
+                            cx,
+                        );
+                    });
+
                     cx.set_global(workspace::PaneSearchBarCallbacks {
                         setup_search_bar: |languages, toolbar, window, cx| {
                             let search_bar =
