@@ -1,5 +1,6 @@
 use std::cmp;
 use std::ops::{ControlFlow, Range};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use git_ui::git_status_icon;
@@ -35,11 +36,13 @@ pub struct AgentiumApp {
     app_state: Arc<AppState>,
     next_workspace_id: usize,
     focus_handle: FocusHandle,
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 struct AgentiumWorkspace {
     id: usize,
     name: String,
+    working_directory: Option<PathBuf>,
     active_pane: Entity<Pane>,
     center: PaneGroup,
     workspace: WeakEntity<Workspace>,
@@ -55,6 +58,11 @@ impl AgentiumApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let git_store = project.read(cx).git_store().clone();
+        let git_subscription = cx.subscribe(&git_store, |_this, _, _event: &GitStoreEvent, cx| {
+            cx.notify();
+        });
+
         Self {
             workspaces: Vec::new(),
             active_workspace_index: None,
@@ -63,12 +71,13 @@ impl AgentiumApp {
             app_state,
             next_workspace_id: 0,
             focus_handle: cx.focus_handle(),
+            _subscriptions: vec![git_subscription],
         }
     }
 
     pub fn add_workspace_with_path(
         &mut self,
-        path: std::path::PathBuf,
+        path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -86,13 +95,15 @@ impl AgentiumApp {
 
     fn add_workspace_inner(
         &mut self,
-        working_directory: Option<std::path::PathBuf>,
+        working_directory: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let workspace_id = self.next_workspace_id;
         self.next_workspace_id += 1;
-        let name = format!("Workspace {}", workspace_id + 1);
+
+        let name = self.resolve_workspace_name(working_directory.as_deref(), workspace_id, cx);
+
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
         let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
@@ -121,6 +132,81 @@ impl AgentiumApp {
         self.active_workspace_index
             .and_then(|i| self.workspaces.get(i))
     }
+
+    fn resolve_workspace_name(
+        &self,
+        working_directory: Option<&std::path::Path>,
+        fallback_id: usize,
+        cx: &App,
+    ) -> String {
+        let effective_path = working_directory
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                self.project
+                    .read(cx)
+                    .worktrees(cx)
+                    .next()
+                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+            });
+
+        let effective_path = match effective_path {
+            Some(path) => path,
+            None => return format!("Workspace {}", fallback_id + 1),
+        };
+
+        // a. Remote repository name from matching git repo
+        let git_store = self.project.read(cx).git_store().read(cx);
+        let matching_repo = git_store.repositories().values().find(|repo| {
+            let repo_path = &repo.read(cx).work_directory_abs_path;
+            effective_path.starts_with(repo_path.as_ref())
+        });
+
+        if let Some(repo) = matching_repo {
+            let repo = repo.read(cx);
+
+            if let Some(name) = repo.remote_origin_url.as_deref().and_then(repo_name_from_url) {
+                return name.to_string();
+            }
+        }
+
+        // b. Worktree root_name
+        let worktree_name = self.project.read(cx).worktrees(cx).find_map(|wt| {
+            let wt = wt.read(cx);
+            let wt_path = wt.abs_path();
+            if effective_path.starts_with(wt_path.as_ref())
+            {
+                let name = wt.root_name_str();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+            None
+        });
+
+        if let Some(name) = worktree_name {
+            return name;
+        }
+
+        // c. Git repository work directory path's last component
+        if let Some(repo) = matching_repo {
+            let repo_path = &repo.read(cx).work_directory_abs_path;
+            if let Some(name) = repo_path.file_name() {
+                return name.to_string_lossy().to_string();
+            }
+        }
+
+        format!("Workspace {}", fallback_id + 1)
+    }
+}
+
+fn repo_name_from_url(url: &str) -> Option<&str> {
+    let path = url
+        .strip_suffix(".git")
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    path.rsplit('/').next()
+        .or_else(|| path.rsplit(':').next())
+        .filter(|name| !name.is_empty())
 }
 
 impl Focusable for AgentiumApp {
@@ -144,7 +230,7 @@ impl Render for AgentiumApp {
                 div()
                     .flex()
                     .flex_col()
-                    .w(px(220.0))
+                    .w(px(240.0))
                     .h_full()
                     .bg(colors.panel_background)
                     .border_r_1()
@@ -166,6 +252,39 @@ impl Render for AgentiumApp {
                                 |(i, workspace_entity)| {
                                     let workspace = workspace_entity.read(cx);
                                     let is_active = Some(i) == active_index;
+
+                                    let effective_path = workspace.working_directory.clone().or_else(|| {
+                                        self.project
+                                            .read(cx)
+                                            .worktrees(cx)
+                                            .next()
+                                            .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                                    });
+
+                                    let display_path = effective_path.as_ref().map(|path| {
+                                        let home = util::paths::home_dir();
+                                        if let Ok(rel) = path.strip_prefix(home) {
+                                            format!("~/{}", rel.display())
+                                        } else {
+                                            path.display().to_string()
+                                        }
+                                    });
+
+                                    let git_info = effective_path.as_ref().and_then(|working_dir| {
+                                        let git_store = self.project.read(cx).git_store().read(cx);
+                                        git_store.repositories().values().find_map(|repo| {
+                                            let repo = repo.read(cx);
+                                            let repo_path = &repo.work_directory_abs_path;
+                                            if working_dir.starts_with(repo_path.as_ref()) {
+                                                let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
+                                                let summary = repo.status_summary();
+                                                Some((branch_name, summary))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    });
+
                                     div()
                                         .id(("workspace", workspace.id))
                                         .px_2()
@@ -173,14 +292,58 @@ impl Render for AgentiumApp {
                                         .mx_1()
                                         .my_px()
                                         .rounded_md()
-                                        .text_sm()
                                         .text_color(colors.text)
                                         .cursor_pointer()
                                         .when(is_active, |d| d.bg(colors.element_selected))
                                         .when(!is_active, |d: Stateful<Div>| {
                                             d.hover(|d| d.bg(colors.element_hover))
                                         })
-                                        .child(workspace.name.clone())
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(workspace.name.clone()),
+                                        )
+                                        .when_some(display_path, |d, path| {
+                                            d.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(colors.text_muted)
+                                                    .child(path),
+                                            )
+                                        })
+                                        .when_some(git_info, |d, (branch, summary)| {
+                                            use std::fmt::Write;
+                                            let mut label = String::new();
+                                            if let Some(branch_name) = branch {
+                                                write!(&mut label, "\u{2387} {branch_name}").ok();
+                                            }
+                                            let added = summary.index.added + summary.worktree.added + summary.untracked;
+                                            let modified = summary.index.modified + summary.worktree.modified;
+                                            let deleted = summary.index.deleted + summary.worktree.deleted;
+                                            if added > 0 {
+                                                if !label.is_empty() { label.push_str("  "); }
+                                                write!(&mut label, "+{added}").ok();
+                                            }
+                                            if modified > 0 {
+                                                if !label.is_empty() { label.push_str("  "); }
+                                                write!(&mut label, "~{modified}").ok();
+                                            }
+                                            if deleted > 0 {
+                                                if !label.is_empty() { label.push_str("  "); }
+                                                write!(&mut label, "-{deleted}").ok();
+                                            }
+                                            if label.is_empty() {
+                                                d
+                                            } else {
+                                                d.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors.text_muted)
+                                                        .child(label),
+                                                )
+                                            }
+                                        })
                                         .on_click(cx.listener(
                                             move |this, _, window, cx| {
                                                 this.switch_workspace(i, window, cx)
@@ -237,7 +400,7 @@ impl AgentiumWorkspace {
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         modal_layer: Entity<ModalLayer>,
-        working_directory: Option<std::path::PathBuf>,
+        working_directory: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -245,7 +408,7 @@ impl AgentiumWorkspace {
         let center = PaneGroup::new(pane.clone());
 
         let terminal_task = project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            project.create_terminal_shell(working_directory.clone(), cx)
         });
         let workspace_weak = workspace.clone();
         let project_weak = project.downgrade();
@@ -274,6 +437,7 @@ impl AgentiumWorkspace {
         Self {
             id,
             name,
+            working_directory,
             active_pane: pane,
             center,
             workspace,
