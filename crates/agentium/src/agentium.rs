@@ -23,7 +23,7 @@ use workspace::{
     SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
 };
 
-actions!(agentium, [NewDiffView, NewProjectSearch, NewGitStatus]);
+actions!(agentium, [NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
 
 pub struct AgentiumApp {
     workspaces: Vec<Entity<AgentiumWorkspace>>,
@@ -302,6 +302,30 @@ impl AgentiumWorkspace {
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(project_diff), true, true, None, window, cx);
         });
+    }
+
+    fn add_branch_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = self.project.clone();
+        let active_pane = self.active_pane.clone();
+        cx.spawn_in(window, async move |_this, cx| {
+            let project_diff = cx
+                .update(|window, cx| {
+                    git_ui::project_diff::ProjectDiff::new_with_default_branch(
+                        project, workspace, window, cx,
+                    )
+                })?
+                .await?;
+            cx.update(|window, cx| {
+                active_pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(project_diff), true, true, None, window, cx);
+                });
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -658,6 +682,11 @@ impl Render for AgentiumWorkspace {
                         }),
                     )
                     .on_action(
+                        cx.listener(|this, _: &NewBranchDiff, window, cx| {
+                            this.add_branch_diff(window, cx);
+                        }),
+                    )
+                    .on_action(
                         cx.listener(|this, _: &NewProjectSearch, window, cx| {
                             this.add_project_search(window, cx);
                         }),
@@ -954,6 +983,10 @@ fn new_agentium_pane(
                                     .action(
                                         "New Diff View",
                                         NewDiffView.boxed_clone(),
+                                    )
+                                    .action(
+                                        "New Branch Diff",
+                                        NewBranchDiff.boxed_clone(),
                                     )
                                     .action(
                                         "New Project Search",
