@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 assets.workspace = true
 clock.workspace = true
 client.workspace = true
@@ -25,6 +26,7 @@ db.workspace = true
 editor.workspace = true
 file_finder.workspace = true
 fs.workspace = true
+futures.workspace = true
 git.workspace = true
 git_ui.workspace = true
 gpui.workspace = true
