@@ -244,7 +244,7 @@ impl ProjectDiff {
         })
     }
 
-    fn new_with_default_branch(
+    pub fn new_with_default_branch(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
         window: &mut Window,
