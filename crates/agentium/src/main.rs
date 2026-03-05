@@ -2,7 +2,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use futures::StreamExt as _;
 use gpui::*;
 use settings::{KeymapFile, DEFAULT_KEYMAP_PATH};
@@ -21,6 +21,12 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    /// Generate shell completions
+    Completions {
+        /// The shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -99,6 +105,15 @@ fn main() {
     let args = Args::parse();
 
     let initial_workspace_path = match args.command {
+        Some(Command::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut Args::command(),
+                "agentium",
+                &mut std::io::stdout(),
+            );
+            return;
+        }
         Some(Command::Workspace {
             action: WorkspaceAction::New { path },
         }) => match std::fs::canonicalize(&path) {
