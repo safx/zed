@@ -261,13 +261,8 @@ impl Render for AgentiumApp {
                                             .map(|wt| wt.read(cx).abs_path().to_path_buf())
                                     });
 
-                                    let display_path = effective_path.as_ref().map(|path| {
-                                        let home = util::paths::home_dir();
-                                        if let Ok(rel) = path.strip_prefix(home) {
-                                            format!("~/{}", rel.display())
-                                        } else {
-                                            path.display().to_string()
-                                        }
+                                    let display_path = effective_path.as_ref().and_then(|path| {
+                                        path.file_name().map(|name| name.to_string_lossy().to_string())
                                     });
 
                                     let git_info = effective_path.as_ref().and_then(|working_dir| {
