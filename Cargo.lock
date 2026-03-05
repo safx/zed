@@ -449,6 +449,7 @@ dependencies = [
  "anyhow",
  "assets",
  "clap",
+ "clap_complete",
  "client",
  "clock",
  "db",
