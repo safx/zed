@@ -23,3 +23,11 @@ Requires Metal Toolchain on macOS:
 ```
 xcodebuild -downloadComponent MetalToolchain
 ```
+
+
+## completion
+
+#### zsh
+```
+if command -v agentium >/dev/null 2>&1; then eval "$(command agentium completions zsh)"; fi
+```
