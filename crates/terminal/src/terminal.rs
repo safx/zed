@@ -2977,6 +2977,15 @@ impl Terminal {
         }
     }
 
+    pub fn foreground_process_name(&self) -> Option<String> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => {
+                info.current.read().as_ref().map(|process| process.name.clone())
+            }
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
     pub fn task(&self) -> Option<&TaskState> {
         self.task.as_ref()
     }

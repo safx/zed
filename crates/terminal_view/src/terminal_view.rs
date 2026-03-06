@@ -873,6 +873,14 @@ impl TerminalView {
         &self.terminal
     }
 
+    fn is_claude_code_running(&self, cx: &App) -> bool {
+        let terminal = self.terminal().read(cx);
+        if terminal.task().is_some() {
+            return false;
+        }
+        terminal.foreground_process_name().as_deref() == Some("claude")
+    }
+
     pub fn set_block_below_cursor(
         &mut self,
         block: BlockProperties,
@@ -1462,37 +1470,46 @@ impl Item for TerminalView {
     }
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        let is_claude = self.is_claude_code_running(cx);
+
         let terminal = self.terminal().read(cx);
-        let title = self
-            .custom_title
-            .as_ref()
-            .filter(|title| !title.trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| terminal.title(true));
+        let title = if is_claude {
+            "Claude".to_string()
+        } else {
+            self.custom_title
+                .as_ref()
+                .filter(|title| !title.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| terminal.title(true))
+        };
 
-        let (icon, icon_color, rerun_button) = match terminal.task() {
-            Some(terminal_task) => match &terminal_task.status {
-                TaskStatus::Running => (
-                    IconName::PlayFilled,
-                    Color::Disabled,
-                    TerminalView::rerun_button(terminal_task),
-                ),
-                TaskStatus::Unknown => (
-                    IconName::Warning,
-                    Color::Warning,
-                    TerminalView::rerun_button(terminal_task),
-                ),
-                TaskStatus::Completed { success } => {
-                    let rerun_button = TerminalView::rerun_button(terminal_task);
+        let (icon, icon_color, rerun_button) = if is_claude {
+            (IconName::AiClaude, Color::Muted, None)
+        } else {
+            match terminal.task() {
+                Some(terminal_task) => match &terminal_task.status {
+                    TaskStatus::Running => (
+                        IconName::PlayFilled,
+                        Color::Disabled,
+                        TerminalView::rerun_button(terminal_task),
+                    ),
+                    TaskStatus::Unknown => (
+                        IconName::Warning,
+                        Color::Warning,
+                        TerminalView::rerun_button(terminal_task),
+                    ),
+                    TaskStatus::Completed { success } => {
+                        let rerun_button = TerminalView::rerun_button(terminal_task);
 
-                    if *success {
-                        (IconName::Check, Color::Success, rerun_button)
-                    } else {
-                        (IconName::XCircle, Color::Error, rerun_button)
+                        if *success {
+                            (IconName::Check, Color::Success, rerun_button)
+                        } else {
+                            (IconName::XCircle, Color::Error, rerun_button)
+                        }
                     }
-                }
-            },
-            None => (IconName::Terminal, Color::Muted, None),
+                },
+                None => (IconName::Terminal, Color::Muted, None),
+            }
         };
 
         let self_handle = self.self_handle.clone();
@@ -1566,6 +1583,9 @@ impl Item for TerminalView {
     }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
+        if self.is_claude_code_running(cx) {
+            return "Claude".into();
+        }
         if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
             return custom_title.clone().into();
         }
