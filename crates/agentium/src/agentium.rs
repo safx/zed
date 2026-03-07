@@ -38,24 +38,24 @@ struct ClaudeSession {
 }
 
 pub struct AgentiumApp {
-    workspaces: Vec<Entity<AgentiumWorkspace>>,
-    active_workspace_index: Option<usize>,
+    arenas: Vec<Entity<Arena>>,
+    active_arena_index: Option<usize>,
     workspace_entity: Entity<Workspace>,
     project: Entity<Project>,
     #[allow(dead_code)]
     app_state: Arc<AppState>,
-    next_workspace_id: usize,
+    next_arena_id: usize,
     focus_handle: FocusHandle,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     rename_editor: Entity<Editor>,
-    renaming_workspace: Option<Entity<AgentiumWorkspace>>,
+    renaming_arena: Option<Entity<Arena>>,
     claude_sessions: HashMap<String, ClaudeSession>,
     ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
     _git_subscription: gpui::Subscription,
-    _workspace_subscriptions: HashMap<EntityId, gpui::Subscription>,
+    _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
 }
 
-struct AgentiumWorkspace {
+struct Arena {
     id: usize,
     name: String,
     working_directory: Option<PathBuf>,
@@ -83,29 +83,29 @@ impl AgentiumApp {
         let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
         cx.subscribe_in(&rename_editor, window, |this: &mut Self, _, event: &EditorEvent, _window, cx| {
             if let EditorEvent::Blurred = event {
-                this.finish_rename_workspace(false, cx);
+                this.finish_rename_arena(false, cx);
             }
         }).detach();
 
         Self {
-            workspaces: Vec::new(),
-            active_workspace_index: None,
+            arenas: Vec::new(),
+            active_arena_index: None,
             workspace_entity,
             project,
             app_state,
-            next_workspace_id: 0,
+            next_arena_id: 0,
             focus_handle: cx.focus_handle(),
             context_menu: None,
             rename_editor,
-            renaming_workspace: None,
+            renaming_arena: None,
             claude_sessions: HashMap::new(),
             ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
             _git_subscription: git_subscription,
-            _workspace_subscriptions: HashMap::new(),
+            _arena_subscriptions: HashMap::new(),
         }
     }
 
-    pub fn add_workspace_with_path(
+    pub fn add_arena_with_path(
         &mut self,
         path: PathBuf,
         window: &mut Window,
@@ -116,66 +116,66 @@ impl AgentiumApp {
                 project.find_or_create_worktree(&path, true, cx)
             })
             .detach_and_log_err(cx);
-        self.add_workspace_inner(Some(path), window, cx);
+        self.add_arena_inner(Some(path), window, cx);
     }
 
-    fn add_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_workspace_inner(None, window, cx);
+    fn add_arena(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_arena_inner(None, window, cx);
     }
 
-    fn add_workspace_inner(
+    fn add_arena_inner(
         &mut self,
         working_directory: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let workspace_id = self.next_workspace_id;
-        self.next_workspace_id += 1;
+        let arena_id = self.next_arena_id;
+        self.next_arena_id += 1;
 
-        let name = self.resolve_workspace_name(working_directory.as_deref(), workspace_id, cx);
+        let name = self.resolve_arena_name(working_directory.as_deref(), arena_id, cx);
 
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
         let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
         let ready_shell_pids = self.ready_shell_pids.clone();
 
-        let workspace_entity = cx.new(|cx| {
-            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, modal_layer, working_directory, ready_shell_pids, window, cx)
+        let arena_entity = cx.new(|cx| {
+            Arena::new(arena_id, name, workspace_weak, project, modal_layer, working_directory, ready_shell_pids, window, cx)
         });
 
         let subscription = cx.subscribe(
-            &workspace_entity,
-            |this, _ws, event: &AgentiumWorkspaceEvent, cx| match event {
-                AgentiumWorkspaceEvent::TerminalActivated { shell_pid } => {
+            &arena_entity,
+            |this, _ws, event: &ArenaEvent, cx| match event {
+                ArenaEvent::TerminalActivated { shell_pid } => {
                     this.clear_ready_for_shell_pid(*shell_pid, cx);
                 }
             },
         );
-        self._workspace_subscriptions
-            .insert(workspace_entity.entity_id(), subscription);
+        self._arena_subscriptions
+            .insert(arena_entity.entity_id(), subscription);
 
-        self.workspaces.push(workspace_entity.clone());
-        self.active_workspace_index = Some(self.workspaces.len() - 1);
-        let focus = workspace_entity.focus_handle(cx);
+        self.arenas.push(arena_entity.clone());
+        self.active_arena_index = Some(self.arenas.len() - 1);
+        let focus = arena_entity.focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
     }
 
-    fn switch_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.workspaces.len() {
-            self.active_workspace_index = Some(index);
-            let focus = self.workspaces[index].focus_handle(cx);
+    fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index < self.arenas.len() {
+            self.active_arena_index = Some(index);
+            let focus = self.arenas[index].focus_handle(cx);
             focus.focus(window, cx);
             cx.notify();
         }
     }
 
-    fn active_workspace(&self) -> Option<&Entity<AgentiumWorkspace>> {
-        self.active_workspace_index
-            .and_then(|i| self.workspaces.get(i))
+    fn active_arena(&self) -> Option<&Entity<Arena>> {
+        self.active_arena_index
+            .and_then(|i| self.arenas.get(i))
     }
 
-    fn resolve_workspace_name(
+    fn resolve_arena_name(
         &self,
         working_directory: Option<&std::path::Path>,
         fallback_id: usize,
@@ -193,7 +193,7 @@ impl AgentiumApp {
 
         let effective_path = match effective_path {
             Some(path) => path,
-            None => return format!("Workspace {}", fallback_id + 1),
+            None => return format!("Arena {}", fallback_id + 1),
         };
 
         // a. Remote repository name from matching git repo
@@ -237,25 +237,25 @@ impl AgentiumApp {
             }
         }
 
-        format!("Workspace {}", fallback_id + 1)
+        format!("Arena {}", fallback_id + 1)
     }
 
-    fn deploy_workspace_context_menu(
+    fn deploy_arena_context_menu(
         &mut self,
-        workspace_entity: Entity<AgentiumWorkspace>,
+        arena_entity: Entity<Arena>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let this = cx.entity();
-        let workspace_for_rename = workspace_entity.clone();
-        let workspace_for_close = workspace_entity;
+        let arena_for_rename = arena_entity.clone();
+        let arena_for_close = arena_entity;
         let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
             menu.entry(
                 "Rename…",
                 None,
                 window.handler_for(&this, move |this, window, cx| {
-                    this.start_rename_workspace(workspace_for_rename.clone(), window, cx);
+                    this.start_rename_arena(arena_for_rename.clone(), window, cx);
                 }),
             )
             .separator()
@@ -263,7 +263,7 @@ impl AgentiumApp {
                 "Close",
                 None,
                 window.handler_for(&this, move |this, window, cx| {
-                    this.remove_workspace(&workspace_for_close, window, cx);
+                    this.remove_arena(&arena_for_close, window, cx);
                 }),
             )
         });
@@ -276,14 +276,14 @@ impl AgentiumApp {
         cx.notify();
     }
 
-    fn start_rename_workspace(
+    fn start_rename_arena(
         &mut self,
-        workspace: Entity<AgentiumWorkspace>,
+        workspace: Entity<Arena>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let name = workspace.read(cx).name.clone();
-        self.renaming_workspace = Some(workspace);
+        self.renaming_arena = Some(workspace);
         self.rename_editor.update(cx, |editor, cx| {
             editor.set_text(name, window, cx);
             editor.select_all(&Default::default(), window, cx);
@@ -292,8 +292,8 @@ impl AgentiumApp {
         cx.notify();
     }
 
-    fn finish_rename_workspace(&mut self, accept: bool, cx: &mut Context<Self>) {
-        let Some(workspace) = self.renaming_workspace.take() else { return };
+    fn finish_rename_arena(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(workspace) = self.renaming_arena.take() else { return };
         if accept {
             let new_name = self.rename_editor.read(cx).text(cx);
             if !new_name.trim().is_empty() {
@@ -303,32 +303,32 @@ impl AgentiumApp {
         cx.notify();
     }
 
-    fn remove_workspace(
+    fn remove_arena(
         &mut self,
-        workspace: &Entity<AgentiumWorkspace>,
+        workspace: &Entity<Arena>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.workspaces.iter().position(|ws| ws == workspace) else { return };
-        self._workspace_subscriptions
+        let Some(index) = self.arenas.iter().position(|ws| ws == workspace) else { return };
+        self._arena_subscriptions
             .remove(&workspace.entity_id());
-        self.workspaces.remove(index);
+        self.arenas.remove(index);
 
-        if self.workspaces.is_empty() {
-            self.active_workspace_index = None;
-        } else if let Some(active) = self.active_workspace_index {
+        if self.arenas.is_empty() {
+            self.active_arena_index = None;
+        } else if let Some(active) = self.active_arena_index {
             if active == index {
-                self.active_workspace_index = Some(active.min(self.workspaces.len() - 1));
+                self.active_arena_index = Some(active.min(self.arenas.len() - 1));
             } else if active > index {
-                self.active_workspace_index = Some(active - 1);
+                self.active_arena_index = Some(active - 1);
             }
         }
 
-        if self.renaming_workspace.as_ref() == Some(workspace) {
-            self.renaming_workspace = None;
+        if self.renaming_arena.as_ref() == Some(workspace) {
+            self.renaming_arena = None;
         }
 
-        if let Some(ws) = self.active_workspace() {
+        if let Some(ws) = self.active_arena() {
             let focus = ws.focus_handle(cx);
             focus.focus(window, cx);
         }
@@ -402,18 +402,18 @@ impl AgentiumApp {
 
     fn notify_all_panes(&self, cx: &mut Context<Self>) {
         let panes: Vec<_> = self
-            .workspaces
+            .arenas
             .iter()
             .flat_map(|ws| ws.read(cx).center.panes().into_iter().cloned())
             .collect();
         for pane in panes {
-            pane.update(cx, |_, cx| cx.notify());
+            pane.update(cx, |_: &mut Pane, cx| cx.notify());
         }
     }
 
-    fn count_ready_terminals_in_workspace(
+    fn count_ready_terminals_in_arena(
         &self,
-        workspace: &Entity<AgentiumWorkspace>,
+        workspace: &Entity<Arena>,
         cx: &App,
     ) -> usize {
         let ready_pids = self.ready_shell_pids.borrow();
@@ -440,11 +440,11 @@ impl AgentiumApp {
     }
 }
 
-enum AgentiumWorkspaceEvent {
+enum ArenaEvent {
     TerminalActivated { shell_pid: u32 },
 }
 
-impl EventEmitter<AgentiumWorkspaceEvent> for AgentiumWorkspace {}
+impl EventEmitter<ArenaEvent> for Arena {}
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
     let path = url
@@ -465,7 +465,7 @@ impl Focusable for AgentiumApp {
 impl Render for AgentiumApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let active_index = self.active_workspace_index;
+        let active_index = self.active_arena_index;
 
         div()
             .flex()
@@ -488,7 +488,7 @@ impl Render for AgentiumApp {
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
                             .text_color(colors.text)
-                            .child("Workspaces"),
+                            .child("Arenas"),
                     )
                     .child(
                         div()
@@ -496,17 +496,17 @@ impl Render for AgentiumApp {
                             .flex_1()
                             .overflow_y_scroll()
                             .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
-                                this.finish_rename_workspace(true, cx);
+                                this.finish_rename_arena(true, cx);
                             }))
                             .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| {
-                                this.finish_rename_workspace(false, cx);
+                                this.finish_rename_arena(false, cx);
                             }))
-                            .children(self.workspaces.iter().enumerate().map(
-                                |(i, workspace_entity)| {
-                                    let workspace = workspace_entity.read(cx);
+                            .children(self.arenas.iter().enumerate().map(
+                                |(i, arena_entity)| {
+                                    let arena = arena_entity.read(cx);
                                     let is_active = Some(i) == active_index;
 
-                                    let effective_path = workspace.working_directory.clone().or_else(|| {
+                                    let effective_path = arena.working_directory.clone().or_else(|| {
                                         self.project
                                             .read(cx)
                                             .worktrees(cx)
@@ -534,7 +534,7 @@ impl Render for AgentiumApp {
                                     });
 
                                     div()
-                                        .id(("workspace", workspace.id))
+                                        .id(("arena", arena.id))
                                         .px_2()
                                         .py_1()
                                         .mx_1()
@@ -547,8 +547,8 @@ impl Render for AgentiumApp {
                                             d.hover(|d| d.bg(colors.element_hover))
                                         })
                                         .child({
-                                            let is_renaming = self.renaming_workspace.as_ref() == Some(workspace_entity);
-                                            let ready_count = self.count_ready_terminals_in_workspace(workspace_entity, cx);
+                                            let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
+                                            let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
                                             div()
                                                 .flex()
                                                 .flex_row()
@@ -557,7 +557,7 @@ impl Render for AgentiumApp {
                                                 .text_sm()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
-                                                .when(!is_renaming, |d| d.child(workspace.name.clone()))
+                                                .when(!is_renaming, |d| d.child(arena.name.clone()))
                                                 .when(ready_count > 0, |d| {
                                                     d.child(
                                                         div()
@@ -613,14 +613,14 @@ impl Render for AgentiumApp {
                                         })
                                         .on_click(cx.listener(
                                             move |this, _, window, cx| {
-                                                this.switch_workspace(i, window, cx)
+                                                this.switch_arena(i, window, cx)
                                             },
                                         ))
                                         .on_mouse_down(MouseButton::Right, {
-                                            let workspace_entity = workspace_entity.clone();
+                                            let arena_entity = arena_entity.clone();
                                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                                this.deploy_workspace_context_menu(
-                                                    workspace_entity.clone(),
+                                                this.deploy_arena_context_menu(
+                                                    arena_entity.clone(),
                                                     event.position,
                                                     window,
                                                     cx,
@@ -641,9 +641,9 @@ impl Render for AgentiumApp {
                                 .text_color(colors.text)
                                 .cursor_pointer()
                                 .hover(|d| d.bg(colors.element_hover))
-                                .child("+ New Workspace")
+                                .child("+ New Arena")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_workspace(window, cx)
+                                    this.add_arena(window, cx)
                                 })),
                         ),
                     )
@@ -662,8 +662,8 @@ impl Render for AgentiumApp {
                     .flex_1()
                     .h_full()
                     .bg(colors.background)
-                    .map(|d| match self.active_workspace() {
-                        Some(workspace) => d.child(workspace.clone()),
+                    .map(|d| match self.active_arena() {
+                        Some(arena) => d.child(arena.clone()),
                         None => d.child(
                             div()
                                 .flex()
@@ -671,16 +671,16 @@ impl Render for AgentiumApp {
                                 .justify_center()
                                 .size_full()
                                 .text_color(colors.text_muted)
-                                .child("Press + to add a workspace"),
+                                .child("Press + to add an arena"),
                         ),
                     }),
             )
     }
 }
 
-// --- AgentiumWorkspace ---
+// --- Arena (formerly AgentiumWorkspace) ---
 
-impl AgentiumWorkspace {
+impl Arena {
     fn new(
         id: usize,
         name: String,
@@ -975,7 +975,7 @@ impl AgentiumWorkspace {
                     if let Some(terminal_view) = item.downcast::<TerminalView>() {
                         let terminal = terminal_view.read(cx).terminal().read(cx);
                         if let Some(pid_getter) = terminal.pid_getter() {
-                            cx.emit(AgentiumWorkspaceEvent::TerminalActivated {
+                            cx.emit(ArenaEvent::TerminalActivated {
                                 shell_pid: pid_getter.fallback_pid().as_u32(),
                             });
                         }
@@ -1114,13 +1114,13 @@ impl AgentiumWorkspace {
     }
 }
 
-impl Focusable for AgentiumWorkspace {
+impl Focusable for Arena {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.active_pane.focus_handle(cx)
     }
 }
 
-impl Render for AgentiumWorkspace {
+impl Render for Arena {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let search_actions_div = cx
             .try_global::<workspace::PaneSearchBarCallbacks>()
@@ -1404,9 +1404,9 @@ fn new_agentium_pane(
     project: Entity<Project>,
     ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
     window: &mut Window,
-    cx: &mut Context<AgentiumWorkspace>,
+    cx: &mut Context<Arena>,
 ) -> Entity<Pane> {
-    let agentium_workspace = cx.entity().downgrade();
+    let arena = cx.entity().downgrade();
 
     let pane = cx.new(|cx| {
         let mut pane = Pane::new(
@@ -1424,14 +1424,14 @@ fn new_agentium_pane(
         pane.set_should_display_tab_bar(|_, _| true);
         pane.set_zoom_out_on_close(false);
 
-        let split_predicate_workspace = agentium_workspace.clone();
+        let split_predicate_workspace = arena.clone();
         pane.set_can_split(Some(Arc::new(
             move |pane, dragged_item, _window, cx| {
                 if let Some(tab) = dragged_item.downcast_ref::<DraggedTab>() {
                     let is_current_pane = tab.pane == cx.entity();
                     let Some(can_drag_away) = split_predicate_workspace
-                        .read_with(cx, |agentium_workspace, _| {
-                            let panes = agentium_workspace.center.panes();
+                        .read_with(cx, |arena, _| {
+                            let panes = arena.center.panes();
                             !panes.contains(&&tab.pane)
                                 || panes.len() > 1
                                 || (!is_current_pane || pane.items_len() > 1)
@@ -1467,7 +1467,7 @@ fn new_agentium_pane(
         });
 
         let drop_project = project.downgrade();
-        let drop_agentium_workspace = agentium_workspace.clone();
+        let drop_arena = arena.clone();
         let drop_workspace = workspace.clone();
         let drop_ready_shell_pids = ready_shell_pids.clone();
         pane.set_custom_drop_handle(cx, move |pane, dropped_item, window, cx| {
@@ -1491,7 +1491,7 @@ fn new_agentium_pane(
                         };
 
                         let workspace_handle = drop_workspace.clone();
-                        let agentium_workspace = drop_agentium_workspace.clone();
+                        let arena = drop_arena.clone();
                         let project = drop_project.clone();
                         let ready_pids = drop_ready_shell_pids.clone();
 
@@ -1501,7 +1501,7 @@ fn new_agentium_pane(
                                     return;
                                 };
                                 let Ok(new_pane) =
-                                    agentium_workspace.update(cx, |workspace, cx| {
+                                    arena.update(cx, |workspace, cx| {
                                         let new_pane = new_agentium_pane(
                                             workspace_handle,
                                             project,
@@ -1642,7 +1642,7 @@ fn new_agentium_pane(
         });
     });
 
-    cx.subscribe_in(&pane, window, AgentiumWorkspace::handle_pane_event)
+    cx.subscribe_in(&pane, window, Arena::handle_pane_event)
         .detach();
     cx.observe(&pane, |_, _, cx| cx.notify()).detach();
 
