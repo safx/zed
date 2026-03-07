@@ -3,6 +3,7 @@ use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use editor::{Editor, EditorEvent};
 use git_ui::git_status_icon;
 use gpui::{prelude::*, *};
 use project::Project;
@@ -36,6 +37,9 @@ pub struct AgentiumApp {
     app_state: Arc<AppState>,
     next_workspace_id: usize,
     focus_handle: FocusHandle,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    rename_editor: Entity<Editor>,
+    renaming_workspace: Option<Entity<AgentiumWorkspace>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -55,13 +59,20 @@ impl AgentiumApp {
         workspace_entity: Entity<Workspace>,
         project: Entity<Project>,
         app_state: Arc<AppState>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let git_store = project.read(cx).git_store().clone();
         let git_subscription = cx.subscribe(&git_store, |_this, _, _event: &GitStoreEvent, cx| {
             cx.notify();
         });
+
+        let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
+        cx.subscribe_in(&rename_editor, window, |this: &mut Self, _, event: &EditorEvent, _window, cx| {
+            if let EditorEvent::Blurred = event {
+                this.finish_rename_workspace(false, cx);
+            }
+        }).detach();
 
         Self {
             workspaces: Vec::new(),
@@ -71,6 +82,9 @@ impl AgentiumApp {
             app_state,
             next_workspace_id: 0,
             focus_handle: cx.focus_handle(),
+            context_menu: None,
+            rename_editor,
+            renaming_workspace: None,
             _subscriptions: vec![git_subscription],
         }
     }
@@ -197,6 +211,99 @@ impl AgentiumApp {
 
         format!("Workspace {}", fallback_id + 1)
     }
+
+    fn deploy_workspace_context_menu(
+        &mut self,
+        workspace_entity: Entity<AgentiumWorkspace>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        let workspace_for_rename = workspace_entity.clone();
+        let workspace_for_close = workspace_entity;
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            menu.entry(
+                "Rename…",
+                None,
+                window.handler_for(&this, move |this, window, cx| {
+                    this.start_rename_workspace(workspace_for_rename.clone(), window, cx);
+                }),
+            )
+            .separator()
+            .entry(
+                "Close",
+                None,
+                window.handler_for(&this, move |this, window, cx| {
+                    this.remove_workspace(&workspace_for_close, window, cx);
+                }),
+            )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn start_rename_workspace(
+        &mut self,
+        workspace: Entity<AgentiumWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = workspace.read(cx).name.clone();
+        self.renaming_workspace = Some(workspace);
+        self.rename_editor.update(cx, |editor, cx| {
+            editor.set_text(name, window, cx);
+            editor.select_all(&Default::default(), window, cx);
+        });
+        window.focus(&self.rename_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn finish_rename_workspace(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(workspace) = self.renaming_workspace.take() else { return };
+        if accept {
+            let new_name = self.rename_editor.read(cx).text(cx);
+            if !new_name.trim().is_empty() {
+                workspace.update(cx, |ws, _| ws.name = new_name);
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_workspace(
+        &mut self,
+        workspace: &Entity<AgentiumWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.workspaces.iter().position(|ws| ws == workspace) else { return };
+        self.workspaces.remove(index);
+
+        if self.workspaces.is_empty() {
+            self.active_workspace_index = None;
+        } else if let Some(active) = self.active_workspace_index {
+            if active == index {
+                self.active_workspace_index = Some(active.min(self.workspaces.len() - 1));
+            } else if active > index {
+                self.active_workspace_index = Some(active - 1);
+            }
+        }
+
+        if self.renaming_workspace.as_ref() == Some(workspace) {
+            self.renaming_workspace = None;
+        }
+
+        if let Some(ws) = self.active_workspace() {
+            let focus = ws.focus_handle(cx);
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
 }
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
@@ -248,6 +355,12 @@ impl Render for AgentiumApp {
                             .id("workspace-list")
                             .flex_1()
                             .overflow_y_scroll()
+                            .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
+                                this.finish_rename_workspace(true, cx);
+                            }))
+                            .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| {
+                                this.finish_rename_workspace(false, cx);
+                            }))
                             .children(self.workspaces.iter().enumerate().map(
                                 |(i, workspace_entity)| {
                                     let workspace = workspace_entity.read(cx);
@@ -293,12 +406,14 @@ impl Render for AgentiumApp {
                                         .when(!is_active, |d: Stateful<Div>| {
                                             d.hover(|d| d.bg(colors.element_hover))
                                         })
-                                        .child(
+                                        .child({
+                                            let is_renaming = self.renaming_workspace.as_ref() == Some(workspace_entity);
                                             div()
                                                 .text_sm()
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .child(workspace.name.clone()),
-                                        )
+                                                .when(is_renaming, |d| d.child(self.rename_editor.clone()))
+                                                .when(!is_renaming, |d| d.child(workspace.name.clone()))
+                                        })
                                         .when_some(display_path, |d, path| {
                                             d.child(
                                                 div()
@@ -344,6 +459,17 @@ impl Render for AgentiumApp {
                                                 this.switch_workspace(i, window, cx)
                                             },
                                         ))
+                                        .on_mouse_down(MouseButton::Right, {
+                                            let workspace_entity = workspace_entity.clone();
+                                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                                this.deploy_workspace_context_menu(
+                                                    workspace_entity.clone(),
+                                                    event.position,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        })
                                 },
                             )),
                     )
@@ -363,7 +489,16 @@ impl Render for AgentiumApp {
                                     this.add_workspace(window, cx)
                                 })),
                         ),
-                    ),
+                    )
+                    .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                        deferred(
+                            anchored()
+                                .position(*position)
+                                .anchor(Corner::TopLeft)
+                                .child(menu.clone()),
+                        )
+                        .with_priority(1)
+                    })),
             )
             .child(
                 div()
