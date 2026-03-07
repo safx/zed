@@ -327,8 +327,8 @@ pub struct PaneRenderContext<'a> {
 
 #[derive(Default)]
 pub struct LeaderDecoration {
-    border: Option<Hsla>,
-    status_box: Option<AnyElement>,
+    pub border: Option<Hsla>,
+    pub status_box: Option<AnyElement>,
 }
 
 pub trait PaneLeaderDecorator {
