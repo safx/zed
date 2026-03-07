@@ -484,6 +484,7 @@ dependencies = [
  "language",
  "languages",
  "markdown_preview",
+ "menu",
  "node_runtime",
  "parking_lot",
  "project",
