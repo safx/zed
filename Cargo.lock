@@ -458,6 +458,7 @@ dependencies = [
  "menu",
  "node_runtime",
  "parking_lot",
+ "paths",
  "project",
  "release_channel",
  "search",
