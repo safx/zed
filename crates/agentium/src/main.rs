@@ -18,9 +18,9 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    Workspace {
+    Arena {
         #[command(subcommand)]
-        action: WorkspaceAction,
+        action: ArenaAction,
     },
     /// Generate shell completions
     Completions {
@@ -36,7 +36,7 @@ enum Command {
 }
 
 #[derive(clap::Subcommand)]
-enum WorkspaceAction {
+enum ArenaAction {
     New { path: PathBuf },
 }
 
@@ -220,8 +220,8 @@ fn main() {
             }
             return;
         }
-        Some(Command::Workspace {
-            action: WorkspaceAction::New { path },
+        Some(Command::Arena {
+            action: ArenaAction::New { path },
         }) => match std::fs::canonicalize(&path) {
             Ok(canonical) => Some(canonical),
             Err(err) => {
@@ -403,7 +403,7 @@ fn main() {
                                         IpcMessage::WorkspacePath(path) => {
                                             window_handle
                                                 .update(cx, |app, window, cx| {
-                                                    app.add_workspace_with_path(
+                                                    app.add_arena_with_path(
                                                         path, window, cx,
                                                     );
                                                     window.activate_window();
