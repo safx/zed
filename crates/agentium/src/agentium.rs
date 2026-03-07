@@ -1,6 +1,9 @@
+use std::cell::RefCell;
 use std::cmp;
+use std::collections::{HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use editor::{Editor, EditorEvent};
@@ -13,20 +16,26 @@ use markdown_preview::{OpenPreview, OpenPreviewToTheSide};
 use search::ProjectSearchView;
 use search::project_search::{ProjectSearch, ProjectSearchBar};
 use terminal_view::TerminalView;
-use ui::{ActiveTheme, ContextMenu, PopoverMenu, Tooltip, prelude::*};
+use ui::{ActiveTheme, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::notifications::NotifyResultExt as _;
+use workspace::pane::render_item_indicator;
 use workspace::{
-    Item, pane, move_active_item, move_item, ActivePaneDecorator, ActivateNextPane, ActivatePane,
+    Item, pane, move_active_item, move_item, ActivateNextPane, ActivatePane,
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
-    AppState, DraggedTab, ModalLayer, MoveItemToPane, MoveItemToPaneInDirection, MovePaneDown,
-    MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal, Pane, PaneGroup, Save, SaveAs,
-    SaveIntent, SaveWithoutFormat, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight,
-    SplitUp, SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom,
-    Workspace,
+    AppState, DraggedTab, LeaderDecoration, ModalLayer, MoveItemToPane,
+    MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal,
+    Pane, PaneGroup, PaneLeaderDecorator, Save, SaveAs, SaveIntent, SaveWithoutFormat,
+    SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
+    SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
 };
 
 actions!(agentium, [NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
+
+struct ClaudeSession {
+    ancestor_pids: Vec<u32>,
+    is_ready: bool,
+}
 
 pub struct AgentiumApp {
     workspaces: Vec<Entity<AgentiumWorkspace>>,
@@ -40,7 +49,10 @@ pub struct AgentiumApp {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     rename_editor: Entity<Editor>,
     renaming_workspace: Option<Entity<AgentiumWorkspace>>,
-    _subscriptions: Vec<gpui::Subscription>,
+    claude_sessions: HashMap<String, ClaudeSession>,
+    ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    _git_subscription: gpui::Subscription,
+    _workspace_subscriptions: HashMap<EntityId, gpui::Subscription>,
 }
 
 struct AgentiumWorkspace {
@@ -52,6 +64,7 @@ struct AgentiumWorkspace {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     modal_layer: Entity<ModalLayer>,
+    ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
 }
 
 impl AgentiumApp {
@@ -85,7 +98,10 @@ impl AgentiumApp {
             context_menu: None,
             rename_editor,
             renaming_workspace: None,
-            _subscriptions: vec![git_subscription],
+            claude_sessions: HashMap::new(),
+            ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
+            _git_subscription: git_subscription,
+            _workspace_subscriptions: HashMap::new(),
         }
     }
 
@@ -121,10 +137,22 @@ impl AgentiumApp {
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
         let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
+        let ready_shell_pids = self.ready_shell_pids.clone();
 
         let workspace_entity = cx.new(|cx| {
-            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, modal_layer, working_directory, window, cx)
+            AgentiumWorkspace::new(workspace_id, name, workspace_weak, project, modal_layer, working_directory, ready_shell_pids, window, cx)
         });
+
+        let subscription = cx.subscribe(
+            &workspace_entity,
+            |this, _ws, event: &AgentiumWorkspaceEvent, cx| match event {
+                AgentiumWorkspaceEvent::TerminalActivated { shell_pid } => {
+                    this.clear_ready_for_shell_pid(*shell_pid, cx);
+                }
+            },
+        );
+        self._workspace_subscriptions
+            .insert(workspace_entity.entity_id(), subscription);
 
         self.workspaces.push(workspace_entity.clone());
         self.active_workspace_index = Some(self.workspaces.len() - 1);
@@ -282,6 +310,8 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.workspaces.iter().position(|ws| ws == workspace) else { return };
+        self._workspace_subscriptions
+            .remove(&workspace.entity_id());
         self.workspaces.remove(index);
 
         if self.workspaces.is_empty() {
@@ -304,7 +334,117 @@ impl AgentiumApp {
         }
         cx.notify();
     }
+
+    fn sync_ready_shell_pids(&self) {
+        let pids: HashSet<u32> = self
+            .claude_sessions
+            .values()
+            .filter(|s| s.is_ready)
+            .flat_map(|s| s.ancestor_pids.iter().copied())
+            .collect();
+        *self.ready_shell_pids.borrow_mut() = pids;
+    }
+
+    pub fn register_claude_session(
+        &mut self,
+        session_id: String,
+        ancestor_pids: Vec<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.claude_sessions.insert(
+            session_id,
+            ClaudeSession {
+                ancestor_pids,
+                is_ready: false,
+            },
+        );
+        self.sync_ready_shell_pids();
+        cx.notify();
+    }
+
+    pub fn mark_claude_session_ready(
+        &mut self,
+        session_id: &str,
+        ancestor_pids: Vec<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.claude_sessions.get_mut(session_id) {
+            session.is_ready = true;
+            session.ancestor_pids = ancestor_pids;
+        } else {
+            self.claude_sessions.insert(
+                session_id.to_string(),
+                ClaudeSession {
+                    ancestor_pids,
+                    is_ready: true,
+                },
+            );
+        }
+        self.sync_ready_shell_pids();
+        self.notify_all_panes(cx);
+        cx.notify();
+    }
+
+    fn clear_ready_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for session in self.claude_sessions.values_mut() {
+            if session.is_ready && session.ancestor_pids.contains(&shell_pid) {
+                session.is_ready = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.sync_ready_shell_pids();
+            self.notify_all_panes(cx);
+            cx.notify();
+        }
+    }
+
+    fn notify_all_panes(&self, cx: &mut Context<Self>) {
+        let panes: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.read(cx).center.panes().into_iter().cloned())
+            .collect();
+        for pane in panes {
+            pane.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    fn count_ready_terminals_in_workspace(
+        &self,
+        workspace: &Entity<AgentiumWorkspace>,
+        cx: &App,
+    ) -> usize {
+        let ready_pids = self.ready_shell_pids.borrow();
+        if ready_pids.is_empty() {
+            return 0;
+        }
+        let ws = workspace.read(cx);
+        ws.center
+            .panes()
+            .iter()
+            .map(|pane| {
+                pane.read(cx)
+                    .items_of_type::<TerminalView>()
+                    .filter(|tv| {
+                        tv.read(cx)
+                            .terminal()
+                            .read(cx)
+                            .pid_getter()
+                            .is_some_and(|g| ready_pids.contains(&g.fallback_pid().as_u32()))
+                    })
+                    .count()
+            })
+            .sum()
+    }
 }
+
+enum AgentiumWorkspaceEvent {
+    TerminalActivated { shell_pid: u32 },
+}
+
+impl EventEmitter<AgentiumWorkspaceEvent> for AgentiumWorkspace {}
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
     let path = url
@@ -408,11 +548,28 @@ impl Render for AgentiumApp {
                                         })
                                         .child({
                                             let is_renaming = self.renaming_workspace.as_ref() == Some(workspace_entity);
+                                            let ready_count = self.count_ready_terminals_in_workspace(workspace_entity, cx);
                                             div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .justify_between()
                                                 .text_sm()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
                                                 .when(!is_renaming, |d| d.child(workspace.name.clone()))
+                                                .when(ready_count > 0, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .rounded_full()
+                                                            .bg(colors.text_accent)
+                                                            .text_color(colors.surface_background)
+                                                            .text_xs()
+                                                            .line_height(relative(1.4))
+                                                            .child(format!("{ready_count}"))
+                                                    )
+                                                })
                                         })
                                         .when_some(display_path, |d, path| {
                                             d.child(
@@ -531,10 +688,11 @@ impl AgentiumWorkspace {
         project: Entity<Project>,
         modal_layer: Entity<ModalLayer>,
         working_directory: Option<PathBuf>,
+        ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let pane = new_agentium_pane(workspace.clone(), project.clone(), window, cx);
+        let pane = new_agentium_pane(workspace.clone(), project.clone(), ready_shell_pids.clone(), window, cx);
         let center = PaneGroup::new(pane.clone());
 
         let terminal_task = project.update(cx, |project, cx| {
@@ -573,6 +731,7 @@ impl AgentiumWorkspace {
             workspace,
             project,
             modal_layer,
+            ready_shell_pids,
         }
     }
 
@@ -694,6 +853,7 @@ impl AgentiumWorkspace {
     ) -> Task<Option<Entity<Pane>>> {
         let workspace_weak = self.workspace.clone();
         let project = self.project.clone();
+        let ready_shell_pids = self.ready_shell_pids.clone();
         let working_directory = if clone {
             self.active_pane
                 .read(cx)
@@ -722,7 +882,7 @@ impl AgentiumWorkspace {
                         cx,
                     )
                 }));
-                let pane = new_agentium_pane(workspace_weak, project, window, cx);
+                let pane = new_agentium_pane(workspace_weak, project, ready_shell_pids, window, cx);
                 pane.update(cx, |pane, cx| {
                     pane.add_item(terminal_view, true, true, None, window, cx);
                 });
@@ -799,6 +959,7 @@ impl AgentiumWorkspace {
                     let new_pane = new_agentium_pane(
                         self.workspace.clone(),
                         self.project.clone(),
+                        self.ready_shell_pids.clone(),
                         window,
                         cx,
                     );
@@ -809,6 +970,18 @@ impl AgentiumWorkspace {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
             },
+            pane::Event::ActivateItem { .. } => {
+                if let Some(item) = pane.read(cx).active_item() {
+                    if let Some(terminal_view) = item.downcast::<TerminalView>() {
+                        let terminal = terminal_view.read(cx).terminal().read(cx);
+                        if let Some(pid_getter) = terminal.pid_getter() {
+                            cx.emit(AgentiumWorkspaceEvent::TerminalActivated {
+                                shell_pid: pid_getter.fallback_pid().as_u32(),
+                            });
+                        }
+                    }
+                }
+            }
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
                 if let Some(workspace) = self.workspace.upgrade() {
@@ -879,6 +1052,7 @@ impl AgentiumWorkspace {
                     let new_pane = new_agentium_pane(
                         self.workspace.clone(),
                         self.project.clone(),
+                        self.ready_shell_pids.clone(),
                         window,
                         cx,
                     );
@@ -954,9 +1128,14 @@ impl Render for AgentiumWorkspace {
                 (callbacks.wrap_div_with_search_actions)(div(), self.active_pane.clone())
             })
             .unwrap_or_else(div);
+        let ready_pids = self.ready_shell_pids.borrow().clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                let decorator = ActivePaneDecorator::new(&self.active_pane, &self.workspace);
+                let decorator = AgentiumPaneDecorator {
+                    active_pane: &self.active_pane,
+                    workspace: &self.workspace,
+                    ready_shell_pids: &ready_pids,
+                };
                 search_actions_div
                     .size_full()
                     .child(self.center.render(
@@ -1178,9 +1357,52 @@ impl Render for AgentiumWorkspace {
     }
 }
 
+struct AgentiumPaneDecorator<'a> {
+    active_pane: &'a Entity<Pane>,
+    workspace: &'a WeakEntity<Workspace>,
+    ready_shell_pids: &'a HashSet<u32>,
+}
+
+impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
+    fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
+        if pane != self.active_pane {
+            return LeaderDecoration::default();
+        }
+        let is_ready = pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<TerminalView>())
+            .and_then(|tv| {
+                let terminal = tv.read(cx).terminal().read(cx);
+                terminal
+                    .pid_getter()
+                    .map(|g| g.fallback_pid().as_u32())
+            })
+            .is_some_and(|pid| self.ready_shell_pids.contains(&pid));
+
+        if is_ready {
+            LeaderDecoration {
+                border: Some(cx.theme().colors().border_focused),
+                status_box: None,
+            }
+        } else {
+            LeaderDecoration::default()
+        }
+    }
+
+    fn active_pane(&self) -> &Entity<Pane> {
+        self.active_pane
+    }
+
+    fn workspace(&self) -> &WeakEntity<Workspace> {
+        self.workspace
+    }
+}
+
 fn new_agentium_pane(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
+    ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
     window: &mut Window,
     cx: &mut Context<AgentiumWorkspace>,
 ) -> Entity<Pane> {
@@ -1247,6 +1469,7 @@ fn new_agentium_pane(
         let drop_project = project.downgrade();
         let drop_agentium_workspace = agentium_workspace.clone();
         let drop_workspace = workspace.clone();
+        let drop_ready_shell_pids = ready_shell_pids.clone();
         pane.set_custom_drop_handle(cx, move |pane, dropped_item, window, cx| {
             if !drop_project.upgrade().is_some() {
                 return ControlFlow::Break(());
@@ -1270,6 +1493,7 @@ fn new_agentium_pane(
                         let workspace_handle = drop_workspace.clone();
                         let agentium_workspace = drop_agentium_workspace.clone();
                         let project = drop_project.clone();
+                        let ready_pids = drop_ready_shell_pids.clone();
 
                         cx.spawn_in(window, async move |_, cx| {
                             cx.update(|window, cx| {
@@ -1281,6 +1505,7 @@ fn new_agentium_pane(
                                         let new_pane = new_agentium_pane(
                                             workspace_handle,
                                             project,
+                                            ready_pids,
                                             window,
                                             cx,
                                         );
@@ -1400,6 +1625,20 @@ fn new_agentium_pane(
                 .into_any_element()
                 .into();
             (None, right_children)
+        });
+
+        let ready_pids = ready_shell_pids;
+        pane.set_render_item_indicator(move |item, cx| {
+            if let Some(terminal_view) = item.downcast::<TerminalView>() {
+                let terminal = terminal_view.read(cx).terminal().read(cx);
+                if let Some(pid_getter) = terminal.pid_getter() {
+                    let pid = pid_getter.fallback_pid().as_u32();
+                    if ready_pids.borrow().contains(&pid) {
+                        return Some(Indicator::dot().color(Color::Accent));
+                    }
+                }
+            }
+            render_item_indicator(item, cx)
         });
     });
 
