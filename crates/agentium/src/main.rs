@@ -28,11 +28,30 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Claude Code hook integration
+    Claude {
+        #[command(subcommand)]
+        action: ClaudeAction,
+    },
 }
 
 #[derive(clap::Subcommand)]
 enum WorkspaceAction {
     New { path: PathBuf },
+}
+
+#[derive(clap::Subcommand)]
+enum ClaudeAction {
+    Hook {
+        #[command(subcommand)]
+        event: ClaudeHookEvent,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ClaudeHookEvent {
+    SessionStart,
+    Stop,
 }
 
 fn agentium_socket_path() -> PathBuf {
@@ -41,6 +60,12 @@ fn agentium_socket_path() -> PathBuf {
         .join("share")
         .join("agentium")
         .join("agentium.sock")
+}
+
+enum IpcMessage {
+    WorkspacePath(PathBuf),
+    ClaudeSessionStart { session_id: String, ancestor_pids: Vec<u32> },
+    ClaudeStop { session_id: String, ancestor_pids: Vec<u32> },
 }
 
 fn try_send_path_to_running_instance(
@@ -56,9 +81,34 @@ fn try_send_path_to_running_instance(
     Ok(())
 }
 
-fn start_workspace_ipc_listener(
+fn get_ancestor_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut current = std::os::unix::process::parent_id();
+    for _ in 0..10 {
+        if current <= 1 {
+            break;
+        }
+        pids.push(current);
+        match std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &current.to_string()])
+            .output()
+        {
+            Ok(output) => match String::from_utf8(output.stdout)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                Some(ppid) => current = ppid,
+                None => break,
+            },
+            Err(_) => break,
+        }
+    }
+    pids
+}
+
+fn start_ipc_listener(
     socket_path: PathBuf,
-    path_sender: futures::channel::mpsc::UnboundedSender<PathBuf>,
+    msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -84,11 +134,41 @@ fn start_workspace_ipc_listener(
     std::thread::spawn(move || {
         let mut buffer = [0u8; 4096];
         while let Ok(n) = listener.recv(&mut buffer) {
-            if let Ok(path_str) = std::str::from_utf8(&buffer[..n]) {
-                let path = PathBuf::from(path_str);
-                if path_sender.unbounded_send(path).is_err() {
-                    break;
+            let bytes = &buffer[..n];
+            let msg = if bytes.first() == Some(&b'{') {
+                match serde_json::from_slice::<serde_json::Value>(bytes) {
+                    Ok(json) => {
+                        let session_id = json["session_id"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let ancestor_pids: Vec<u32> = json["ancestor_pids"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        match json["type"].as_str() {
+                            Some("claude_session_start") => {
+                                IpcMessage::ClaudeSessionStart { session_id, ancestor_pids }
+                            }
+                            Some("claude_stop") => {
+                                IpcMessage::ClaudeStop { session_id, ancestor_pids }
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Err(_) => continue,
                 }
+            } else if let Ok(path_str) = std::str::from_utf8(bytes) {
+                IpcMessage::WorkspacePath(PathBuf::from(path_str))
+            } else {
+                continue;
+            };
+            if msg_sender.unbounded_send(msg).is_err() {
+                break;
             }
         }
     });
@@ -112,6 +192,32 @@ fn main() {
                 "agentium",
                 &mut std::io::stdout(),
             );
+            return;
+        }
+        Some(Command::Claude {
+            action: ClaudeAction::Hook { event },
+        }) => {
+            let json: serde_json::Value =
+                serde_json::from_reader(std::io::stdin()).unwrap_or_default();
+            let session_id = json["session_id"].as_str().unwrap_or("");
+            let ancestor_pids = get_ancestor_pids();
+
+            let msg_type = match event {
+                ClaudeHookEvent::SessionStart => "claude_session_start",
+                ClaudeHookEvent::Stop => "claude_stop",
+            };
+            let msg = serde_json::json!({
+                "type": msg_type,
+                "session_id": session_id,
+                "ancestor_pids": ancestor_pids,
+            });
+
+            let socket_path = agentium_socket_path();
+            if let Ok(socket) = UnixDatagram::unbound() {
+                if socket.connect(&socket_path).is_ok() {
+                    socket.send(msg.to_string().as_bytes()).ok();
+                }
+            }
             return;
         }
         Some(Command::Workspace {
@@ -283,21 +389,51 @@ fn main() {
                         .log_err();
 
                     if let Some(window_handle) = window_handle {
-                        let (path_sender, mut path_receiver) =
-                            futures::channel::mpsc::unbounded::<PathBuf>();
+                        let (msg_sender, mut msg_receiver) =
+                            futures::channel::mpsc::unbounded::<IpcMessage>();
 
-                        start_workspace_ipc_listener(socket_path, path_sender).log_err();
+                        start_ipc_listener(socket_path, msg_sender).log_err();
 
                         cx.spawn({
                             async move |cx| {
-                                while let Some(path) = path_receiver.next().await {
-                                    window_handle
-                                        .update(cx, |app, window, cx| {
-                                            app.add_workspace_with_path(path, window, cx);
-                                            window.activate_window();
-                                            cx.activate(true);
-                                        })
-                                        .log_err();
+                                while let Some(msg) = msg_receiver.next().await {
+                                    match msg {
+                                        IpcMessage::WorkspacePath(path) => {
+                                            window_handle
+                                                .update(cx, |app, window, cx| {
+                                                    app.add_workspace_with_path(
+                                                        path, window, cx,
+                                                    );
+                                                    window.activate_window();
+                                                    cx.activate(true);
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudeSessionStart {
+                                            session_id,
+                                            ancestor_pids,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.register_claude_session(
+                                                        session_id, ancestor_pids, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudeStop {
+                                            session_id,
+                                            ancestor_pids,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.mark_claude_session_ready(
+                                                        &session_id, ancestor_pids, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                    }
                                 }
                             }
                         })
