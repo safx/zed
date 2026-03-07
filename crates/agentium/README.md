@@ -4,8 +4,9 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 
 ## Features
 
-- **Multiple workspaces** — create isolated workspaces with independent pane layouts
+- **Multiple arenas** — create isolated arenas with independent pane layouts for each agent
 - **Terminal** — integrated terminal with shell support
+- **LSP** — language server support for Go to Definition, Find All References, etc.
 - **Diff view** — view uncommitted changes (powered by `git_ui::ProjectDiff`)
 - **Project search** — full-text search across the project
 - **Git status** — read-only view of changed files grouped by Conflicts/Tracked/Untracked, with click-to-open
@@ -26,7 +27,7 @@ Add the following to your Claude Code `settings.json`:
 }
 ```
 
-When Claude Code completes a response, the corresponding terminal tab shows a dot indicator and the workspace sidebar shows a badge count. Switching to the tab clears the notification.
+When Claude Code completes a response, the corresponding terminal tab shows a blue dot indicator and the arena sidebar shows a badge count. Switching to the tab clears the notification.
 
 ## Building
 
