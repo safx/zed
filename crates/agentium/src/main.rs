@@ -265,9 +265,11 @@ fn main() {
             let fs = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
             <dyn fs::Fs>::set_global(fs.clone(), cx);
 
-            let languages = Arc::new(language::LanguageRegistry::new(
+            let mut languages = language::LanguageRegistry::new(
                 cx.background_executor().clone(),
-            ));
+            );
+            languages.set_language_server_download_dir(paths::languages_dir().clone());
+            let languages = Arc::new(languages);
             let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
             let node_runtime = node_runtime::NodeRuntime::unavailable();
 
