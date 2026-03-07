@@ -1336,11 +1336,11 @@ impl Editor {
                     if Some(&target_buffer) == editor.buffer.read(cx).as_singleton().as_ref() {
                         editor.go_to_singleton_buffer_range(range, window, cx);
                     } else {
-                        let pane = workspace.read(cx).active_pane().clone();
+                        let pane = workspace.read(cx).pane_for_open();
                         window.defer(cx, move |window, cx| {
                             let target_editor: Entity<Self> =
                                 workspace.update(cx, |workspace, cx| {
-                                    let pane = workspace.active_pane().clone();
+                                    let pane = workspace.pane_for_open();
 
                                     let preview_tabs_settings = PreviewTabsSettings::get_global(cx);
                                     let keep_old_preview = preview_tabs_settings
@@ -1813,7 +1813,7 @@ impl Editor {
                         let Some(workspace) = workspace else {
                             return Navigated::No;
                         };
-                        let pane = workspace.read(cx).active_pane().clone();
+                        let pane = workspace.read(cx).pane_for_open();
                         let offset = editor.cursor_top_offset(cx);
 
                         window.defer(cx, move |window, cx| {
@@ -1822,7 +1822,7 @@ impl Editor {
                                     let pane = if split {
                                         workspace.adjacent_pane(window, cx)
                                     } else {
-                                        workspace.active_pane().clone()
+                                        workspace.pane_for_open()
                                     };
 
                                     let preview_tabs_settings = PreviewTabsSettings::get_global(cx);
@@ -2087,7 +2087,7 @@ impl Editor {
 
             multibuffer.with_title(title)
         });
-        let existing = workspace.active_pane().update(cx, |pane, cx| {
+        let existing = workspace.pane_for_open().update(cx, |pane, cx| {
             pane.items()
                 .filter_map(|item| item.downcast::<Editor>())
                 .find(|editor| {
@@ -2147,7 +2147,7 @@ impl Editor {
         let pane = if split {
             workspace.adjacent_pane(window, cx)
         } else {
-            workspace.active_pane().clone()
+            workspace.pane_for_open()
         };
         let activate_pane = split;
 
