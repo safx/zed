@@ -69,8 +69,8 @@ use notifications::{
 };
 pub use pane::*;
 pub use pane_group::{
-    ActivePaneDecorator, HANDLE_HITBOX_SIZE, Member, PaneAxis, PaneGroup, PaneRenderContext,
-    SplitDirection,
+    ActivePaneDecorator, HANDLE_HITBOX_SIZE, LeaderDecoration, Member, PaneAxis, PaneGroup,
+    PaneLeaderDecorator, PaneRenderContext, SplitDirection,
 };
 use persistence::{DB, SerializedWindowBounds, model::SerializedWorkspace};
 pub use persistence::{
