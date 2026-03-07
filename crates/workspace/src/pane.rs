@@ -428,6 +428,7 @@ pub struct Pane {
         ) -> (Option<AnyElement>, Option<AnyElement>),
     >,
     render_tab_bar: Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> AnyElement>,
+    render_item_indicator: Option<Rc<dyn Fn(Box<dyn ItemHandle>, &App) -> Option<Indicator>>>,
     show_tab_bar_buttons: bool,
     max_tabs: Option<NonZeroUsize>,
     use_max_tabs: bool,
@@ -607,6 +608,7 @@ impl Pane {
             should_display_welcome_page: false,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
             render_tab_bar: Rc::new(Self::render_tab_bar),
+            render_item_indicator: None,
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
             display_nav_history_buttons: Some(
                 TabBarSettings::get_global(cx).show_nav_history_buttons,
@@ -883,6 +885,13 @@ impl Pane {
     {
         self.render_tab_bar_buttons = Rc::new(render);
         cx.notify();
+    }
+
+    pub fn set_render_item_indicator(
+        &mut self,
+        render: impl Fn(Box<dyn ItemHandle>, &App) -> Option<Indicator> + 'static,
+    ) {
+        self.render_item_indicator = Some(Rc::new(render));
     }
 
     pub fn nav_history_for_item<T: Item>(&self, item: &Entity<T>) -> ItemNavHistory {
@@ -2867,7 +2876,11 @@ impl Pane {
         let settings = ItemSettings::get_global(cx);
         let close_side = &settings.close_position;
         let show_close_button = &settings.show_close_button;
-        let indicator = render_item_indicator(item.boxed_clone(), cx);
+        let indicator = if let Some(ref custom) = self.render_item_indicator {
+            (custom)(item.boxed_clone(), cx)
+        } else {
+            render_item_indicator(item.boxed_clone(), cx)
+        };
         let tab_tooltip_content = item.tab_tooltip_content(cx);
         let item_id = item.item_id();
         let is_first_item = ix == 0;

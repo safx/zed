@@ -82,8 +82,8 @@ use notifications::{
 };
 pub use pane::*;
 pub use pane_group::{
-    ActivePaneDecorator, HANDLE_HITBOX_SIZE, Member, PaneAxis, PaneGroup, PaneRenderContext,
-    SplitDirection,
+    ActivePaneDecorator, HANDLE_HITBOX_SIZE, LeaderDecoration, Member, PaneAxis, PaneGroup,
+    PaneLeaderDecorator, PaneRenderContext, SplitDirection,
 };
 pub use persistence::{
     RecentWorkspace, WorkspaceDb, delete_unloaded_items,
