@@ -484,11 +484,14 @@ impl Render for AgentiumApp {
                     .border_color(colors.border)
                     .child(
                         div()
-                            .p_2()
+                            .pl(px(78.0))
+                            .pr_2()
+                            .py_2()
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
                             .text_color(colors.text)
-                            .child("Arenas"),
+                            .window_control_area(WindowControlArea::Drag)
+                            .child("Agentium"),
                     )
                     .child(
                         div()
@@ -1626,6 +1629,8 @@ fn new_agentium_pane(
                 .into();
             (None, right_children)
         });
+
+        pane.set_tab_bar_drag_area(true);
 
         let ready_pids = ready_shell_pids;
         pane.set_render_item_indicator(move |item, cx| {
