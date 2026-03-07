@@ -11,6 +11,22 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **Git status** — read-only view of changed files grouped by Conflicts/Tracked/Untracked, with click-to-open
 - **Markdown preview** — preview markdown files side-by-side
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
+- **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC
+
+## Claude Code Hook Setup
+
+Add the following to your Claude Code `settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "type": "command", "command": "agentium claude hook session-start" }],
+    "Stop": [{ "type": "command", "command": "agentium claude hook stop" }]
+  }
+}
+```
+
+When Claude Code completes a response, the corresponding terminal tab shows a dot indicator and the workspace sidebar shows a badge count. Switching to the tab clears the notification.
 
 ## Building
 
