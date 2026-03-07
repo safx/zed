@@ -38,6 +38,7 @@ menu.workspace = true
 languages = { workspace = true, features = ["load-grammars"] }
 node_runtime.workspace = true
 parking_lot.workspace = true
+paths.workspace = true
 project.workspace = true
 release_channel.workspace = true
 search.workspace = true
