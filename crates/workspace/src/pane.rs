@@ -21,8 +21,8 @@ use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, ClickEvent, ClipboardItem, Context, Div,
     DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
     Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point, PromptLevel, Render,
-    ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window, actions,
-    anchored, deferred, prelude::*,
+    ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window,
+    WindowControlArea, actions, anchored, deferred, prelude::*,
 };
 use itertools::Itertools;
 use language::{Capability, DiagnosticSeverity};
@@ -455,6 +455,7 @@ pub struct Pane {
     welcome_page: Option<Entity<crate::welcome::WelcomePage>>,
 
     pub in_center_group: bool,
+    tab_bar_drag_area: bool,
 }
 
 pub struct ActivationHistoryEntry {
@@ -627,6 +628,7 @@ impl Pane {
             project_item_restoration_data: HashMap::default(),
             welcome_page: None,
             in_center_group: false,
+            tab_bar_drag_area: false,
         }
     }
 
@@ -3658,6 +3660,9 @@ impl Pane {
             .min_w_6()
             .h(Tab::container_height(cx))
             .flex_grow_1()
+            .when(self.tab_bar_drag_area, |d| {
+                d.window_control_area(WindowControlArea::Drag)
+            })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
@@ -3704,6 +3709,9 @@ impl Pane {
             .flex_grow_1()
             .border_l_1()
             .border_color(cx.theme().colors().border)
+            .when(self.tab_bar_drag_area, |d| {
+                d.window_control_area(WindowControlArea::Drag)
+            })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
@@ -4259,6 +4267,10 @@ impl Pane {
 
     pub fn set_zoom_out_on_close(&mut self, zoom_out_on_close: bool) {
         self.zoom_out_on_close = zoom_out_on_close;
+    }
+
+    pub fn set_tab_bar_drag_area(&mut self, enabled: bool) {
+        self.tab_bar_drag_area = enabled;
     }
 }
 
