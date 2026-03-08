@@ -418,6 +418,7 @@ pub struct Pane {
     can_split_predicate:
         Option<Arc<dyn Fn(&mut Self, &dyn Any, &mut Window, &mut Context<Self>) -> bool>>,
     can_toggle_zoom: bool,
+    show_external_drop_overlay: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
     render_tab_bar_buttons: Rc<
@@ -606,6 +607,7 @@ impl Pane {
             can_drop_predicate,
             can_split_predicate: None,
             can_toggle_zoom: true,
+            show_external_drop_overlay: true,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
@@ -856,6 +858,10 @@ impl Pane {
     pub fn set_can_toggle_zoom(&mut self, can_toggle_zoom: bool, cx: &mut Context<Self>) {
         self.can_toggle_zoom = can_toggle_zoom;
         cx.notify();
+    }
+
+    pub fn set_show_external_drop_overlay(&mut self, show: bool) {
+        self.show_external_drop_overlay = show;
     }
 
     pub fn set_close_pane_if_empty(&mut self, close_pane_if_empty: bool, cx: &mut Context<Self>) {
@@ -4596,6 +4602,7 @@ impl Render for Pane {
             })
             .child({
                 let has_worktrees = project.read(cx).visible_worktrees(cx).next().is_some();
+                let show_external_drop_overlay = self.show_external_drop_overlay;
                 // main content
                 div()
                     .flex_1()
@@ -4604,7 +4611,7 @@ impl Render for Pane {
                     .overflow_hidden()
                     .on_drag_move::<DraggedTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedSelection>(cx.listener(Self::handle_drag_move))
-                    .when(accepts_external_paths, |div| {
+                    .when(accepts_external_paths && show_external_drop_overlay, |div| {
                         div.on_drag_move::<ExternalPaths>(cx.listener(Self::handle_drag_move))
                     })
                     .map(|div| {
@@ -4647,6 +4654,11 @@ impl Render for Pane {
                         }
                         .focus_follows_mouse(self.focus_follows_mouse, cx)
                     })
+                    .when(accepts_external_paths && !show_external_drop_overlay, |div| {
+                        div.on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                            this.handle_external_paths_drop(paths, window, cx)
+                        }))
+                    })
                     .child(
                         // drag target
                         div()
@@ -4655,7 +4667,7 @@ impl Render for Pane {
                             .bg(cx.theme().colors().drop_target_background)
                             .group_drag_over::<DraggedTab>("", |style| style.visible())
                             .group_drag_over::<DraggedSelection>("", |style| style.visible())
-                            .when(accepts_external_paths, |div| {
+                            .when(accepts_external_paths && show_external_drop_overlay, |div| {
                                 div.group_drag_over::<ExternalPaths>("", |style| style.visible())
                             })
                             .when_some(self.can_drop_predicate.clone(), |this, p| {
