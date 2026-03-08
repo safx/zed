@@ -22,8 +22,8 @@ use gpui::{
     Action, Anchor, AnyElement, App, AsyncWindowContext, ClickEvent, ClipboardItem, Context, Div,
     DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
     Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point, PromptLevel, Render,
-    ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window,
-    WindowControlArea, actions, anchored, deferred, prelude::*,
+    ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window, actions,
+    anchored, deferred, prelude::*,
 };
 use itertools::Itertools;
 use language::{Capability, DiagnosticSeverity};
@@ -457,6 +457,7 @@ pub struct Pane {
 
     pub in_center_group: bool,
     tab_bar_drag_area: bool,
+    tab_bar_should_move_window: bool,
 }
 
 pub struct ActivationHistoryEntry {
@@ -630,6 +631,7 @@ impl Pane {
             welcome_page: None,
             in_center_group: false,
             tab_bar_drag_area: false,
+            tab_bar_should_move_window: false,
         }
     }
 
@@ -3720,7 +3722,24 @@ impl Pane {
             .h(Tab::container_height(cx))
             .flex_grow_1()
             .when(self.tab_bar_drag_area, |d| {
-                d.window_control_area(WindowControlArea::Drag)
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|pane: &mut Pane, _, _, _| {
+                        pane.tab_bar_should_move_window = true;
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|pane: &mut Pane, _, _, _| {
+                        pane.tab_bar_should_move_window = false;
+                    }),
+                )
+                .on_mouse_move(cx.listener(|pane: &mut Pane, _, window, _| {
+                    if pane.tab_bar_should_move_window {
+                        pane.tab_bar_should_move_window = false;
+                        window.start_window_move();
+                    }
+                }))
             })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
@@ -3769,7 +3788,24 @@ impl Pane {
             .border_l_1()
             .border_color(cx.theme().colors().border)
             .when(self.tab_bar_drag_area, |d| {
-                d.window_control_area(WindowControlArea::Drag)
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|pane: &mut Pane, _, _, _| {
+                        pane.tab_bar_should_move_window = true;
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|pane: &mut Pane, _, _, _| {
+                        pane.tab_bar_should_move_window = false;
+                    }),
+                )
+                .on_mouse_move(cx.listener(|pane: &mut Pane, _, window, _| {
+                    if pane.tab_bar_should_move_window {
+                        pane.tab_bar_should_move_window = false;
+                        window.start_window_move();
+                    }
+                }))
             })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
