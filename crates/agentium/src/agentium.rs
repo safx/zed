@@ -1895,6 +1895,7 @@ fn new_agentium_pane(
         pane.display_nav_history_buttons(None);
         pane.set_should_display_tab_bar(|_, _| true);
         pane.set_zoom_out_on_close(false);
+        pane.set_show_external_drop_overlay(false);
 
         let split_predicate_workspace = arena.clone();
         pane.set_can_split(Some(Arc::new(
@@ -2010,8 +2011,12 @@ fn new_agentium_pane(
                         .detach();
                     }
                 }
+                return ControlFlow::Break(());
+            } else if let Some(paths) = dropped_item.downcast_ref::<ExternalPaths>() {
+                add_paths_to_terminal(pane, paths.paths(), window, cx);
+                return ControlFlow::Break(());
             }
-            ControlFlow::Break(())
+            ControlFlow::Continue(())
         });
 
         pane
@@ -2383,5 +2388,30 @@ impl Item for GitStatusView {
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::GitBranch).color(Color::Muted))
+    }
+}
+
+fn add_paths_to_terminal(
+    pane: &mut Pane,
+    paths: &[PathBuf],
+    window: &mut Window,
+    cx: &mut Context<Pane>,
+) {
+    if let Some(terminal_view) = pane
+        .active_item()
+        .and_then(|item| item.downcast::<TerminalView>())
+    {
+        window.focus(&terminal_view.focus_handle(cx), cx);
+        let mut new_text = String::new();
+        for path in paths {
+            new_text.push(' ');
+            new_text.push_str(&format!("{path:?}"));
+        }
+        new_text.push(' ');
+        terminal_view.update(cx, |terminal_view, cx| {
+            terminal_view.terminal().update(cx, |terminal, _| {
+                terminal.paste(&new_text);
+            });
+        });
     }
 }
