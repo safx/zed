@@ -70,6 +70,7 @@ pub struct AgentiumApp {
     renaming_arena: Option<Entity<Arena>>,
     claude_sessions: HashMap<String, ClaudeSession>,
     ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    should_move_window: bool,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
 }
@@ -120,6 +121,7 @@ impl AgentiumApp {
             rename_editor,
             renaming_arena: None,
             claude_sessions: HashMap::new(),
+            should_move_window: false,
             ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
@@ -684,13 +686,39 @@ impl Render for AgentiumApp {
                     .border_color(colors.border)
                     .child(
                         div()
+                            .id("agentium-title")
                             .pl(px(78.0))
                             .pr_2()
                             .py_2()
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
                             .text_color(colors.text)
-                            .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| {
+                                    this.should_move_window = true;
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| {
+                                    this.should_move_window = false;
+                                }),
+                            )
+                            .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                                this.should_move_window = false;
+                            }))
+                            .on_mouse_move(cx.listener(|this, _, window, _| {
+                                if this.should_move_window {
+                                    this.should_move_window = false;
+                                    window.start_window_move();
+                                }
+                            }))
+                            .on_click(|event, window, _| {
+                                if event.click_count() == 2 {
+                                    window.titlebar_double_click();
+                                }
+                            })
                             .child("Agentium"),
                     )
                     .child(
