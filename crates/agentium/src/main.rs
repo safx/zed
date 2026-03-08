@@ -8,6 +8,7 @@ use gpui::*;
 use settings::{KeymapFile, DEFAULT_KEYMAP_PATH};
 use ui::ActiveTheme;
 use util::ResultExt as _;
+use workspace::SplitDirection;
 
 #[derive(Parser)]
 #[command(name = "agentium")]
@@ -22,6 +23,11 @@ enum Command {
         #[command(subcommand)]
         action: ArenaAction,
     },
+    /// Pane operations
+    Pane {
+        #[command(subcommand)]
+        action: PaneAction,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -33,6 +39,37 @@ enum Command {
         #[command(subcommand)]
         action: ClaudeAction,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum PaneAction {
+    /// Split active pane horizontally (new pane to the right)
+    Hsplit {
+        #[arg(long, default_value = "terminal")]
+        r#type: PaneContentType,
+        #[arg(long)]
+        keep_focus: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Split active pane vertically (new pane below)
+    Vsplit {
+        #[arg(long, default_value = "terminal")]
+        r#type: PaneContentType,
+        #[arg(long)]
+        keep_focus: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone)]
+enum PaneContentType {
+    Terminal,
+    Diff,
+    BranchDiff,
+    GitStatus,
+    ProjectSearch,
 }
 
 #[derive(clap::Subcommand)]
@@ -77,6 +114,12 @@ enum IpcMessage {
     ClaudeStop { session_id: String, ancestor_pids: Vec<u32> },
     ClaudeNotification { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeUserPromptSubmit { session_id: String, ancestor_pids: Vec<u32>, prompt: String },
+    PaneSplit {
+        direction: SplitDirection,
+        content_type: agentium::PaneContentType,
+        keep_focus: bool,
+        command: Vec<String>,
+    },
 }
 
 fn try_send_path_to_running_instance(
@@ -182,6 +225,31 @@ fn start_ipc_listener(
                             Some("claude_user_prompt_submit") => {
                                 IpcMessage::ClaudeUserPromptSubmit { session_id, ancestor_pids, prompt }
                             }
+                            Some("pane_split") => {
+                                let direction = match json["direction"].as_str() {
+                                    Some("right") => SplitDirection::Right,
+                                    Some("down") => SplitDirection::Down,
+                                    _ => continue,
+                                };
+                                let content_type = match json["content_type"].as_str() {
+                                    Some("terminal") => agentium::PaneContentType::Terminal,
+                                    Some("diff") => agentium::PaneContentType::Diff,
+                                    Some("branch-diff") => agentium::PaneContentType::BranchDiff,
+                                    Some("git-status") => agentium::PaneContentType::GitStatus,
+                                    Some("project-search") => agentium::PaneContentType::ProjectSearch,
+                                    _ => continue,
+                                };
+                                let keep_focus = json["keep_focus"].as_bool().unwrap_or(false);
+                                let command: Vec<String> = json["command"]
+                                    .as_array()
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                IpcMessage::PaneSplit { direction, content_type, keep_focus, command }
+                            }
                             _ => continue,
                         }
                     }
@@ -245,6 +313,41 @@ fn main() {
                 msg["prompt"] = serde_json::Value::String(truncate_string(prompt, 500));
             }
 
+            let socket_path = agentium_socket_path();
+            if let Ok(socket) = UnixDatagram::unbound() {
+                if socket.connect(&socket_path).is_ok() {
+                    socket.send(msg.to_string().as_bytes()).ok();
+                }
+            }
+            return;
+        }
+        Some(Command::Pane { action }) => {
+            let (direction, content_type, keep_focus, command) = match action {
+                PaneAction::Hsplit {
+                    r#type,
+                    keep_focus,
+                    command,
+                } => ("right", r#type, keep_focus, command),
+                PaneAction::Vsplit {
+                    r#type,
+                    keep_focus,
+                    command,
+                } => ("down", r#type, keep_focus, command),
+            };
+            let content_type_str = match content_type {
+                PaneContentType::Terminal => "terminal",
+                PaneContentType::Diff => "diff",
+                PaneContentType::BranchDiff => "branch-diff",
+                PaneContentType::GitStatus => "git-status",
+                PaneContentType::ProjectSearch => "project-search",
+            };
+            let msg = serde_json::json!({
+                "type": "pane_split",
+                "direction": direction,
+                "content_type": content_type_str,
+                "keep_focus": keep_focus,
+                "command": command,
+            });
             let socket_path = agentium_socket_path();
             if let Ok(socket) = UnixDatagram::unbound() {
                 if socket.connect(&socket_path).is_ok() {
@@ -495,6 +598,25 @@ fn main() {
                                                 .update(cx, |app, _window, cx| {
                                                     app.set_claude_session_prompt(
                                                         &session_id, ancestor_pids, prompt, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::PaneSplit {
+                                            direction,
+                                            content_type,
+                                            keep_focus,
+                                            command,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, window, cx| {
+                                                    app.handle_pane_split(
+                                                        direction,
+                                                        content_type,
+                                                        keep_focus,
+                                                        command,
+                                                        window,
+                                                        cx,
                                                     );
                                                 })
                                                 .log_err();
