@@ -15,6 +15,7 @@ use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPrevi
 use markdown_preview::{OpenPreview, OpenPreviewToTheSide};
 use search::ProjectSearchView;
 use search::project_search::{ProjectSearch, ProjectSearchBar};
+use task::Shell;
 use terminal_view::TerminalView;
 use ui::{ActiveTheme, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -29,6 +30,14 @@ use workspace::{
     SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
     SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
 };
+
+pub enum PaneContentType {
+    Terminal,
+    Diff,
+    BranchDiff,
+    GitStatus,
+    ProjectSearch,
+}
 
 actions!(agentium, [NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
 
@@ -437,6 +446,23 @@ impl AgentiumApp {
         self.sync_ready_shell_pids();
         self.notify_all_panes(cx);
         cx.notify();
+    }
+
+    pub fn handle_pane_split(
+        &mut self,
+        direction: SplitDirection,
+        content_type: PaneContentType,
+        keep_focus: bool,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(arena) = self.active_arena().cloned() else {
+            return;
+        };
+        arena.update(cx, |arena, cx| {
+            arena.split_active_pane(direction, content_type, keep_focus, command, window, cx);
+        });
     }
 
     fn clear_ready_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
@@ -1051,6 +1077,200 @@ impl Arena {
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
         });
+    }
+
+    fn split_active_pane(
+        &mut self,
+        direction: SplitDirection,
+        content_type: PaneContentType,
+        keep_focus: bool,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match content_type {
+            PaneContentType::Terminal => {
+                self.split_with_terminal(direction, keep_focus, command, window, cx);
+            }
+            PaneContentType::Diff => {
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                let item = cx.new(|cx| {
+                    git_ui::project_diff::ProjectDiff::new(
+                        self.project.clone(),
+                        workspace,
+                        window,
+                        cx,
+                    )
+                });
+                self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
+            }
+            PaneContentType::BranchDiff => {
+                self.split_with_branch_diff(direction, keep_focus, window, cx);
+            }
+            PaneContentType::GitStatus => {
+                let item = cx.new(|cx| {
+                    GitStatusView::new(self.project.clone(), self.workspace.clone(), cx)
+                });
+                self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
+            }
+            PaneContentType::ProjectSearch => {
+                let project_search = cx.new(|cx| ProjectSearch::new(self.project.clone(), cx));
+                let item = cx.new(|cx| {
+                    ProjectSearchView::new(
+                        self.workspace.clone(),
+                        project_search,
+                        window,
+                        cx,
+                        None,
+                    )
+                });
+                self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
+            }
+        }
+    }
+
+    fn split_with_item(
+        &mut self,
+        item: Box<dyn workspace::ItemHandle>,
+        direction: SplitDirection,
+        keep_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new_pane = new_agentium_pane(
+            self.workspace.clone(),
+            self.project.clone(),
+            self.ready_shell_pids.clone(),
+            window,
+            cx,
+        );
+        new_pane.update(cx, |pane, cx| {
+            pane.add_item(item, true, true, None, window, cx);
+        });
+        self.center
+            .split(&self.active_pane, &new_pane, direction, cx)
+            .log_err();
+        if !keep_focus {
+            window.focus(&new_pane.focus_handle(cx), cx);
+        }
+    }
+
+    fn split_with_terminal(
+        &mut self,
+        direction: SplitDirection,
+        keep_focus: bool,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_task = if command.is_empty() {
+            self.project.update(cx, |project, cx| {
+                project.create_terminal_shell(self.working_directory.clone(), cx)
+            })
+        } else {
+            let program = command[0].clone();
+            let args = command[1..].to_vec();
+            let shell = Shell::WithArguments {
+                program,
+                args,
+                title_override: None,
+            };
+            self.project.update(cx, |project, cx| {
+                project.create_terminal_with_shell(self.working_directory.clone(), shell, cx)
+            })
+        };
+
+        let workspace_weak = self.workspace.clone();
+        let project = self.project.clone();
+        let ready_shell_pids = self.ready_shell_pids.clone();
+        let active_pane = self.active_pane.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let terminal = terminal_task.await?;
+
+            this.update_in(cx, move |this, window, cx| {
+                let terminal_view = Box::new(cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace_weak.clone(),
+                        None,
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                }));
+                let new_pane = new_agentium_pane(
+                    workspace_weak,
+                    project,
+                    ready_shell_pids,
+                    window,
+                    cx,
+                );
+                new_pane.update(cx, |pane, cx| {
+                    pane.add_item(terminal_view, true, true, None, window, cx);
+                });
+                this.center
+                    .split(&active_pane, &new_pane, direction, cx)
+                    .log_err();
+                if !keep_focus {
+                    window.focus(&new_pane.focus_handle(cx), cx);
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn split_with_branch_diff(
+        &mut self,
+        direction: SplitDirection,
+        keep_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = self.project.clone();
+        let workspace_weak = self.workspace.clone();
+        let ready_shell_pids = self.ready_shell_pids.clone();
+        let active_pane = self.active_pane.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let project_diff = cx
+                .update(|window, cx| {
+                    git_ui::project_diff::ProjectDiff::new_with_default_branch(
+                        project.clone(),
+                        workspace,
+                        window,
+                        cx,
+                    )
+                })?
+                .await?;
+
+            this.update_in(cx, |this, window, cx| {
+                let new_pane = new_agentium_pane(
+                    workspace_weak,
+                    project,
+                    ready_shell_pids,
+                    window,
+                    cx,
+                );
+                new_pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(project_diff), true, true, None, window, cx);
+                });
+                this.center
+                    .split(&active_pane, &new_pane, direction, cx)
+                    .log_err();
+                if !keep_focus {
+                    window.focus(&new_pane.focus_handle(cx), cx);
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn new_pane_with_terminal(
