@@ -902,18 +902,21 @@ impl Arena {
         let workspace_weak = workspace.clone();
         let project_weak = project.downgrade();
         let active_pane = pane.clone();
+        let pids_for_terminal = ready_shell_pids.clone();
         cx.spawn_in(window, async move |_this, cx| {
             let terminal = terminal_task.await?;
             cx.update(|window, cx| {
                 let terminal_view = Box::new(cx.new(|cx| {
-                    TerminalView::new(
+                    let mut view = TerminalView::new(
                         terminal,
                         workspace_weak,
                         None,
                         project_weak,
                         window,
                         cx,
-                    )
+                    );
+                    view.set_prompt_waiting_pids(pids_for_terminal);
+                    view
                 }));
                 active_pane.update(cx, |pane, cx| {
                     pane.add_item(terminal_view, true, true, None, window, cx);
@@ -944,19 +947,22 @@ impl Arena {
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
+        let pids = self.ready_shell_pids.clone();
 
         cx.spawn_in(window, async move |_this, cx| {
             let terminal = terminal_task.await?;
             cx.update(|window, cx| {
                 let terminal_view = Box::new(cx.new(|cx| {
-                    TerminalView::new(
+                    let mut view = TerminalView::new(
                         terminal,
                         workspace_weak,
                         None,
                         project_weak,
                         window,
                         cx,
-                    )
+                    );
+                    view.set_prompt_waiting_pids(pids);
+                    view
                 }));
                 active_pane.update(cx, |pane, cx| {
                     pane.add_item(terminal_view, true, true, None, window, cx);
@@ -1075,14 +1081,16 @@ impl Arena {
 
             this.update_in(cx, move |_this, window, cx| {
                 let terminal_view = Box::new(cx.new(|cx| {
-                    TerminalView::new(
+                    let mut view = TerminalView::new(
                         terminal,
                         workspace_weak.clone(),
                         None,
                         project.downgrade(),
                         window,
                         cx,
-                    )
+                    );
+                    view.set_prompt_waiting_pids(ready_shell_pids.clone());
+                    view
                 }));
                 let pane = new_agentium_pane(workspace_weak, project, ready_shell_pids, window, cx);
                 pane.update(cx, |pane, cx| {
