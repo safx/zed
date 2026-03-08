@@ -557,14 +557,14 @@ impl AgentiumApp {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_ellipsis()
+                                    .truncate()
                                     .child(prompt_label.clone()),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(colors.text_muted)
-                                    .text_ellipsis()
+                                    .truncate()
                                     .child(status_label.clone()),
                             )
                             .into_any_element()
