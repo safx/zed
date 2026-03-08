@@ -488,6 +488,7 @@ fn main() {
                                     appears_transparent: true,
                                     traffic_light_position: Some(point(px(9.0), px(9.0))),
                                 }),
+                                is_movable: false,
                                 ..Default::default()
                             },
                             |window, cx| {
