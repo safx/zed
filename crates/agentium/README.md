@@ -21,9 +21,10 @@ Add the following to your Claude Code `settings.json`:
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "type": "command", "command": "agentium claude hook session-start" }],
-    "Stop": [{ "type": "command", "command": "agentium claude hook stop" }],
-    "Notification": [{ "type": "command", "command": "agentium claude hook notification" }]
+    "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command", "command": "agentium claude hook session-start" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "agentium claude hook stop" }] }],
+    "Notification": [{ "matcher": "", "hooks": [{ "type": "command", "command": "agentium claude hook notification" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentium claude hook user-prompt-submit" }] }]
   }
 }
 ```
