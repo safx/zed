@@ -1632,8 +1632,21 @@ impl Render for Arena {
                             this.save_active_item(SaveIntent::SaveAs, window, cx);
                         }),
                     )
-                    .child(
-                        pane_group
+                    .child(pane_group)
+                    .children(self.zoomed_pane.as_ref().and_then(|view| {
+                        let zoomed_view = view.upgrade()?;
+                        let colors = cx.theme().colors();
+                        Some(
+                            div()
+                                .occlude()
+                                .absolute()
+                                .overflow_hidden()
+                                .bg(colors.background)
+                                .child(zoomed_view)
+                                .inset_0()
+                                .shadow_lg(),
+                        )
+                    }))
                     .on_action(
                         cx.listener(|this, _: &OpenPreview, window, cx| {
                             this.open_markdown_preview(false, window, cx);
@@ -1782,7 +1795,6 @@ impl Render for Arena {
                             }
                         },
                     ))
-                    )
                     .child(self.modal_layer.clone())
             })
             .unwrap_or_else(|| div().size_full())
