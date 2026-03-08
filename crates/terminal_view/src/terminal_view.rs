@@ -12,7 +12,7 @@ use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
     Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
-    WeakEntity, actions, anchored, deferred, div,
+    WeakEntity, actions, anchored, deferred, div, hsla,
 };
 use menu;
 use persistence::TerminalDb;
@@ -24,7 +24,9 @@ use settings::{
 };
 use std::{
     any::Any,
+    cell::RefCell,
     cmp,
+    collections::HashSet,
     ops::Range as StdRange,
     path::{Path, PathBuf},
     rc::Rc,
@@ -155,6 +157,7 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    prompt_waiting_pids: Option<Rc<RefCell<HashSet<u32>>>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -302,9 +305,14 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            prompt_waiting_pids: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
+    }
+
+    pub fn set_prompt_waiting_pids(&mut self, pids: Rc<RefCell<HashSet<u32>>>) {
+        self.prompt_waiting_pids = Some(pids);
     }
 
     /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
@@ -879,6 +887,18 @@ impl TerminalView {
             return false;
         }
         terminal.foreground_process_name().as_deref() == Some("claude")
+    }
+
+    fn is_claude_prompt_waiting(&self, cx: &App) -> bool {
+        let pids = match self.prompt_waiting_pids.as_ref() {
+            Some(pids) => pids,
+            None => return false,
+        };
+        let terminal = self.terminal().read(cx);
+        terminal
+            .pid_getter()
+            .map(|g| g.fallback_pid().as_u32())
+            .is_some_and(|pid| pids.borrow().contains(&pid))
     }
 
     pub fn set_block_below_cursor(
@@ -1484,7 +1504,12 @@ impl Item for TerminalView {
         };
 
         let (icon, icon_color, rerun_button) = if is_claude {
-            (IconName::AiClaude, Color::Muted, None)
+            let color = if self.is_claude_prompt_waiting(cx) {
+                Color::Custom(hsla(12.0 / 360.0, 0.76, 0.63, 1.0))
+            } else {
+                Color::Muted
+            };
+            (IconName::AiClaude, color, None)
         } else {
             match terminal.task() {
                 Some(terminal_task) => match &terminal_task.status {
