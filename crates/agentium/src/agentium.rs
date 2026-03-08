@@ -71,6 +71,7 @@ struct Arena {
     working_directory: Option<PathBuf>,
     active_pane: Entity<Pane>,
     center: PaneGroup,
+    zoomed_pane: Option<AnyWeakView>,
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     modal_layer: Entity<ModalLayer>,
@@ -131,7 +132,13 @@ impl AgentiumApp {
     }
 
     fn add_arena(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_arena_inner(None, window, cx);
+        let working_directory = self
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .map(|wt| wt.read(cx).abs_path().to_path_buf());
+        self.add_arena_inner(working_directory, window, cx);
     }
 
     fn add_arena_inner(
@@ -922,6 +929,7 @@ impl Arena {
             working_directory,
             active_pane: pane,
             center,
+            zoomed_pane: None,
             workspace,
             project,
             modal_layer,
@@ -1107,15 +1115,17 @@ impl Arena {
                 }
             }
             pane::Event::ZoomIn => {
-                for pane in self.center.panes() {
+                if *pane == self.active_pane {
                     pane.update(cx, |pane, cx| pane.set_zoomed(true, cx));
+                    if pane.read(cx).has_focus(window, cx) {
+                        self.zoomed_pane = Some(pane.downgrade().into());
+                    }
+                    cx.notify();
                 }
-                cx.notify();
             }
             pane::Event::ZoomOut => {
-                for pane in self.center.panes() {
-                    pane.update(cx, |pane, cx| pane.set_zoomed(false, cx));
-                }
+                pane.update(cx, |pane, cx| pane.set_zoomed(false, cx));
+                self.zoomed_pane = None;
                 cx.notify();
             }
             pane::Event::AddItem { item } => {
@@ -1324,7 +1334,7 @@ impl Render for Arena {
             .unwrap_or_else(div);
         let ready_pids = self.ready_shell_pids.borrow().clone();
         self.workspace
-            .update(cx, |workspace, cx| {
+            .update(cx, |_workspace, cx| {
                 let decorator = AgentiumPaneDecorator {
                     active_pane: &self.active_pane,
                     workspace: &self.workspace,
@@ -1333,7 +1343,7 @@ impl Render for Arena {
                 search_actions_div
                     .size_full()
                     .child(self.center.render(
-                        workspace.zoomed_item(),
+                        self.zoomed_pane.as_ref(),
                         &decorator,
                         window,
                         cx,
