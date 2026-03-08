@@ -475,6 +475,7 @@ dependencies = [
  "serde_json",
  "session",
  "settings",
+ "task",
  "terminal",
  "terminal_view",
  "theme",
