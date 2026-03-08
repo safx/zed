@@ -53,6 +53,14 @@ enum ClaudeHookEvent {
     SessionStart,
     Stop,
     Notification,
+    UserPromptSubmit,
+}
+
+fn truncate_string(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_index, _)) => s[..byte_index].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn agentium_socket_path() -> PathBuf {
@@ -67,7 +75,8 @@ enum IpcMessage {
     WorkspacePath(PathBuf),
     ClaudeSessionStart { session_id: String, ancestor_pids: Vec<u32> },
     ClaudeStop { session_id: String, ancestor_pids: Vec<u32> },
-    ClaudeNotification { session_id: String, ancestor_pids: Vec<u32> },
+    ClaudeNotification { session_id: String, ancestor_pids: Vec<u32>, title: String },
+    ClaudeUserPromptSubmit { session_id: String, ancestor_pids: Vec<u32>, prompt: String },
 }
 
 fn try_send_path_to_running_instance(
@@ -152,6 +161,14 @@ fn start_ipc_listener(
                                     .collect()
                             })
                             .unwrap_or_default();
+                        let title = json["title"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let prompt = json["prompt"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
                         match json["type"].as_str() {
                             Some("claude_session_start") => {
                                 IpcMessage::ClaudeSessionStart { session_id, ancestor_pids }
@@ -160,7 +177,10 @@ fn start_ipc_listener(
                                 IpcMessage::ClaudeStop { session_id, ancestor_pids }
                             }
                             Some("claude_notification") => {
-                                IpcMessage::ClaudeNotification { session_id, ancestor_pids }
+                                IpcMessage::ClaudeNotification { session_id, ancestor_pids, title }
+                            }
+                            Some("claude_user_prompt_submit") => {
+                                IpcMessage::ClaudeUserPromptSubmit { session_id, ancestor_pids, prompt }
                             }
                             _ => continue,
                         }
@@ -211,12 +231,19 @@ fn main() {
                 ClaudeHookEvent::SessionStart => "claude_session_start",
                 ClaudeHookEvent::Stop => "claude_stop",
                 ClaudeHookEvent::Notification => "claude_notification",
+                ClaudeHookEvent::UserPromptSubmit => "claude_user_prompt_submit",
             };
-            let msg = serde_json::json!({
+            let mut msg = serde_json::json!({
                 "type": msg_type,
                 "session_id": session_id,
                 "ancestor_pids": ancestor_pids,
             });
+            if let Some(title) = json["title"].as_str() {
+                msg["title"] = serde_json::Value::String(truncate_string(title, 500));
+            }
+            if let Some(prompt) = json["prompt"].as_str() {
+                msg["prompt"] = serde_json::Value::String(truncate_string(prompt, 500));
+            }
 
             let socket_path = agentium_socket_path();
             if let Ok(socket) = UnixDatagram::unbound() {
@@ -441,7 +468,7 @@ fn main() {
                                             window_handle
                                                 .update(cx, |app, _window, cx| {
                                                     app.mark_claude_session_ready(
-                                                        &session_id, ancestor_pids, cx,
+                                                        &session_id, ancestor_pids, None, cx,
                                                     );
                                                 })
                                                 .log_err();
@@ -449,14 +476,25 @@ fn main() {
                                         IpcMessage::ClaudeNotification {
                                             session_id,
                                             ancestor_pids,
+                                            title,
                                         } => {
-                                            // Currently uses the same ready-state logic as Stop.
-                                            // Notification may fire while the agent is still running,
-                                            // so this may need a separate code path in the future.
                                             window_handle
                                                 .update(cx, |app, _window, cx| {
                                                     app.mark_claude_session_ready(
-                                                        &session_id, ancestor_pids, cx,
+                                                        &session_id, ancestor_pids, Some(title), cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudeUserPromptSubmit {
+                                            session_id,
+                                            ancestor_pids,
+                                            prompt,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.set_claude_session_prompt(
+                                                        &session_id, ancestor_pids, prompt, cx,
                                                     );
                                                 })
                                                 .log_err();

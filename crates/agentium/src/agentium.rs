@@ -35,6 +35,15 @@ actions!(agentium, [NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus])
 struct ClaudeSession {
     ancestor_pids: Vec<u32>,
     is_ready: bool,
+    user_prompt: String,
+    status_message: String,
+}
+
+struct ReadyTerminalInfo {
+    pane: Entity<Pane>,
+    terminal_view: Entity<TerminalView>,
+    user_prompt: String,
+    status_message: String,
 }
 
 pub struct AgentiumApp {
@@ -47,6 +56,7 @@ pub struct AgentiumApp {
     next_arena_id: usize,
     focus_handle: FocusHandle,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    badge_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     rename_editor: Entity<Editor>,
     renaming_arena: Option<Entity<Arena>>,
     claude_sessions: HashMap<String, ClaudeSession>,
@@ -96,6 +106,7 @@ impl AgentiumApp {
             next_arena_id: 0,
             focus_handle: cx.focus_handle(),
             context_menu: None,
+            badge_menu: None,
             rename_editor,
             renaming_arena: None,
             claude_sessions: HashMap::new(),
@@ -248,6 +259,7 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) {
         let this = cx.entity();
+        self.badge_menu.take();
         let arena_for_rename = arena_entity.clone();
         let arena_for_close = arena_entity;
         let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
@@ -356,6 +368,8 @@ impl AgentiumApp {
             ClaudeSession {
                 ancestor_pids,
                 is_ready: false,
+                user_prompt: String::new(),
+                status_message: String::new(),
             },
         );
         self.sync_ready_shell_pids();
@@ -366,17 +380,50 @@ impl AgentiumApp {
         &mut self,
         session_id: &str,
         ancestor_pids: Vec<u32>,
+        title: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let status_message = title.unwrap_or_else(|| "Ready".to_string());
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             session.is_ready = true;
             session.ancestor_pids = ancestor_pids;
+            session.status_message = status_message;
         } else {
             self.claude_sessions.insert(
                 session_id.to_string(),
                 ClaudeSession {
                     ancestor_pids,
                     is_ready: true,
+                    user_prompt: String::new(),
+                    status_message,
+                },
+            );
+        }
+        self.sync_ready_shell_pids();
+        self.notify_all_panes(cx);
+        cx.notify();
+    }
+
+    pub fn set_claude_session_prompt(
+        &mut self,
+        session_id: &str,
+        ancestor_pids: Vec<u32>,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.claude_sessions.get_mut(session_id) {
+            session.user_prompt = prompt;
+            session.ancestor_pids = ancestor_pids;
+            session.is_ready = false;
+            session.status_message.clear();
+        } else {
+            self.claude_sessions.insert(
+                session_id.to_string(),
+                ClaudeSession {
+                    ancestor_pids,
+                    is_ready: false,
+                    user_prompt: prompt,
+                    status_message: String::new(),
                 },
             );
         }
@@ -437,6 +484,126 @@ impl AgentiumApp {
                     .count()
             })
             .sum()
+    }
+
+    fn collect_ready_terminal_infos(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> Vec<ReadyTerminalInfo> {
+        let ready_pids = self.ready_shell_pids.borrow();
+        if ready_pids.is_empty() {
+            return vec![];
+        }
+        let arena = arena_entity.read(cx);
+        let mut infos = Vec::new();
+        for pane in arena.center.panes() {
+            for tv in pane.read(cx).items_of_type::<TerminalView>() {
+                let pid = tv
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .pid_getter()
+                    .map(|g| g.fallback_pid().as_u32());
+                let pid = match pid {
+                    Some(p) if ready_pids.contains(&p) => p,
+                    _ => continue,
+                };
+                let (user_prompt, status_message) = self
+                    .claude_sessions
+                    .values()
+                    .find(|s| s.is_ready && s.ancestor_pids.contains(&pid))
+                    .map(|s| (s.user_prompt.clone(), s.status_message.clone()))
+                    .unwrap_or_default();
+                infos.push(ReadyTerminalInfo {
+                    pane: pane.clone(),
+                    terminal_view: tv,
+                    user_prompt,
+                    status_message,
+                });
+            }
+        }
+        infos
+    }
+
+    fn deploy_badge_menu(
+        &mut self,
+        arena_index: usize,
+        terminal_infos: Vec<ReadyTerminalInfo>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.context_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |mut menu, window, _cx| {
+            for info in terminal_infos {
+                let pane = info.pane.clone();
+                let terminal_view = info.terminal_view.clone();
+                let prompt_label = if info.user_prompt.is_empty() {
+                    "(no prompt)".to_string()
+                } else {
+                    info.user_prompt.clone()
+                };
+                let status_label = info.status_message.clone();
+
+                menu = menu.custom_entry(
+                    move |_window, cx| {
+                        let colors = cx.theme().colors();
+                        v_flex()
+                            .w_full()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_ellipsis()
+                                    .child(prompt_label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.text_muted)
+                                    .text_ellipsis()
+                                    .child(status_label.clone()),
+                            )
+                            .into_any_element()
+                    },
+                    window.handler_for(&this, move |this, window, cx| {
+                        this.navigate_to_terminal(arena_index, &pane, &terminal_view, window, cx);
+                    }),
+                );
+            }
+            menu
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.badge_menu.take();
+                cx.notify();
+            });
+        self.badge_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn navigate_to_terminal(
+        &mut self,
+        arena_index: usize,
+        target_pane: &Entity<Pane>,
+        terminal_view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_arena(arena_index, window, cx);
+        window.focus(&target_pane.focus_handle(cx), cx);
+        let item_index = target_pane
+            .read(cx)
+            .index_for_item(terminal_view);
+        if let Some(index) = item_index {
+            target_pane.update(cx, |pane, cx| {
+                pane.activate_item(index, true, true, window, cx);
+            });
+        }
     }
 }
 
@@ -562,15 +729,30 @@ impl Render for AgentiumApp {
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
                                                 .when(!is_renaming, |d| d.child(arena.name.clone()))
                                                 .when(ready_count > 0, |d| {
+                                                    let arena_entity_for_badge = arena_entity.clone();
                                                     d.child(
                                                         div()
+                                                            .id(("arena-badge", arena.id))
                                                             .px_1p5()
                                                             .rounded_full()
                                                             .bg(colors.text_accent)
                                                             .text_color(colors.surface_background)
                                                             .text_xs()
                                                             .line_height(relative(1.4))
+                                                            .cursor_pointer()
                                                             .child(format!("{ready_count}"))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    let infos = this.collect_ready_terminal_infos(
+                                                                        &arena_entity_for_badge, cx,
+                                                                    );
+                                                                    this.deploy_badge_menu(
+                                                                        i, infos, event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
                                                     )
                                                 })
                                         })
@@ -651,6 +833,15 @@ impl Render for AgentiumApp {
                         ),
                     )
                     .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                        deferred(
+                            anchored()
+                                .position(*position)
+                                .anchor(Corner::TopLeft)
+                                .child(menu.clone()),
+                        )
+                        .with_priority(1)
+                    }))
+                    .children(self.badge_menu.as_ref().map(|(menu, position, _)| {
                         deferred(
                             anchored()
                                 .position(*position)
