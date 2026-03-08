@@ -52,6 +52,7 @@ enum ClaudeAction {
 enum ClaudeHookEvent {
     SessionStart,
     Stop,
+    Notification,
 }
 
 fn agentium_socket_path() -> PathBuf {
@@ -66,6 +67,7 @@ enum IpcMessage {
     WorkspacePath(PathBuf),
     ClaudeSessionStart { session_id: String, ancestor_pids: Vec<u32> },
     ClaudeStop { session_id: String, ancestor_pids: Vec<u32> },
+    ClaudeNotification { session_id: String, ancestor_pids: Vec<u32> },
 }
 
 fn try_send_path_to_running_instance(
@@ -157,6 +159,9 @@ fn start_ipc_listener(
                             Some("claude_stop") => {
                                 IpcMessage::ClaudeStop { session_id, ancestor_pids }
                             }
+                            Some("claude_notification") => {
+                                IpcMessage::ClaudeNotification { session_id, ancestor_pids }
+                            }
                             _ => continue,
                         }
                     }
@@ -205,6 +210,7 @@ fn main() {
             let msg_type = match event {
                 ClaudeHookEvent::SessionStart => "claude_session_start",
                 ClaudeHookEvent::Stop => "claude_stop",
+                ClaudeHookEvent::Notification => "claude_notification",
             };
             let msg = serde_json::json!({
                 "type": msg_type,
@@ -432,6 +438,21 @@ fn main() {
                                             session_id,
                                             ancestor_pids,
                                         } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.mark_claude_session_ready(
+                                                        &session_id, ancestor_pids, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudeNotification {
+                                            session_id,
+                                            ancestor_pids,
+                                        } => {
+                                            // Currently uses the same ready-state logic as Stop.
+                                            // Notification may fire while the agent is still running,
+                                            // so this may need a separate code path in the future.
                                             window_handle
                                                 .update(cx, |app, _window, cx| {
                                                     app.mark_claude_session_ready(

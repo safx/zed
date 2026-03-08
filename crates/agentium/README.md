@@ -22,7 +22,8 @@ Add the following to your Claude Code `settings.json`:
 {
   "hooks": {
     "SessionStart": [{ "type": "command", "command": "agentium claude hook session-start" }],
-    "Stop": [{ "type": "command", "command": "agentium claude hook stop" }]
+    "Stop": [{ "type": "command", "command": "agentium claude hook stop" }],
+    "Notification": [{ "type": "command", "command": "agentium claude hook notification" }]
   }
 }
 ```
