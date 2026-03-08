@@ -46,6 +46,7 @@ semver.workspace = true
 serde_json.workspace = true
 session.workspace = true
 settings.workspace = true
+task.workspace = true
 terminal.workspace = true
 terminal_view.workspace = true
 theme.workspace = true
