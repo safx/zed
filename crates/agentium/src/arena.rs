@@ -29,7 +29,7 @@ use workspace::{
 };
 
 use crate::{
-    NewBranchDiff, NewDiffView, NewGitStatus, NewProjectSearch, PaneContentType,
+    NewBranchDiff, NewClaudeCode, NewDiffView, NewGitStatus, NewProjectSearch, PaneContentType,
     git_status_view::GitStatusView,
 };
 
@@ -140,6 +140,38 @@ impl Arena {
         let terminal_task = self
             .project
             .update(cx, |project, cx| project.create_terminal_shell(None, cx));
+        let workspace_weak = self.workspace.clone();
+        let project_weak = self.project.downgrade();
+        let active_pane = self.active_pane.clone();
+        let pids = self.ready_shell_pids.clone();
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let terminal = terminal_task.await?;
+            cx.update(|window, cx| {
+                add_terminal_view_to_pane(
+                    terminal,
+                    workspace_weak,
+                    project_weak,
+                    pids,
+                    &active_pane,
+                    window,
+                    cx,
+                );
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn add_claude_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = Shell::WithArguments {
+            program: "claude".to_string(),
+            args: vec![],
+            title_override: Some("Claude Code".to_string()),
+        };
+        let terminal_task = self
+            .project
+            .update(cx, |project, cx| project.create_terminal_with_shell(None, shell, cx));
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
@@ -866,6 +898,11 @@ impl Render for Arena {
                         }),
                     )
                     .on_action(
+                        cx.listener(|this, _: &NewClaudeCode, window, cx| {
+                            this.add_claude_code(window, cx);
+                        }),
+                    )
+                    .on_action(
                         cx.listener(|this, _: &NewTerminal, window, cx| {
                             this.add_terminal(window, cx);
                         }),
@@ -1239,6 +1276,10 @@ pub(crate) fn new_agentium_pane(
                             let focus_handle = focus_handle.clone();
                             Some(ContextMenu::build(_window, cx, |menu: ui::ContextMenu, _, _| {
                                 menu.context(focus_handle.clone())
+                                    .action(
+                                        "New Claude Code",
+                                        NewClaudeCode.boxed_clone(),
+                                    )
                                     .action(
                                         "New Terminal",
                                         NewTerminal::default().boxed_clone(),
