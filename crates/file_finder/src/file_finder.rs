@@ -176,6 +176,81 @@ impl FileFinder {
         })
     }
 
+    pub fn open_scoped(
+        workspace: &mut Workspace,
+        separate_history: bool,
+        worktree_id: WorktreeId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<()> {
+        let project = workspace.project().read(cx);
+        let fs = project.fs();
+
+        let currently_opened_path = workspace.active_item(cx).and_then(|item| {
+            let project_path = item.project_path(cx)?;
+            if project_path.worktree_id != worktree_id {
+                return None;
+            }
+            let abs_path = project
+                .worktree_for_id(project_path.worktree_id, cx)?
+                .read(cx)
+                .absolutize(&project_path.path);
+            Some(FoundPath::new(project_path, abs_path))
+        });
+
+        let history_items = workspace
+            .recent_navigation_history(Some(MAX_RECENT_SELECTIONS), cx)
+            .into_iter()
+            .filter_map(|(project_path, abs_path)| {
+                if project_path.worktree_id != worktree_id {
+                    return None;
+                }
+                if project.entry_for_path(&project_path, cx).is_some() {
+                    return Some(Task::ready(Some(FoundPath::new(project_path, abs_path?))));
+                }
+                let abs_path = abs_path?;
+                if project.is_local() {
+                    let fs = fs.clone();
+                    Some(cx.background_spawn(async move {
+                        if fs.is_file(&abs_path).await {
+                            Some(FoundPath::new(project_path, abs_path))
+                        } else {
+                            None
+                        }
+                    }))
+                } else {
+                    Some(Task::ready(Some(FoundPath::new(project_path, abs_path))))
+                }
+            })
+            .collect::<Vec<_>>();
+        cx.spawn_in(window, async move |workspace, cx| {
+            let history_items = join_all(history_items).await.into_iter().flatten();
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let project = workspace.project().clone();
+                    let weak_workspace = cx.entity().downgrade();
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        let mut delegate = FileFinderDelegate::new(
+                            cx.entity().downgrade(),
+                            weak_workspace,
+                            project,
+                            currently_opened_path,
+                            history_items.collect(),
+                            separate_history,
+                            None,
+                            window,
+                            cx,
+                        );
+                        delegate.worktree_filter = Some(worktree_id);
+
+                        FileFinder::new(delegate, window, cx)
+                    });
+                })
+                .ok();
+        })
+    }
+
     fn new(delegate: FileFinderDelegate, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let modal_max_width_setting = FileFinderSettings::get_global(cx).modal_max_width;
 
@@ -388,6 +463,7 @@ pub struct FileFinderDelegate {
     include_ignored: Option<bool>,
     include_ignored_refresh: Task<()>,
     debounce_next_refresh: bool,
+    worktree_filter: Option<WorktreeId>,
 }
 
 /// Use a custom ordering for file finder: the regular one
@@ -1003,6 +1079,7 @@ impl FileFinderDelegate {
             include_ignored: include_ignored.or(FileFinderSettings::get_global(cx).include_ignored),
             include_ignored_refresh: Task::ready(()),
             debounce_next_refresh: false,
+            worktree_filter: None,
         }
     }
 
@@ -1056,10 +1133,12 @@ impl FileFinderDelegate {
             .currently_opened_path
             .as_ref()
             .map(|found_path| Arc::clone(&found_path.project.path));
+        let worktree_filter = self.worktree_filter;
         let worktree_store = self.project.read(cx).worktree_store();
         let worktrees = worktree_store
             .read(cx)
             .visible_worktrees_and_single_files(cx)
+            .filter(|wt| worktree_filter.map_or(true, |id| wt.read(cx).id() == id))
             .collect::<Vec<_>>();
         let include_root_name = !should_hide_root_in_entry_path(&worktree_store, cx);
         let candidate_sets = worktrees
