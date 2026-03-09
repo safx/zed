@@ -598,9 +598,9 @@ impl AgentiumApp {
                 let prompt_label = if info.user_prompt.is_empty() {
                     "(no prompt)".to_string()
                 } else {
-                    info.user_prompt.clone()
+                    truncate_for_menu(&info.user_prompt)
                 };
-                let status_label = info.status_message.clone();
+                let status_label = truncate_for_menu(&info.status_message);
 
                 menu = menu.custom_entry(
                     move |_window, cx| {
@@ -667,6 +667,16 @@ enum ArenaEvent {
 }
 
 impl EventEmitter<ArenaEvent> for Arena {}
+
+fn truncate_for_menu(s: &str) -> String {
+    for (i, ch) in s.char_indices() {
+        if i >= 100 || ch == '\n' || ch == '.' || ch == '\u{3002}' {
+            let end = if ch == '\n' { i } else { i + ch.len_utf8() };
+            return format!("{} \u{2026}", &s[..end]);
+        }
+    }
+    s.to_string()
+}
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
     let path = url
