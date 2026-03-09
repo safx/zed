@@ -43,8 +43,23 @@ Requires Metal Toolchain on macOS:
 xcodebuild -downloadComponent MetalToolchain
 ```
 
+## macOS App Bundle
 
-## completion
+To build `Agentium.app`:
+
+```
+./script/bundle-agentium
+```
+
+Options:
+- `-d` — debug build
+- `-o` — open the app after building
+
+The bundle is output to `target/<triple>/release/bundle/osx/Agentium.app`.
+
+Replace the placeholder icons at `crates/agentium/resources/app-icon{,@2x}.png` with real Agentium icons (512x512 and 1024x1024).
+
+## Completion
 
 #### zsh
 ```
