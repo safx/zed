@@ -54,3 +54,10 @@ ui.workspace = true
 util.workspace = true
 uuid.workspace = true
 workspace.workspace = true
+
+[package.metadata.bundle]
+icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
+identifier = "dev.agentium.Agentium"
+name = "Agentium"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
