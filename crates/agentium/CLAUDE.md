@@ -62,3 +62,17 @@ The Unix datagram socket at `agentium.sock` carries two message formats: raw UTF
 ## Cross-file navigation uses `pane_for_open()` not `active_pane()`
 
 Zed's `editor.rs` navigation code (`navigate_to_hover_links`, `find_all_references`, `open_locations_in_multibuffer`) was changed to use `workspace.pane_for_open()` instead of `workspace.active_pane()`. This is necessary because `Workspace::active_pane` points to its own internal pane (not rendered in Agentium), while `pane_for_open()` checks `last_active_center_pane` first, which Agentium sets via `Workspace::set_last_active_center_pane` on `pane::Event::Focus`.
+
+## macOS app bundle uses `cargo bundle` (Zed fork)
+
+`Agentium.app` is built via `script/bundle-agentium`, which uses the Zed fork of `cargo-bundle` (`cargo-bundle v0.6.1-zed` from `zed-industries/cargo-bundle`, branch `zed-deploy`). The bundle metadata is in `[package.metadata.bundle]` in `Cargo.toml` — not channel-suffixed like Zed's `bundle-dev`/`bundle-stable`, since Agentium has no release channels.
+
+Resources at `crates/agentium/resources/info/` contain plist fragments that `cargo bundle` merges into `Info.plist`:
+- `Permissions.plist` — NS*UsageDescription keys (camera, mic, location, etc.)
+- `SupportedPlatforms.plist` — `CFBundleSupportedPlatforms: [MacOSX]`
+
+Agentium does **not** set `ZED_BUNDLE=true` at build time. This env var controls whether the `git` crate looks for a bundled git binary at `Contents/MacOS/git`. Since Agentium does not bundle git, the system git is used instead.
+
+## TERM_PROGRAM is derived from the binary name
+
+`terminal::insert_zed_terminal_env` uses `std::env::current_exe()` to determine the value of `TERM_PROGRAM`. When the running binary is `agentium` (including inside `Agentium.app/Contents/MacOS/agentium`), terminals get `TERM_PROGRAM=agentium`. When running as `zed`, they get `TERM_PROGRAM=zed`. This is important for tools like Claude Code that inspect `TERM_PROGRAM` to detect the host terminal.
