@@ -635,7 +635,7 @@ impl AgentiumApp {
 
 fn truncate_for_menu(s: &str) -> String {
     for (i, ch) in s.char_indices() {
-        if i >= 100 || ch == '\n' || ch == '.' || ch == '\u{3002}' {
+        if i >= 100 || ch == '\n' || ch == '\u{3002}' {
             let end = if ch == '\n' { i } else { i + ch.len_utf8() };
             return format!("{} \u{2026}", &s[..end]);
         }
@@ -718,7 +718,7 @@ impl Render for AgentiumApp {
                     )
                     .child(
                         div()
-                            .id("workspace-list")
+                            .id("arena-list")
                             .flex_1()
                             .overflow_y_scroll()
                             .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
