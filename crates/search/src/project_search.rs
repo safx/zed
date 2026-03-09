@@ -990,6 +990,12 @@ impl ProjectSearchView {
         this
     }
 
+    pub fn set_include_filter(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.included_files_editor
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        self.filters_enabled = true;
+    }
+
     pub fn new_search_in_directory(
         workspace: &mut Workspace,
         dir_path: &RelPath,
