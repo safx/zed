@@ -136,7 +136,7 @@ impl AgentiumApp {
     ) {
         self.project
             .update(cx, |project, cx| {
-                project.find_or_create_worktree(&path, true, cx)
+                project.create_worktree(&path, true, cx)
             })
             .detach_and_log_err(cx);
         self.add_arena_inner(Some(path), window, cx);
@@ -226,9 +226,8 @@ impl AgentiumApp {
                     .map(|wt| wt.read(cx).abs_path().to_path_buf())
             });
 
-        let effective_path = match effective_path {
-            Some(path) => path,
-            None => return format!("Arena {}", fallback_id + 1),
+        let Some(effective_path) = effective_path else {
+            return format!("Arena {}", fallback_id + 1);
         };
 
         // a. Remote repository name from matching git repo
@@ -269,6 +268,14 @@ impl AgentiumApp {
             let repo_path = &repo.read(cx).work_directory_abs_path;
             if let Some(name) = repo_path.file_name() {
                 return name.to_string_lossy().to_string();
+            }
+        }
+
+        // d. Directory name from the effective path
+        if let Some(name) = effective_path.file_name() {
+            let name = name.to_string_lossy();
+            if !name.is_empty() {
+                return name.to_string();
             }
         }
 
@@ -764,17 +771,20 @@ impl Render for AgentiumApp {
 
                                     let git_info = effective_path.as_ref().and_then(|working_dir| {
                                         let git_store = self.project.read(cx).git_store().read(cx);
-                                        git_store.repositories().values().find_map(|repo| {
-                                            let repo = repo.read(cx);
-                                            let repo_path = &repo.work_directory_abs_path;
-                                            if working_dir.starts_with(repo_path.as_ref()) {
-                                                let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
-                                                let summary = repo.status_summary();
-                                                Some((branch_name, summary))
-                                            } else {
-                                                None
-                                            }
-                                        })
+                                        git_store.repositories().values()
+                                            .filter_map(|repo| {
+                                                let repo = repo.read(cx);
+                                                let repo_path = &repo.work_directory_abs_path;
+                                                if working_dir.starts_with(repo_path.as_ref()) {
+                                                    let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
+                                                    let summary = repo.status_summary();
+                                                    Some((repo_path.clone(), branch_name, summary))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .max_by_key(|(repo_path, _, _)| repo_path.clone())
+                                            .map(|(_, branch_name, summary)| (branch_name, summary))
                                     });
 
                                     div()
