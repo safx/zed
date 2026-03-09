@@ -111,7 +111,7 @@ fn agentium_socket_path() -> PathBuf {
 enum IpcMessage {
     WorkspacePath(PathBuf),
     ClaudeSessionStart { session_id: String, ancestor_pids: Vec<u32> },
-    ClaudeStop { session_id: String, ancestor_pids: Vec<u32> },
+    ClaudeStop { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeNotification { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeUserPromptSubmit { session_id: String, ancestor_pids: Vec<u32>, prompt: String },
     PaneSplit {
@@ -217,7 +217,7 @@ fn start_ipc_listener(
                                 IpcMessage::ClaudeSessionStart { session_id, ancestor_pids }
                             }
                             Some("claude_stop") => {
-                                IpcMessage::ClaudeStop { session_id, ancestor_pids }
+                                IpcMessage::ClaudeStop { session_id, ancestor_pids, title }
                             }
                             Some("claude_notification") => {
                                 IpcMessage::ClaudeNotification { session_id, ancestor_pids, title }
@@ -306,7 +306,9 @@ fn main() {
                 "session_id": session_id,
                 "ancestor_pids": ancestor_pids,
             });
-            if let Some(title) = json["title"].as_str() {
+            let title = json["title"].as_str()
+                .or_else(|| json["message"].as_str());
+            if let Some(title) = title {
                 msg["title"] = serde_json::Value::String(truncate_string(title, 500));
             }
             if let Some(prompt) = json["prompt"].as_str() {
@@ -568,11 +570,13 @@ fn main() {
                                         IpcMessage::ClaudeStop {
                                             session_id,
                                             ancestor_pids,
+                                            title,
                                         } => {
+                                            let title = if title.is_empty() { None } else { Some(title) };
                                             window_handle
                                                 .update(cx, |app, _window, cx| {
                                                     app.mark_claude_session_ready(
-                                                        &session_id, ancestor_pids, None, cx,
+                                                        &session_id, ancestor_pids, title, cx,
                                                     );
                                                 })
                                                 .log_err();
