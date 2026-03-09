@@ -9,7 +9,7 @@ use std::sync::Arc;
 use editor::{Editor, EditorEvent};
 use git_ui::git_status_icon;
 use gpui::{prelude::*, *};
-use project::Project;
+use project::{Project, ProjectPath, WorktreeId};
 use project::git_store::{GitStoreEvent, RepositoryEvent, StatusEntry};
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
 use markdown_preview::{OpenPreview, OpenPreviewToTheSide};
@@ -185,6 +185,9 @@ impl AgentiumApp {
 
         self.arenas.push(arena_entity.clone());
         self.active_arena_index = Some(self.arenas.len() - 1);
+        arena_entity.update(cx, |arena, cx| {
+            arena.activate_context(cx);
+        });
         let focus = arena_entity.focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
@@ -193,6 +196,9 @@ impl AgentiumApp {
     fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.arenas.len() {
             self.active_arena_index = Some(index);
+            self.arenas[index].update(cx, |arena, cx| {
+                arena.activate_context(cx);
+            });
             let focus = self.arenas[index].focus_handle(cx);
             focus.focus(window, cx);
             cx.notify();
@@ -358,9 +364,16 @@ impl AgentiumApp {
             self.renaming_arena = None;
         }
 
-        if let Some(ws) = self.active_arena() {
+        if let Some(ws) = self.active_arena().cloned() {
+            ws.update(cx, |arena, cx| {
+                arena.activate_context(cx);
+            });
             let focus = ws.focus_handle(cx);
             focus.focus(window, cx);
+        } else {
+            self.workspace_entity.update(cx, |ws, cx| {
+                ws.clear_active_worktree_override(cx);
+            });
         }
         cx.notify();
     }
@@ -994,6 +1007,39 @@ impl Arena {
         }
     }
 
+    fn worktree_id(&self, cx: &App) -> Option<WorktreeId> {
+        let working_directory = self.working_directory.as_ref()?;
+        self.project.read(cx).visible_worktrees(cx).find_map(|wt| {
+            let wt = wt.read(cx);
+            if wt.abs_path().as_ref() == working_directory.as_path() {
+                Some(wt.id())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn activate_context(&self, cx: &mut App) {
+        let worktree_id = self.worktree_id(cx);
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |ws, cx| {
+                ws.set_active_worktree_override(worktree_id, cx);
+            });
+        }
+
+        if let Some(worktree_id) = worktree_id {
+            let project_path = ProjectPath {
+                worktree_id,
+                path: Arc::from(util::rel_path::RelPath::empty()),
+            };
+            let git_store = self.project.read(cx).git_store().clone();
+            git_store.update(cx, |git_store, cx| {
+                git_store.set_active_repo_for_path(&project_path, cx);
+            });
+        }
+    }
+
     fn add_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let terminal_task = self
             .project
@@ -1048,6 +1094,7 @@ impl Arena {
     }
 
     fn add_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1065,6 +1112,7 @@ impl Arena {
     }
 
     fn add_branch_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1089,9 +1137,25 @@ impl Arena {
     }
 
     fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
         let project_search = cx.new(|cx| ProjectSearch::new(self.project.clone(), cx));
+        let needs_filter = self.project.read(cx).visible_worktrees(cx).count() > 1;
+        let filter = if needs_filter {
+            self.working_directory
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| format!("{}/**", n.to_string_lossy()))
+        } else {
+            None
+        };
+        let workspace_weak = self.workspace.clone();
         let view = cx.new(|cx| {
-            ProjectSearchView::new(self.workspace.clone(), project_search, window, cx, None)
+            let mut view =
+                ProjectSearchView::new(workspace_weak, project_search, window, cx, None);
+            if let Some(ref filter) = filter {
+                view.set_include_filter(filter, window, cx);
+            }
+            view
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
@@ -1099,6 +1163,7 @@ impl Arena {
     }
 
     fn add_git_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
         let view = cx.new(|cx| {
             GitStatusView::new(self.project.clone(), self.workspace.clone(), cx)
         });
@@ -1121,6 +1186,7 @@ impl Arena {
                 self.split_with_terminal(direction, keep_focus, command, window, cx);
             }
             PaneContentType::Diff => {
+                self.activate_context(cx);
                 let Some(workspace) = self.workspace.upgrade() else {
                     return;
                 };
@@ -1135,24 +1201,42 @@ impl Arena {
                 self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
             }
             PaneContentType::BranchDiff => {
+                self.activate_context(cx);
                 self.split_with_branch_diff(direction, keep_focus, window, cx);
             }
             PaneContentType::GitStatus => {
+                self.activate_context(cx);
                 let item = cx.new(|cx| {
                     GitStatusView::new(self.project.clone(), self.workspace.clone(), cx)
                 });
                 self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
             }
             PaneContentType::ProjectSearch => {
+                self.activate_context(cx);
                 let project_search = cx.new(|cx| ProjectSearch::new(self.project.clone(), cx));
+                let needs_filter =
+                    self.project.read(cx).visible_worktrees(cx).count() > 1;
+                let filter = if needs_filter {
+                    self.working_directory
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| format!("{}/**", n.to_string_lossy()))
+                } else {
+                    None
+                };
+                let workspace_weak = self.workspace.clone();
                 let item = cx.new(|cx| {
-                    ProjectSearchView::new(
-                        self.workspace.clone(),
+                    let mut view = ProjectSearchView::new(
+                        workspace_weak,
                         project_search,
                         window,
                         cx,
                         None,
-                    )
+                    );
+                    if let Some(ref filter) = filter {
+                        view.set_include_filter(filter, window, cx);
+                    }
+                    view
                 });
                 self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
             }
@@ -1616,6 +1700,7 @@ impl Render for Arena {
                     .size_full()
                     .on_action(
                         cx.listener(|this, action: &ToggleFileFinder, window, cx| {
+                            let worktree_id = this.worktree_id(cx);
                             let Some(workspace) = this.workspace.upgrade() else {
                                 return;
                             };
@@ -1625,6 +1710,15 @@ impl Render for Arena {
                                     .is_some()
                                 {
                                     workspace.hide_modal(window, cx);
+                                } else if let Some(worktree_id) = worktree_id {
+                                    file_finder::FileFinder::open_scoped(
+                                        workspace,
+                                        action.separate_history,
+                                        worktree_id,
+                                        window,
+                                        cx,
+                                    )
+                                    .detach();
                                 } else {
                                     file_finder::FileFinder::open(
                                         workspace,
