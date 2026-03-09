@@ -10,6 +10,12 @@ use ui::ActiveTheme;
 use util::ResultExt as _;
 use workspace::SplitDirection;
 
+actions!(agentium, [Quit]);
+
+fn quit(_: &Quit, cx: &mut App) {
+    cx.quit();
+}
+
 #[derive(Parser)]
 #[command(name = "agentium")]
 struct Args {
@@ -390,6 +396,15 @@ fn main() {
                 theme::SystemAppearance(theme::Appearance::Dark);
             theme::GlobalTheme::reload_theme(cx);
             load_embedded_fonts(cx);
+
+            cx.on_action(quit);
+            cx.set_menus(vec![Menu {
+                name: "Agentium".into(),
+                items: vec![
+                    MenuItem::action("Quit Agentium", Quit),
+                ],
+            }]);
+
             let clock = Arc::new(clock::RealSystemClock);
             let http = Arc::new(http_client::HttpClientWithUrl::new(
                 Arc::new(http_client::BlockedHttpClient::new()),
