@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+build_flag="--release"
+target_dir="release"
+open_result=false
+
+help_info() {
+  echo "
+Usage: ${0##*/} [options] [architecture]
+Build the Agentium.app bundle for macOS.
+
+Options:
+  -d    Compile in debug mode
+  -o    Open the resulting app after build.
+  -h    Display this help and exit.
+  "
+}
+
+while getopts 'doh' flag
+do
+    case "${flag}" in
+        o) open_result=true;;
+        d)
+            export CARGO_INCREMENTAL=true
+            export CARGO_BUNDLE_SKIP_BUILD=true
+            build_flag=""
+            target_dir="debug"
+            ;;
+        h)
+           help_info
+           exit 0
+           ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+export CXXFLAGS="-stdlib=libc++"
+
+cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
+if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+fi
+
+version_info=$(rustc --version --verbose)
+host_line=$(echo "$version_info" | grep host)
+target_triple=${host_line#*: }
+if [[ $# -gt 0 && -n "$1" ]]; then
+    target_triple="$1"
+fi
+
+echo "Compiling agentium binary for ${target_triple}"
+cargo build ${build_flag} --package agentium --target "${target_triple}"
+
+echo "Creating application bundle"
+pushd crates/agentium
+app_path=$(cargo bundle ${build_flag} --target "${target_triple}" --select-workspace-root | xargs)
+popd
+echo "Bundled ${app_path}"
+
+cp "target/${target_triple}/${target_dir}/agentium" "${app_path}/Contents/MacOS/agentium"
+
+if [ "$open_result" = true ]; then
+    open "${app_path}"
+fi
