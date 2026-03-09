@@ -27,7 +27,7 @@ pub enum PaneContentType {
     ProjectSearch,
 }
 
-actions!(agentium, [NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
+actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
 
 struct ClaudeSession {
     ancestor_pids: Vec<u32>,
