@@ -1,10 +1,11 @@
 use std::ops::Range;
 
+use git::status::StageStatus;
 use git_ui::git_status_icon;
 use gpui::{prelude::*, *};
 use project::Project;
-use project::git_store::{GitStoreEvent, RepositoryEvent, StatusEntry};
-use ui::{ActiveTheme, prelude::*};
+use project::git_store::{GitStoreEvent, Repository, RepositoryEvent, StatusEntry};
+use ui::{ActiveTheme, Checkbox, ToggleState, prelude::*};
 use workspace::notifications::NotifyResultExt as _;
 use workspace::{Item, Workspace};
 
@@ -71,19 +72,7 @@ impl GitStatusView {
     fn update_entries(&mut self, cx: &mut Context<Self>) {
         self.entries.clear();
 
-        let repo = self
-            .project
-            .read(cx)
-            .active_repository(cx)
-            .or_else(|| {
-                self.project
-                    .read(cx)
-                    .repositories(cx)
-                    .values()
-                    .next()
-                    .cloned()
-            });
-        let Some(repo) = repo else {
+        let Some(repo) = self.active_repository(cx) else {
             cx.notify();
             return;
         };
@@ -120,15 +109,8 @@ impl GitStatusView {
         cx.notify();
     }
 
-    fn open_entry(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(GitStatusListEntry::Entry(status_entry)) = self.entries.get(ix) else {
-            return;
-        };
-        if status_entry.status.is_deleted() {
-            return;
-        }
-        let repo = self
-            .project
+    fn active_repository(&self, cx: &App) -> Option<Entity<Repository>> {
+        self.project
             .read(cx)
             .active_repository(cx)
             .or_else(|| {
@@ -138,8 +120,43 @@ impl GitStatusView {
                     .values()
                     .next()
                     .cloned()
-            });
-        let Some(repo) = repo else {
+            })
+    }
+
+    fn toggle_staged(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(GitStatusListEntry::Entry(status_entry)) = self.entries.get(ix) else {
+            return;
+        };
+        let Some(repo) = self.active_repository(cx) else {
+            return;
+        };
+
+        let stage_status = repo.read(cx)
+            .status_for_path(&status_entry.repo_path)
+            .map(|e| e.status.staging())
+            .unwrap_or_else(|| status_entry.status.staging());
+
+        let repo_path = status_entry.repo_path.clone();
+        let should_stage = !stage_status.is_fully_staged();
+
+        repo.update(cx, |repo, cx| {
+            if should_stage {
+                repo.stage_entries(vec![repo_path], cx)
+            } else {
+                repo.unstage_entries(vec![repo_path], cx)
+            }
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_entry(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(GitStatusListEntry::Entry(status_entry)) = self.entries.get(ix) else {
+            return;
+        };
+        if status_entry.status.is_deleted() {
+            return;
+        }
+        let Some(repo) = self.active_repository(cx) else {
             return;
         };
         let Some(project_path) =
@@ -217,33 +234,60 @@ impl Render for GitStatusView {
                                             .text_color(colors.text_muted)
                                             .child(section.title())
                                             .into_any_element(),
-                                        GitStatusListEntry::Entry(status_entry) => div()
-                                            .id(("entry", ix))
-                                            .px_2()
-                                            .py_0p5()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .text_sm()
-                                            .text_color(colors.text)
-                                            .cursor_pointer()
-                                            .hover(|style| {
-                                                style.bg(colors.element_hover)
-                                            })
-                                            .child(git_status_icon(status_entry.status))
-                                            .child(SharedString::from(
-                                                status_entry
-                                                    .repo_path
-                                                    .display(util::paths::PathStyle::Posix)
-                                                    .to_string(),
-                                            ))
-                                            .on_click(cx.listener(
-                                                move |this, _, window, cx| {
-                                                    this.open_entry(ix, window, cx);
-                                                },
-                                            ))
-                                            .into_any_element(),
+                                        GitStatusListEntry::Entry(status_entry) => {
+                                            let toggle_state =
+                                                match status_entry.status.staging() {
+                                                    StageStatus::Staged => ToggleState::Selected,
+                                                    StageStatus::Unstaged => {
+                                                        ToggleState::Unselected
+                                                    }
+                                                    StageStatus::PartiallyStaged => {
+                                                        ToggleState::Indeterminate
+                                                    }
+                                                };
+
+                                            div()
+                                                .id(("entry", ix))
+                                                .px_2()
+                                                .py_0p5()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .text_sm()
+                                                .text_color(colors.text)
+                                                .cursor_pointer()
+                                                .hover(|style| {
+                                                    style.bg(colors.element_hover)
+                                                })
+                                                .child(
+                                                    Checkbox::new(
+                                                        ("staged", ix),
+                                                        toggle_state,
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.toggle_staged(ix, cx);
+                                                        },
+                                                    )),
+                                                )
+                                                .child(git_status_icon(status_entry.status))
+                                                .child(SharedString::from(
+                                                    status_entry
+                                                        .repo_path
+                                                        .display(
+                                                            util::paths::PathStyle::Posix,
+                                                        )
+                                                        .to_string(),
+                                                ))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.open_entry(ix, window, cx);
+                                                    },
+                                                ))
+                                                .into_any_element()
+                                        }
                                     }
                                 })
                                 .collect()
