@@ -14,7 +14,7 @@ use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
 use ui::{ActiveTheme, ContextMenu, prelude::*};
 use workspace::{
-    AppState, Pane, SplitDirection, Workspace,
+    AppState, Pane, SplitDirection, Workspace, ZoomOut,
 };
 
 use arena::{Arena, ArenaEvent};
@@ -621,6 +621,24 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) {
         self.switch_arena(arena_index, window, cx);
+
+        if let Some(arena) = self.arenas.get(arena_index) {
+            if let Some(zoomed_view) = arena
+                .read(cx)
+                .zoomed_pane
+                .as_ref()
+                .and_then(|z| z.upgrade())
+            {
+                if zoomed_view.entity_id() != target_pane.entity_id() {
+                    if let Ok(zoomed_pane) = zoomed_view.downcast::<Pane>() {
+                        zoomed_pane.update(cx, |pane, cx| {
+                            pane.zoom_out(&ZoomOut, window, cx);
+                        });
+                    }
+                }
+            }
+        }
+
         window.focus(&target_pane.focus_handle(cx), cx);
         let item_index = target_pane
             .read(cx)
