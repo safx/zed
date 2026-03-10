@@ -43,7 +43,7 @@ pub(crate) struct Arena {
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) active_pane: Entity<Pane>,
     pub(crate) center: PaneGroup,
-    zoomed_pane: Option<AnyWeakView>,
+    pub(crate) zoomed_pane: Option<AnyWeakView>,
     pub(crate) workspace: WeakEntity<Workspace>,
     pub(crate) project: Entity<Project>,
     modal_layer: Entity<ModalLayer>,
