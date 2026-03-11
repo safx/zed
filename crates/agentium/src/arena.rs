@@ -294,6 +294,71 @@ impl Arena {
         });
     }
 
+    pub(crate) fn add_tab(
+        &mut self,
+        content_type: PaneContentType,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match content_type {
+            PaneContentType::Terminal => {
+                let terminal_task = if command.is_empty() {
+                    self.project.update(cx, |project, cx| {
+                        project.create_terminal_shell(self.working_directory.clone(), cx)
+                    })
+                } else {
+                    let program = command[0].clone();
+                    let args = command[1..].to_vec();
+                    let shell = Shell::WithArguments {
+                        program,
+                        args,
+                        title_override: None,
+                    };
+                    self.project.update(cx, |project, cx| {
+                        project.create_terminal_with_shell(
+                            self.working_directory.clone(),
+                            shell,
+                            cx,
+                        )
+                    })
+                };
+                let workspace_weak = self.workspace.clone();
+                let project_weak = self.project.downgrade();
+                let active_pane = self.active_pane.clone();
+                let pids = self.session_state.ready_shell_pids.clone();
+                cx.spawn_in(window, async move |_this, cx| {
+                    let terminal = terminal_task.await?;
+                    cx.update(|window, cx| {
+                        add_terminal_view_to_pane(
+                            terminal,
+                            workspace_weak,
+                            project_weak,
+                            pids,
+                            &active_pane,
+                            window,
+                            cx,
+                        );
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+            PaneContentType::Diff => {
+                self.add_diff_view(window, cx);
+            }
+            PaneContentType::BranchDiff => {
+                self.add_branch_diff(window, cx);
+            }
+            PaneContentType::GitStatus => {
+                self.add_git_status(window, cx);
+            }
+            PaneContentType::ProjectSearch => {
+                self.add_project_search(window, cx);
+            }
+        }
+    }
+
     pub(crate) fn split_active_pane(
         &mut self,
         direction: SplitDirection,

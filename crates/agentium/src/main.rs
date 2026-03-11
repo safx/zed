@@ -34,6 +34,11 @@ enum Command {
         #[command(subcommand)]
         action: PaneAction,
     },
+    /// Tab operations
+    Tab {
+        #[command(subcommand)]
+        action: TabAction,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -64,6 +69,17 @@ enum PaneAction {
         r#type: PaneContentType,
         #[arg(long)]
         keep_focus: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum TabAction {
+    /// Add a new tab to the active pane
+    New {
+        #[arg(long, default_value = "terminal")]
+        r#type: PaneContentType,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -124,6 +140,10 @@ enum IpcMessage {
         direction: SplitDirection,
         content_type: agentium::PaneContentType,
         keep_focus: bool,
+        command: Vec<String>,
+    },
+    TabNew {
+        content_type: agentium::PaneContentType,
         command: Vec<String>,
     },
 }
@@ -258,6 +278,25 @@ fn start_ipc_listener(
                                     .unwrap_or_default();
                                 IpcMessage::PaneSplit { direction, content_type, keep_focus, command }
                             }
+                            Some("tab_new") => {
+                                let content_type = match json["content_type"].as_str() {
+                                    Some("terminal") => agentium::PaneContentType::Terminal,
+                                    Some("diff") => agentium::PaneContentType::Diff,
+                                    Some("branch-diff") => agentium::PaneContentType::BranchDiff,
+                                    Some("git-status") => agentium::PaneContentType::GitStatus,
+                                    Some("project-search") => agentium::PaneContentType::ProjectSearch,
+                                    _ => continue,
+                                };
+                                let command: Vec<String> = json["command"]
+                                    .as_array()
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                IpcMessage::TabNew { content_type, command }
+                            }
                             _ => continue,
                         }
                     }
@@ -362,6 +401,30 @@ fn main() {
                 "direction": direction,
                 "content_type": content_type_str,
                 "keep_focus": keep_focus,
+                "command": command,
+            });
+            let socket_path = agentium_socket_path();
+            if let Ok(socket) = UnixDatagram::unbound() {
+                if socket.connect(&socket_path).is_ok() {
+                    socket.send(msg.to_string().as_bytes()).ok();
+                }
+            }
+            return;
+        }
+        Some(Command::Tab { action }) => {
+            let (content_type, command) = match action {
+                TabAction::New { r#type, command } => (r#type, command),
+            };
+            let content_type_str = match content_type {
+                PaneContentType::Terminal => "terminal",
+                PaneContentType::Diff => "diff",
+                PaneContentType::BranchDiff => "branch-diff",
+                PaneContentType::GitStatus => "git-status",
+                PaneContentType::ProjectSearch => "project-search",
+            };
+            let msg = serde_json::json!({
+                "type": "tab_new",
+                "content_type": content_type_str,
                 "command": command,
             });
             let socket_path = agentium_socket_path();
@@ -642,6 +705,21 @@ fn main() {
                                                         direction,
                                                         content_type,
                                                         keep_focus,
+                                                        command,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::TabNew {
+                                            content_type,
+                                            command,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, window, cx| {
+                                                    app.handle_tab_new(
+                                                        content_type,
                                                         command,
                                                         window,
                                                         cx,

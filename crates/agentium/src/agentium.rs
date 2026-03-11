@@ -489,6 +489,21 @@ impl AgentiumApp {
         });
     }
 
+    pub fn handle_tab_new(
+        &mut self,
+        content_type: PaneContentType,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(arena) = self.active_arena().cloned() else {
+            return;
+        };
+        arena.update(cx, |arena, cx| {
+            arena.add_tab(content_type, command, window, cx);
+        });
+    }
+
     fn clear_ready_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
         let mut changed = false;
         for session in self.claude_sessions.values_mut() {
