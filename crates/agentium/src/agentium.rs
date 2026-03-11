@@ -29,6 +29,12 @@ pub enum PaneContentType {
 
 actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
 
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
+#[action(namespace = agentium)]
+pub(crate) struct ForkClaudeSession {
+    pub session_id: String,
+}
+
 struct ClaudeSession {
     ancestor_pids: Vec<u32>,
     is_ready: bool,
@@ -41,6 +47,21 @@ struct ReadyTerminalInfo {
     terminal_view: Entity<TerminalView>,
     user_prompt: String,
     status_message: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedSessionState {
+    pub ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    pub pid_to_session_id: Rc<RefCell<HashMap<u32, String>>>,
+}
+
+impl SharedSessionState {
+    fn new() -> Self {
+        Self {
+            ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
+            pid_to_session_id: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
 }
 
 pub struct AgentiumApp {
@@ -57,7 +78,7 @@ pub struct AgentiumApp {
     rename_editor: Entity<Editor>,
     renaming_arena: Option<Entity<Arena>>,
     pub(crate) claude_sessions: HashMap<String, ClaudeSession>,
-    ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    session_state: SharedSessionState,
     should_move_window: bool,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
@@ -97,7 +118,7 @@ impl AgentiumApp {
             renaming_arena: None,
             claude_sessions: HashMap::new(),
             should_move_window: false,
-            ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
+            session_state: SharedSessionState::new(),
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
         }
@@ -141,10 +162,10 @@ impl AgentiumApp {
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
         let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
-        let ready_shell_pids = self.ready_shell_pids.clone();
+        let session_state = self.session_state.clone();
 
         let arena_entity = cx.new(|cx| {
-            Arena::new(arena_id, name, workspace_weak, project, modal_layer, working_directory, ready_shell_pids, window, cx)
+            Arena::new(arena_id, name, workspace_weak, project, modal_layer, working_directory, session_state, window, cx)
         });
 
         let subscription = cx.subscribe(
@@ -356,14 +377,24 @@ impl AgentiumApp {
         cx.notify();
     }
 
-    fn sync_ready_shell_pids(&self) {
+    fn sync_session_derived_state(&self) {
         let pids: HashSet<u32> = self
             .claude_sessions
             .values()
             .filter(|s| s.is_ready)
             .flat_map(|s| s.ancestor_pids.iter().copied())
             .collect();
-        *self.ready_shell_pids.borrow_mut() = pids;
+        *self.session_state.ready_shell_pids.borrow_mut() = pids;
+
+        // Includes all sessions (not just ready ones) so that Fork Session
+        // is available while Claude is still running.
+        let mut pid_map = self.session_state.pid_to_session_id.borrow_mut();
+        pid_map.clear();
+        for (session_id, session) in &self.claude_sessions {
+            for &pid in &session.ancestor_pids {
+                pid_map.insert(pid, session_id.clone());
+            }
+        }
     }
 
     pub fn register_claude_session(
@@ -381,7 +412,7 @@ impl AgentiumApp {
                 status_message: String::new(),
             },
         );
-        self.sync_ready_shell_pids();
+        self.sync_session_derived_state();
         cx.notify();
     }
 
@@ -408,7 +439,7 @@ impl AgentiumApp {
                 },
             );
         }
-        self.sync_ready_shell_pids();
+        self.sync_session_derived_state();
         self.notify_all_panes(cx);
         cx.notify();
     }
@@ -436,7 +467,7 @@ impl AgentiumApp {
                 },
             );
         }
-        self.sync_ready_shell_pids();
+        self.sync_session_derived_state();
         self.notify_all_panes(cx);
         cx.notify();
     }
@@ -467,7 +498,7 @@ impl AgentiumApp {
             }
         }
         if changed {
-            self.sync_ready_shell_pids();
+            self.sync_session_derived_state();
             self.notify_all_panes(cx);
             cx.notify();
         }
@@ -489,7 +520,7 @@ impl AgentiumApp {
         workspace: &Entity<Arena>,
         cx: &App,
     ) -> usize {
-        let ready_pids = self.ready_shell_pids.borrow();
+        let ready_pids = self.session_state.ready_shell_pids.borrow();
         if ready_pids.is_empty() {
             return 0;
         }
@@ -517,7 +548,7 @@ impl AgentiumApp {
         arena_entity: &Entity<Arena>,
         cx: &App,
     ) -> Vec<ReadyTerminalInfo> {
-        let ready_pids = self.ready_shell_pids.borrow();
+        let ready_pids = self.session_state.ready_shell_pids.borrow();
         if ready_pids.is_empty() {
             return vec![];
         }
