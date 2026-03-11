@@ -9,10 +9,10 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **LSP** — language server support for Go to Definition, Find All References, etc.
 - **Diff view** — view uncommitted changes (powered by `git_ui::ProjectDiff`)
 - **Project search** — full-text search across the project
-- **Git status** — read-only view of changed files grouped by Conflicts/Tracked/Untracked, with click-to-open
+- **Git status** — view changed files grouped by Conflicts/Tracked/Untracked, with staging checkboxes and click-to-open
 - **Markdown preview** — preview markdown files side-by-side
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
-- **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC
+- **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu
 
 ## Claude Code Hook Setup
 
@@ -30,6 +30,40 @@ Add the following to your Claude Code `settings.json`:
 ```
 
 When Claude Code completes a response, the corresponding terminal tab shows a blue dot indicator and the arena sidebar shows a badge count. Switching to the tab clears the notification.
+
+## CLI
+
+### `agentium arena new <path>`
+
+Open a new arena for the given directory.
+
+### `agentium pane split`
+
+Split the active pane.
+
+```
+agentium pane split [--horizontal|--vertical] [--before] [--type <TYPE>] [--keep-focus] [-- <COMMAND>...]
+```
+
+- `--horizontal` — split horizontally (new pane to the right, or left with `--before`)
+- `--vertical` — split vertically (new pane below, or above with `--before`). This is the default.
+- `--before` — place the new pane before the active one
+- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`
+- `--keep-focus` — keep focus on the current pane instead of switching to the new one
+
+### `agentium tab new`
+
+Add a new tab to the active pane.
+
+```
+agentium tab new [--type <TYPE>] [-- <COMMAND>...]
+```
+
+- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`
+
+### `agentium claude hook <event>`
+
+Claude Code hook integration. Events: `session-start`, `stop`, `notification`, `user-prompt-submit`.
 
 ## Building
 
