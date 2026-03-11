@@ -430,6 +430,15 @@ pub struct Pane {
     >,
     render_tab_bar: Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> AnyElement>,
     render_item_indicator: Option<Rc<dyn Fn(Box<dyn ItemHandle>, &App) -> Option<Indicator>>>,
+    tab_context_menu_extension: Option<
+        Rc<
+            dyn Fn(
+                Box<dyn ItemHandle>,
+                &mut Window,
+                &mut App,
+            ) -> Vec<(SharedString, Box<dyn Action>)>,
+        >,
+    >,
     show_tab_bar_buttons: bool,
     max_tabs: Option<NonZeroUsize>,
     use_max_tabs: bool,
@@ -613,6 +622,7 @@ impl Pane {
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
             render_tab_bar: Rc::new(Self::render_tab_bar),
             render_item_indicator: None,
+            tab_context_menu_extension: None,
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
             display_nav_history_buttons: Some(
                 TabBarSettings::get_global(cx).show_nav_history_buttons,
@@ -902,6 +912,14 @@ impl Pane {
         render: impl Fn(Box<dyn ItemHandle>, &App) -> Option<Indicator> + 'static,
     ) {
         self.render_item_indicator = Some(Rc::new(render));
+    }
+
+    pub fn set_tab_context_menu_extension(
+        &mut self,
+        handler: impl Fn(Box<dyn ItemHandle>, &mut Window, &mut App) -> Vec<(SharedString, Box<dyn Action>)>
+            + 'static,
+    ) {
+        self.tab_context_menu_extension = Some(Rc::new(handler));
     }
 
     pub fn nav_history_for_item<T: Item>(&self, item: &Entity<T>) -> ItemNavHistory {
@@ -3122,13 +3140,17 @@ impl Pane {
         let pane = cx.entity().downgrade();
         let menu_context = item.item_focus_handle(cx);
         let item_handle = item.boxed_clone();
+        let tab_context_menu_extension = self.tab_context_menu_extension.clone();
 
         right_click_menu(ix)
             .trigger(|_, _, _| tab)
             .menu(move |window, cx| {
                 let pane = pane.clone();
                 let menu_context = menu_context.clone();
-                let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
+                let mut extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
+                if let Some(extension) = &tab_context_menu_extension {
+                    extra_actions.extend(extension(item_handle.boxed_clone(), window, cx));
+                }
                 ContextMenu::build(window, cx, move |mut menu, window, cx| {
                     let close_active_item_action = CloseActiveItem {
                         save_intent: None,
