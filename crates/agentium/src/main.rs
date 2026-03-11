@@ -49,17 +49,17 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum PaneAction {
-    /// Split active pane horizontally (new pane to the right)
-    Hsplit {
-        #[arg(long, default_value = "terminal")]
-        r#type: PaneContentType,
+    /// Split the active pane
+    Split {
+        /// Split horizontally (new pane to the right, or left with --before)
+        #[arg(long, conflicts_with = "vertical")]
+        horizontal: bool,
+        /// Split vertically (new pane below, or above with --before). This is the default.
+        #[arg(long, conflicts_with = "horizontal")]
+        vertical: bool,
+        /// Place the new pane before (left for horizontal, above for vertical)
         #[arg(long)]
-        keep_focus: bool,
-        #[arg(last = true)]
-        command: Vec<String>,
-    },
-    /// Split active pane vertically (new pane below)
-    Vsplit {
+        before: bool,
         #[arg(long, default_value = "terminal")]
         r#type: PaneContentType,
         #[arg(long)]
@@ -234,7 +234,9 @@ fn start_ipc_listener(
                             Some("pane_split") => {
                                 let direction = match json["direction"].as_str() {
                                     Some("right") => SplitDirection::Right,
+                                    Some("left") => SplitDirection::Left,
                                     Some("down") => SplitDirection::Down,
+                                    Some("up") => SplitDirection::Up,
                                     _ => continue,
                                 };
                                 let content_type = match json["content_type"].as_str() {
@@ -331,16 +333,22 @@ fn main() {
         }
         Some(Command::Pane { action }) => {
             let (direction, content_type, keep_focus, command) = match action {
-                PaneAction::Hsplit {
+                PaneAction::Split {
+                    horizontal,
+                    before,
                     r#type,
                     keep_focus,
                     command,
-                } => ("right", r#type, keep_focus, command),
-                PaneAction::Vsplit {
-                    r#type,
-                    keep_focus,
-                    command,
-                } => ("down", r#type, keep_focus, command),
+                    ..
+                } => {
+                    let direction = match (horizontal, before) {
+                        (true, true) => "left",
+                        (true, false) => "right",
+                        (false, true) => "up",
+                        (false, false) => "down",
+                    };
+                    (direction, r#type, keep_focus, command)
+                }
             };
             let content_type_str = match content_type {
                 PaneContentType::Terminal => "terminal",
