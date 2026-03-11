@@ -47,7 +47,7 @@ pub(crate) struct Arena {
     pub(crate) workspace: WeakEntity<Workspace>,
     pub(crate) project: Entity<Project>,
     modal_layer: Entity<ModalLayer>,
-    pub(crate) ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    pub(crate) session_state: crate::SharedSessionState,
 }
 
 impl Arena {
@@ -58,11 +58,11 @@ impl Arena {
         project: Entity<Project>,
         modal_layer: Entity<ModalLayer>,
         working_directory: Option<PathBuf>,
-        ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+        session_state: crate::SharedSessionState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let pane = new_agentium_pane(workspace.clone(), project.clone(), ready_shell_pids.clone(), window, cx);
+        let pane = new_agentium_pane(workspace.clone(), project.clone(), session_state.clone(), window, cx);
         let center = PaneGroup::new(pane.clone());
 
         let terminal_task = project.update(cx, |project, cx| {
@@ -71,7 +71,7 @@ impl Arena {
         let workspace_weak = workspace.clone();
         let project_weak = project.downgrade();
         let active_pane = pane.clone();
-        let pids_for_terminal = ready_shell_pids.clone();
+        let pids_for_terminal = session_state.ready_shell_pids.clone();
         cx.spawn_in(window, async move |_this, cx| {
             let terminal = terminal_task.await?;
             cx.update(|window, cx| {
@@ -99,7 +99,7 @@ impl Arena {
             workspace,
             project,
             modal_layer,
-            ready_shell_pids,
+            session_state,
         }
     }
 
@@ -143,7 +143,7 @@ impl Arena {
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
-        let pids = self.ready_shell_pids.clone();
+        let pids = self.session_state.ready_shell_pids.clone();
 
         cx.spawn_in(window, async move |_this, cx| {
             let terminal = terminal_task.await?;
@@ -175,7 +175,7 @@ impl Arena {
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
-        let pids = self.ready_shell_pids.clone();
+        let pids = self.session_state.ready_shell_pids.clone();
 
         cx.spawn_in(window, async move |_this, cx| {
             let terminal = terminal_task.await?;
@@ -376,7 +376,7 @@ impl Arena {
         let new_pane = new_agentium_pane(
             self.workspace.clone(),
             self.project.clone(),
-            self.ready_shell_pids.clone(),
+            self.session_state.clone(),
             window,
             cx,
         );
@@ -418,7 +418,7 @@ impl Arena {
 
         let workspace_weak = self.workspace.clone();
         let project = self.project.clone();
-        let ready_shell_pids = self.ready_shell_pids.clone();
+        let session_state = self.session_state.clone();
         let active_pane = self.active_pane.clone();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -438,7 +438,7 @@ impl Arena {
                 let new_pane = new_agentium_pane(
                     workspace_weak,
                     project,
-                    ready_shell_pids,
+                    session_state,
                     window,
                     cx,
                 );
@@ -469,7 +469,7 @@ impl Arena {
         };
         let project = self.project.clone();
         let workspace_weak = self.workspace.clone();
-        let ready_shell_pids = self.ready_shell_pids.clone();
+        let session_state = self.session_state.clone();
         let active_pane = self.active_pane.clone();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -488,7 +488,7 @@ impl Arena {
                 let new_pane = new_agentium_pane(
                     workspace_weak,
                     project,
-                    ready_shell_pids,
+                    session_state,
                     window,
                     cx,
                 );
@@ -515,7 +515,7 @@ impl Arena {
     ) -> Task<Option<Entity<Pane>>> {
         let workspace_weak = self.workspace.clone();
         let project = self.project.clone();
-        let ready_shell_pids = self.ready_shell_pids.clone();
+        let session_state = self.session_state.clone();
         let working_directory = if clone {
             self.active_pane
                 .read(cx)
@@ -534,12 +534,12 @@ impl Arena {
             let terminal = terminal_task.await.log_err()?;
 
             this.update_in(cx, move |_this, window, cx| {
-                let pane = new_agentium_pane(workspace_weak.clone(), project.clone(), ready_shell_pids.clone(), window, cx);
+                let pane = new_agentium_pane(workspace_weak.clone(), project.clone(), session_state.clone(), window, cx);
                 add_terminal_view_to_pane(
                     terminal,
                     workspace_weak,
                     project.downgrade(),
-                    ready_shell_pids,
+                    session_state.ready_shell_pids.clone(),
                     &pane,
                     window,
                     cx,
@@ -619,7 +619,7 @@ impl Arena {
                     let new_pane = new_agentium_pane(
                         self.workspace.clone(),
                         self.project.clone(),
-                        self.ready_shell_pids.clone(),
+                        self.session_state.clone(),
                         window,
                         cx,
                     );
@@ -712,7 +712,7 @@ impl Arena {
                     let new_pane = new_agentium_pane(
                         self.workspace.clone(),
                         self.project.clone(),
-                        self.ready_shell_pids.clone(),
+                        self.session_state.clone(),
                         window,
                         cx,
                     );
@@ -790,7 +790,7 @@ impl Render for Arena {
                 (callbacks.wrap_div_with_search_actions)(div(), self.active_pane.clone())
             })
             .unwrap_or_else(div);
-        let ready_pids = self.ready_shell_pids.borrow().clone();
+        let ready_pids = self.session_state.ready_shell_pids.borrow().clone();
         self.workspace
             .update(cx, |_workspace, cx| {
                 let decorator = AgentiumPaneDecorator {
@@ -1040,6 +1040,46 @@ impl Render for Arena {
                             }
                         },
                     ))
+                    .on_action(
+                        cx.listener(|this, action: &crate::ForkClaudeSession, window, cx| {
+                            let shell = Shell::WithArguments {
+                                program: "claude".to_string(),
+                                args: vec![
+                                    "--resume".to_string(),
+                                    action.session_id.clone(),
+                                    "--fork-session".to_string(),
+                                ],
+                                title_override: None,
+                            };
+                            let terminal_task = this.project.update(cx, |project, cx| {
+                                project.create_terminal_with_shell(
+                                    this.working_directory.clone(),
+                                    shell,
+                                    cx,
+                                )
+                            });
+                            let workspace_weak = this.workspace.clone();
+                            let project_weak = this.project.downgrade();
+                            let ready_shell_pids = this.session_state.ready_shell_pids.clone();
+                            let pane = this.active_pane.clone();
+                            cx.spawn_in(window, async move |_this, cx| {
+                                let terminal = terminal_task.await?;
+                                cx.update(|window, cx| {
+                                    add_terminal_view_to_pane(
+                                        terminal,
+                                        workspace_weak,
+                                        project_weak,
+                                        ready_shell_pids,
+                                        &pane,
+                                        window,
+                                        cx,
+                                    );
+                                })?;
+                                anyhow::Ok(())
+                            })
+                            .detach_and_log_err(cx);
+                        }),
+                    )
                     .child(self.modal_layer.clone())
             })
             .unwrap_or_else(|| div().size_full())
@@ -1110,7 +1150,7 @@ fn add_terminal_view_to_pane(
 pub(crate) fn new_agentium_pane(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
-    ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    session_state: crate::SharedSessionState,
     window: &mut Window,
     cx: &mut Context<Arena>,
 ) -> Entity<Pane> {
@@ -1132,6 +1172,38 @@ pub(crate) fn new_agentium_pane(
         pane.set_should_display_tab_bar(|_, _| true);
         pane.set_zoom_out_on_close(false);
         pane.set_show_external_drop_overlay(false);
+
+        pane.set_tab_context_menu_extension({
+            let pid_to_session_id = session_state.pid_to_session_id.clone();
+            move |item, _window, cx| {
+                let Some(entity) =
+                    item.act_as_type(std::any::TypeId::of::<TerminalView>(), cx)
+                else {
+                    return Vec::new();
+                };
+                let Ok(terminal_view) = entity.downcast::<TerminalView>() else {
+                    return Vec::new();
+                };
+                let terminal = terminal_view.read(cx).terminal().read(cx);
+                let Some(shell_pid) = terminal
+                    .pid_getter()
+                    .map(|g| g.fallback_pid().as_u32())
+                else {
+                    return Vec::new();
+                };
+                let session_id_map = pid_to_session_id.borrow();
+                let Some(session_id) = session_id_map.get(&shell_pid) else {
+                    return Vec::new();
+                };
+                let session_id = session_id.clone();
+                vec![(
+                    "Fork Session".into(),
+                    Box::new(crate::ForkClaudeSession {
+                        session_id,
+                    }) as Box<dyn Action>,
+                )]
+            }
+        });
 
         let split_predicate_workspace = arena.clone();
         pane.set_can_split(Some(Arc::new(
@@ -1178,7 +1250,7 @@ pub(crate) fn new_agentium_pane(
         let drop_project = project.downgrade();
         let drop_arena = arena.clone();
         let drop_workspace = workspace.clone();
-        let drop_ready_shell_pids = ready_shell_pids.clone();
+        let drop_session_state = session_state.clone();
         pane.set_custom_drop_handle(cx, move |pane, dropped_item, window, cx| {
             if !drop_project.upgrade().is_some() {
                 return ControlFlow::Break(());
@@ -1202,7 +1274,7 @@ pub(crate) fn new_agentium_pane(
                         let workspace_handle = drop_workspace.clone();
                         let arena = drop_arena.clone();
                         let project = drop_project.clone();
-                        let ready_pids = drop_ready_shell_pids.clone();
+                        let session_state = drop_session_state.clone();
 
                         cx.spawn_in(window, async move |_, cx| {
                             cx.update(|window, cx| {
@@ -1214,7 +1286,7 @@ pub(crate) fn new_agentium_pane(
                                         let new_pane = new_agentium_pane(
                                             workspace_handle,
                                             project,
-                                            ready_pids,
+                                            session_state,
                                             window,
                                             cx,
                                         );
@@ -1346,7 +1418,7 @@ pub(crate) fn new_agentium_pane(
 
         pane.set_tab_bar_drag_area(true);
 
-        let ready_pids = ready_shell_pids;
+        let ready_pids = session_state.ready_shell_pids.clone();
         pane.set_render_item_indicator(move |item, cx| {
             if let Some(terminal_view) = item.downcast::<TerminalView>() {
                 let terminal = terminal_view.read(cx).terminal().read(cx);
