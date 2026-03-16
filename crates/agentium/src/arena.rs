@@ -139,7 +139,9 @@ impl Arena {
     fn add_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let terminal_task = self
             .project
-            .update(cx, |project, cx| project.create_terminal_shell(None, cx));
+            .update(cx, |project, cx| {
+                project.create_terminal_shell(self.working_directory.clone(), cx)
+            });
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
@@ -171,7 +173,9 @@ impl Arena {
         };
         let terminal_task = self
             .project
-            .update(cx, |project, cx| project.create_terminal_with_shell(None, shell, cx));
+            .update(cx, |project, cx| {
+                project.create_terminal_with_shell(self.working_directory.clone(), shell, cx)
+            });
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
