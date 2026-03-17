@@ -24,7 +24,7 @@ use rpc::{AnyProtoClient, proto};
 use language::ByteContent;
 use util::{ResultExt, maybe, rel_path::RelPath};
 use worktree::{
-    Entry, ProjectEntryId, Snapshot, Worktree, WorktreeSettings, decode_byte_header,
+    Entry, ProjectEntryId, Snapshot, Worktree, WorktreeId, WorktreeSettings, decode_byte_header,
     decode_file_text,
 };
 
@@ -38,6 +38,7 @@ use crate::{
 pub struct Search {
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
+    worktree_scope: Option<WorktreeId>,
     limit: usize,
     kind: SearchKind,
 }
@@ -116,22 +117,26 @@ impl Search {
         fs: Arc<dyn Fs>,
         buffer_store: Entity<BufferStore>,
         worktree_store: Entity<WorktreeStore>,
+        worktree_scope: Option<WorktreeId>,
         limit: usize,
         cx: &mut App,
     ) -> Self {
         let mut worktrees = worktree_store
             .read(cx)
             .visible_worktrees(cx)
+            .filter(|worktree| worktree_scope.is_none_or(|id| worktree.read(cx).id() == id))
             .collect::<Vec<_>>();
         worktrees.sort_by_key(|worktree| worktree.read(cx).id());
         Self {
             kind: SearchKind::Local { fs, worktrees },
             buffer_store,
             worktree_store,
+            worktree_scope,
             limit,
         }
     }
 
+    // Note: Remote search does not support worktree scoping; Agentium is local-only.
     pub(crate) fn remote(
         buffer_store: Entity<BufferStore>,
         worktree_store: Entity<WorktreeStore>,
@@ -146,18 +151,21 @@ impl Search {
             },
             buffer_store,
             worktree_store,
+            worktree_scope: None,
             limit,
         }
     }
     pub(crate) fn open_buffers_only(
         buffer_store: Entity<BufferStore>,
         worktree_store: Entity<WorktreeStore>,
+        worktree_scope: Option<WorktreeId>,
         limit: usize,
     ) -> Self {
         Self {
             kind: SearchKind::OpenBuffersOnly,
             buffer_store,
             worktree_store,
+            worktree_scope,
             limit,
         }
     }
@@ -673,6 +681,11 @@ impl Search {
                     if file.disk_state().is_deleted() {
                         return false;
                     }
+                    if let Some(scope_id) = self.worktree_scope {
+                        if file.worktree_id(cx) != scope_id {
+                            return false;
+                        }
+                    }
                     if !search_query.match_path(file.path()) {
                         return false;
                     }
@@ -684,6 +697,8 @@ impl Search {
                     {
                         return false;
                     }
+                } else if self.worktree_scope.is_some() {
+                    return false;
                 }
                 true
             })

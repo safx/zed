@@ -262,26 +262,20 @@ impl Arena {
         .detach_and_log_err(cx);
     }
 
+    fn new_project_search(&self, cx: &mut Context<Self>) -> Entity<ProjectSearch> {
+        let worktree_id = self.worktree_id(cx);
+        cx.new(|cx| match worktree_id {
+            Some(id) => ProjectSearch::new_scoped(self.project.clone(), id, cx),
+            None => ProjectSearch::new(self.project.clone(), cx),
+        })
+    }
+
     fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
-        let project_search = cx.new(|cx| ProjectSearch::new(self.project.clone(), cx));
-        let needs_filter = self.project.read(cx).visible_worktrees(cx).count() > 1;
-        let filter = if needs_filter {
-            self.working_directory
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| format!("{}/**", n.to_string_lossy()))
-        } else {
-            None
-        };
+        let project_search = self.new_project_search(cx);
         let workspace_weak = self.workspace.clone();
         let view = cx.new(|cx| {
-            let mut view =
-                ProjectSearchView::new(workspace_weak, project_search, window, cx, None);
-            if let Some(ref filter) = filter {
-                view.set_include_filter(filter, window, cx);
-            }
-            view
+            ProjectSearchView::new(workspace_weak, project_search, window, cx, None)
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
@@ -404,30 +398,10 @@ impl Arena {
             }
             PaneContentType::ProjectSearch => {
                 self.activate_context(cx);
-                let project_search = cx.new(|cx| ProjectSearch::new(self.project.clone(), cx));
-                let needs_filter =
-                    self.project.read(cx).visible_worktrees(cx).count() > 1;
-                let filter = if needs_filter {
-                    self.working_directory
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|n| format!("{}/**", n.to_string_lossy()))
-                } else {
-                    None
-                };
+                let project_search = self.new_project_search(cx);
                 let workspace_weak = self.workspace.clone();
                 let item = cx.new(|cx| {
-                    let mut view = ProjectSearchView::new(
-                        workspace_weak,
-                        project_search,
-                        window,
-                        cx,
-                        None,
-                    );
-                    if let Some(ref filter) = filter {
-                        view.set_include_filter(filter, window, cx);
-                    }
-                    view
+                    ProjectSearchView::new(workspace_weak, project_search, window, cx, None)
                 });
                 self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
             }

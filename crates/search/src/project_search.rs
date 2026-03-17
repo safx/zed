@@ -32,7 +32,7 @@ use language::{Buffer, Language};
 use menu::Confirm;
 use multi_buffer;
 use project::{
-    Project, ProjectPath, SearchResults,
+    Project, ProjectPath, SearchResults, WorktreeId,
     search::{SearchInputKind, SearchQuery, SearchResult},
     search_history::SearchHistoryCursor,
 };
@@ -254,6 +254,7 @@ const SEARCH_ON_TYPE_DEBOUNCE: Duration = Duration::from_millis(250);
 pub struct ProjectSearch {
     pub(crate) project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    pub(crate) worktree_scope: Option<WorktreeId>,
     pub excerpts: Entity<MultiBuffer>,
     pub pending_search: Option<Task<Option<SearchResults<SearchResult>>>>,
     pub match_ranges: Vec<Range<Anchor>>,
@@ -408,6 +409,7 @@ impl ProjectSearch {
         Self {
             project,
             workspace,
+            worktree_scope: None,
             excerpts,
             pending_search: Default::default(),
             match_ranges: Default::default(),
@@ -427,6 +429,17 @@ impl ProjectSearch {
         }
     }
 
+    pub fn new_scoped(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(project, workspace, cx);
+        this.worktree_scope = Some(worktree_id);
+        this
+    }
+
     fn clone(&self, cx: &mut Context<Self>) -> Entity<Self> {
         cx.new(|cx| {
             let excerpts = self
@@ -438,6 +451,7 @@ impl ProjectSearch {
             Self {
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
+                worktree_scope: self.worktree_scope,
                 excerpts,
                 pending_search: Default::default(),
                 match_ranges: self.match_ranges.clone(),
@@ -553,9 +567,11 @@ impl ProjectSearch {
     ) {
         let project_search_turning_into_text_finder =
             Arc::clone(&self.project_search_turning_into_text_finder);
-        let search = self
-            .project
-            .update(cx, |project, cx| project.search(query.clone(), cx));
+        let worktree_scope = self.worktree_scope;
+        let search = self.project.update(cx, |project, cx| match worktree_scope {
+            Some(worktree_id) => project.search_in_worktree(query.clone(), worktree_id, cx),
+            None => project.search(query.clone(), cx),
+        });
         self.last_search_query_text = Some(query.as_str().to_string());
         self.search_id += 1;
         self.active_query = Some(query);
@@ -2144,18 +2160,22 @@ impl ProjectSearchView {
             })
             .unwrap_or(PathMatcher::default());
 
-        // If the project contains multiple visible worktrees, we match the
-        // include/exclude patterns against full paths to allow them to be
-        // disambiguated. For single worktree projects we use worktree relative
-        // paths for convenience.
-        let match_full_paths = self
-            .entity
-            .read(cx)
-            .project
-            .read(cx)
-            .visible_worktrees(cx)
-            .count()
-            > 1;
+        // When the search is scoped to a single worktree, use worktree-relative
+        // paths so users don't need to prefix patterns with the directory name.
+        // Otherwise, if the project contains multiple visible worktrees, match
+        // against full paths to allow disambiguation.
+        let match_full_paths = match self.entity.read(cx).worktree_scope {
+            Some(_) => false,
+            None => {
+                self.entity
+                    .read(cx)
+                    .project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .count()
+                    > 1
+            }
+        };
 
         let query = match self.search_options.build_query(
             text,
