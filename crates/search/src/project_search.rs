@@ -29,7 +29,7 @@ use language::{Buffer, Language};
 use menu::Confirm;
 use multi_buffer;
 use project::{
-    Project, ProjectPath, SearchResults,
+    Project, ProjectPath, SearchResults, WorktreeId,
     search::{SearchInputKind, SearchQuery},
     search_history::SearchHistoryCursor,
 };
@@ -229,6 +229,7 @@ fn contains_uppercase(str: &str) -> bool {
 
 pub struct ProjectSearch {
     project: Entity<Project>,
+    pub(crate) worktree_scope: Option<WorktreeId>,
     excerpts: Entity<MultiBuffer>,
     pending_search: Option<Task<Option<()>>>,
     match_ranges: Vec<Range<Anchor>>,
@@ -291,6 +292,34 @@ impl ProjectSearch {
 
         Self {
             project,
+            worktree_scope: None,
+            excerpts,
+            pending_search: Default::default(),
+            match_ranges: Default::default(),
+            active_query: None,
+            last_search_query_text: None,
+            search_id: 0,
+            no_results: None,
+            limit_reached: false,
+            search_history_cursor: Default::default(),
+            search_included_history_cursor: Default::default(),
+            search_excluded_history_cursor: Default::default(),
+            _excerpts_subscription: subscription,
+        }
+    }
+
+    pub fn new_scoped(
+        project: Entity<Project>,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let capability = project.read(cx).capability();
+        let excerpts = cx.new(|_| MultiBuffer::new(capability));
+        let subscription = Self::subscribe_to_excerpts(&excerpts, cx);
+
+        Self {
+            project,
+            worktree_scope: Some(worktree_id),
             excerpts,
             pending_search: Default::default(),
             match_ranges: Default::default(),
@@ -315,6 +344,7 @@ impl ProjectSearch {
 
             Self {
                 project: self.project.clone(),
+                worktree_scope: self.worktree_scope,
                 excerpts,
                 pending_search: Default::default(),
                 match_ranges: self.match_ranges.clone(),
@@ -404,7 +434,12 @@ impl ProjectSearch {
                     .search_history_mut(SearchInputKind::Exclude)
                     .add(&mut self.search_excluded_history_cursor, excluded);
             }
-            project.search(query.clone(), cx)
+            match self.worktree_scope {
+                Some(worktree_id) => {
+                    project.search_in_worktree(query.clone(), worktree_id, cx)
+                }
+                None => project.search(query.clone(), cx),
+            }
         });
         self.last_search_query_text = Some(query.as_str().to_string());
         self.search_id += 1;
@@ -1404,18 +1439,22 @@ impl ProjectSearchView {
             })
             .unwrap_or(PathMatcher::default());
 
-        // If the project contains multiple visible worktrees, we match the
-        // include/exclude patterns against full paths to allow them to be
-        // disambiguated. For single worktree projects we use worktree relative
-        // paths for convenience.
-        let match_full_paths = self
-            .entity
-            .read(cx)
-            .project
-            .read(cx)
-            .visible_worktrees(cx)
-            .count()
-            > 1;
+        // When the search is scoped to a single worktree, use worktree-relative
+        // paths so users don't need to prefix patterns with the directory name.
+        // Otherwise, if the project contains multiple visible worktrees, match
+        // against full paths to allow disambiguation.
+        let match_full_paths = match self.entity.read(cx).worktree_scope {
+            Some(_) => false,
+            None => {
+                self.entity
+                    .read(cx)
+                    .project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .count()
+                    > 1
+            }
+        };
 
         let query = if self.search_options.contains(SearchOptions::REGEX) {
             match SearchQuery::regex(
