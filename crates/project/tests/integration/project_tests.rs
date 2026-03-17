@@ -8980,6 +8980,112 @@ async fn test_search_multiple_worktrees_with_inclusions(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
+async fn test_search_in_worktree_scoped(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/worktree-a"),
+        json!({
+            "alpha.rs": "fn alpha() { NEEDLE }",
+            "beta.rs": "fn beta() { HAYSTACK }",
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/worktree-b"),
+        json!({
+            "gamma.rs": "fn gamma() { NEEDLE }",
+            "delta.rs": "fn delta() { HAYSTACK }",
+        }),
+    )
+    .await;
+
+    let project = Project::test(
+        fs.clone(),
+        [path!("/worktree-a").as_ref(), path!("/worktree-b").as_ref()],
+        cx,
+    )
+    .await;
+
+    let (worktree_a_id, worktree_b_id) = project.read_with(cx, |project, cx| {
+        let mut wts = project.worktrees(cx);
+        let a = wts.next().unwrap().read(cx).id();
+        let b = wts.next().unwrap().read(cx).id();
+        (a, b)
+    });
+
+    let query = SearchQuery::text(
+        "NEEDLE",
+        false,
+        true,
+        false,
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+    )
+    .unwrap();
+
+    // Scoped to worktree-a: only alpha.rs should match
+    let results_a = search_in_worktree(&project, query.clone(), worktree_a_id, cx)
+        .await
+        .unwrap();
+    assert_eq!(
+        results_a,
+        HashMap::from_iter([(path!("worktree-a/alpha.rs").to_string(), vec![13..19])]),
+        "scoped search should only return results from worktree-a"
+    );
+
+    // Scoped to worktree-b: only gamma.rs should match
+    let results_b = search_in_worktree(&project, query, worktree_b_id, cx)
+        .await
+        .unwrap();
+    assert_eq!(
+        results_b,
+        HashMap::from_iter([(path!("worktree-b/gamma.rs").to_string(), vec![13..19])]),
+        "scoped search should only return results from worktree-b"
+    );
+}
+
+async fn search_in_worktree(
+    project: &Entity<Project>,
+    query: SearchQuery,
+    worktree_id: WorktreeId,
+    cx: &mut gpui::TestAppContext,
+) -> Result<HashMap<String, Vec<Range<usize>>>> {
+    let search_rx =
+        project.update(cx, |project, cx| project.search_in_worktree(query, worktree_id, cx));
+    let mut results = HashMap::default();
+    while let Ok(search_result) = search_rx.rx.recv().await {
+        match search_result {
+            SearchResult::Buffer { buffer, ranges } => {
+                results.entry(buffer).or_insert(ranges);
+            }
+            SearchResult::LimitReached => {}
+        }
+    }
+    Ok(results
+        .into_iter()
+        .map(|(buffer, ranges)| {
+            buffer.update(cx, |buffer, cx| {
+                let path = buffer
+                    .file()
+                    .unwrap()
+                    .full_path(cx)
+                    .to_string_lossy()
+                    .to_string();
+                let ranges = ranges
+                    .into_iter()
+                    .map(|range| range.to_offset(buffer))
+                    .collect::<Vec<_>>();
+                (path, ranges)
+            })
+        })
+        .collect())
+}
+
+#[gpui::test]
 async fn test_search_in_gitignored_dirs(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

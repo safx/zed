@@ -4694,7 +4694,12 @@ impl Project {
         })
     }
 
-    fn search_impl(&mut self, query: SearchQuery, cx: &mut Context<Self>) -> SearchResultsHandle {
+    fn search_impl(
+        &mut self,
+        query: SearchQuery,
+        worktree_scope: Option<WorktreeId>,
+        cx: &mut Context<Self>,
+    ) -> SearchResultsHandle {
         let client: Option<(AnyProtoClient, _)> = if let Some(ssh_client) = &self.remote_client {
             Some((ssh_client.read(cx).proto_client(), 0))
         } else if let Some(remote_id) = self.remote_id() {
@@ -4708,6 +4713,7 @@ impl Project {
             project_search::Search::open_buffers_only(
                 self.buffer_store.clone(),
                 self.worktree_store.clone(),
+                worktree_scope,
                 project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
             )
         } else {
@@ -4722,6 +4728,7 @@ impl Project {
                     self.fs.clone(),
                     self.buffer_store.clone(),
                     self.worktree_store.clone(),
+                    worktree_scope,
                     project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
                     cx,
                 ),
@@ -4735,7 +4742,16 @@ impl Project {
         query: SearchQuery,
         cx: &mut Context<Self>,
     ) -> SearchResults<SearchResult> {
-        self.search_impl(query, cx).results(cx)
+        self.search_impl(query, None, cx).results(cx)
+    }
+
+    pub fn search_in_worktree(
+        &mut self,
+        query: SearchQuery,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> SearchResults<SearchResult> {
+        self.search_impl(query, Some(worktree_id), cx).results(cx)
     }
 
     pub fn request_lsp<R: LspCommand>(
@@ -5768,7 +5784,7 @@ impl Project {
         let client = this.read_with(&cx, |this, _| this.client());
         let task = cx.spawn(async move |cx| {
             let results = this.update(cx, |this, cx| {
-                this.search_impl(query, cx).matching_buffers(cx)
+                this.search_impl(query, None, cx).matching_buffers(cx)
             });
             let (batcher, batches) = project_search::AdaptiveBatcher::new(cx.background_executor());
             let mut new_matches = Box::pin(results.rx);
