@@ -1076,6 +1076,7 @@ impl HeadlessProject {
                     this.fs.clone(),
                     this.buffer_store.clone(),
                     this.worktree_store.clone(),
+                    None,
                     message.limit as _,
                     cx,
                 )
