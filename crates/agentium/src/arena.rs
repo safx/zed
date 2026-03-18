@@ -29,8 +29,8 @@ use workspace::{
 };
 
 use crate::{
-    NewBranchDiff, NewClaudeCode, NewDiffView, NewGitStatus, NewProjectSearch, PaneContentType,
-    git_status_view::GitStatusView,
+    NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitStatus, NewProjectSearch,
+    PaneContentType, file_browser_view::FileBrowserView, git_status_view::GitStatusView,
 };
 
 pub(crate) enum ArenaEvent {
@@ -292,6 +292,22 @@ impl Arena {
         });
     }
 
+    fn add_file_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
+        let worktree_id = self.worktree_id(cx);
+        let view = cx.new(|cx| {
+            FileBrowserView::new(
+                self.project.clone(),
+                self.workspace.clone(),
+                worktree_id,
+                cx,
+            )
+        });
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(view), true, true, None, window, cx);
+        });
+    }
+
     pub(crate) fn add_tab(
         &mut self,
         content_type: PaneContentType,
@@ -354,6 +370,9 @@ impl Arena {
             PaneContentType::ProjectSearch => {
                 self.add_project_search(window, cx);
             }
+            PaneContentType::FileBrowser => {
+                self.add_file_browser(window, cx);
+            }
         }
     }
 
@@ -402,6 +421,19 @@ impl Arena {
                 let workspace_weak = self.workspace.clone();
                 let item = cx.new(|cx| {
                     ProjectSearchView::new(workspace_weak, project_search, window, cx, None)
+                });
+                self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
+            }
+            PaneContentType::FileBrowser => {
+                self.activate_context(cx);
+                let worktree_id = self.worktree_id(cx);
+                let item = cx.new(|cx| {
+                    FileBrowserView::new(
+                        self.project.clone(),
+                        self.workspace.clone(),
+                        worktree_id,
+                        cx,
+                    )
                 });
                 self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
             }
@@ -972,6 +1004,11 @@ impl Render for Arena {
                         }),
                     )
                     .on_action(
+                        cx.listener(|this, _: &NewFileBrowser, window, cx| {
+                            this.add_file_browser(window, cx);
+                        }),
+                    )
+                    .on_action(
                         cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                             this.activate_pane_in_direction(SplitDirection::Left, window, cx);
                         }),
@@ -1415,6 +1452,10 @@ pub(crate) fn new_agentium_pane(
                                     .action(
                                         "New Git Status",
                                         NewGitStatus.boxed_clone(),
+                                    )
+                                    .action(
+                                        "New File Browser",
+                                        NewFileBrowser.boxed_clone(),
                                     )
                             }))
                         }),

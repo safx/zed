@@ -1,4 +1,5 @@
 mod arena;
+mod file_browser_view;
 mod git_status_view;
 
 use std::cell::RefCell;
@@ -25,9 +26,10 @@ pub enum PaneContentType {
     BranchDiff,
     GitStatus,
     ProjectSearch,
+    FileBrowser,
 }
 
-actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus]);
+actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser]);
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
 #[action(namespace = agentium)]
