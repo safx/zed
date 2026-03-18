@@ -842,6 +842,7 @@ impl Render for Arena {
                     ready_shell_pids: &ready_pids,
                 };
                 search_actions_div
+                    .relative()
                     .size_full()
                     .child(self.center.render(
                         self.zoomed_pane.as_ref(),
@@ -849,6 +850,20 @@ impl Render for Arena {
                         window,
                         cx,
                     ))
+                    .children(self.zoomed_pane.as_ref().and_then(|view| {
+                        let zoomed_view = view.upgrade()?;
+                        let colors = cx.theme().colors();
+                        Some(
+                            div()
+                                .occlude()
+                                .absolute()
+                                .overflow_hidden()
+                                .bg(colors.background)
+                                .child(zoomed_view)
+                                .inset_0()
+                                .shadow_lg(),
+                        )
+                    }))
             })
             .ok()
             .map(|pane_group| {
@@ -916,20 +931,6 @@ impl Render for Arena {
                         }),
                     )
                     .child(pane_group)
-                    .children(self.zoomed_pane.as_ref().and_then(|view| {
-                        let zoomed_view = view.upgrade()?;
-                        let colors = cx.theme().colors();
-                        Some(
-                            div()
-                                .occlude()
-                                .absolute()
-                                .overflow_hidden()
-                                .bg(colors.background)
-                                .child(zoomed_view)
-                                .inset_0()
-                                .shadow_lg(),
-                        )
-                    }))
                     .on_action(
                         cx.listener(|this, _: &OpenPreview, window, cx| {
                             this.open_markdown_preview(false, window, cx);
