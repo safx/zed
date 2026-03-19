@@ -19,6 +19,10 @@ fn quit(_: &Quit, cx: &mut App) {
 #[derive(Parser)]
 #[command(name = "agentium")]
 struct Args {
+    /// Theme name (e.g. "One Dark", "Ayu Dark", "Gruvbox Dark")
+    #[arg(long)]
+    theme: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -323,6 +327,7 @@ fn main() {
     }
 
     let args = Args::parse();
+    let theme_name = args.theme;
 
     let initial_workspace_path = match args.command {
         Some(Command::Completions { shell }) => {
@@ -458,10 +463,23 @@ fn main() {
 
     Application::new()
         .with_assets(assets::Assets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
             settings::init(cx);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
+
+            if let Some(ref name) = theme_name {
+                let registry = theme::ThemeRegistry::default_global(cx);
+                if registry.get(name).is_err() {
+                    let available = registry.list_names();
+                    eprintln!("error: unknown theme '{name}'");
+                    eprintln!("Available themes:");
+                    for theme in &available {
+                        eprintln!("  - {theme}");
+                    }
+                    std::process::exit(1);
+                }
+            }
 
             *theme::SystemAppearance::global_mut(cx) =
                 theme::SystemAppearance(theme::Appearance::Dark);
@@ -533,10 +551,13 @@ fn main() {
                     markdown_preview::init(cx);
 
                     settings::SettingsStore::update_global(cx, |store, cx| {
-                        _ = store.set_user_settings(
-                            r#"{"active_pane_modifiers": {"inactive_opacity": 0.65}}"#,
-                            cx,
-                        );
+                        let mut settings = serde_json::json!({
+                            "active_pane_modifiers": {"inactive_opacity": 0.65},
+                        });
+                        if let Some(ref name) = theme_name {
+                            settings["theme"] = serde_json::json!(name);
+                        }
+                        _ = store.set_user_settings(&settings.to_string(), cx);
                     });
 
                     cx.set_global(workspace::PaneSearchBarCallbacks {
