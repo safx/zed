@@ -11,6 +11,16 @@ use util::rel_path::{RelPath, RelPathBuf};
 use workspace::notifications::NotifyResultExt as _;
 use workspace::{Item, Workspace};
 
+actions!(
+    file_browser,
+    [ExpandSelectedEntry, CollapseSelectedEntry, ConfirmEntry, SwitchPane]
+);
+
+enum ActivePane {
+    DirTree,
+    FileList,
+}
+
 struct DirTreeEntry {
     entry_id: ProjectEntryId,
     path: Arc<RelPath>,
@@ -36,10 +46,13 @@ pub(crate) struct FileBrowserView {
     selected_dir_id: Option<ProjectEntryId>,
     selected_dir_path: Option<Arc<RelPath>>,
     dir_tree_scroll: UniformListScrollHandle,
+    dir_tree_selected_index: Option<usize>,
 
     file_list_entries: Vec<FileListEntry>,
     file_list_scroll: UniformListScrollHandle,
+    file_list_selected_index: Option<usize>,
 
+    active_pane: ActivePane,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -78,8 +91,11 @@ impl FileBrowserView {
             selected_dir_id: None,
             selected_dir_path: None,
             dir_tree_scroll: UniformListScrollHandle::new(),
+            dir_tree_selected_index: None,
             file_list_entries: Vec::new(),
             file_list_scroll: UniformListScrollHandle::new(),
+            file_list_selected_index: None,
+            active_pane: ActivePane::DirTree,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
@@ -98,6 +114,171 @@ impl FileBrowserView {
         this
     }
 
+    fn dispatch_context(&self) -> KeyContext {
+        let mut context = KeyContext::new_with_defaults();
+        context.add("FileBrowser");
+        context.add("menu");
+        context
+    }
+
+    // --- Keyboard navigation ---
+
+    fn select_next(
+        &mut self,
+        _: &menu::SelectNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.active_pane {
+            ActivePane::DirTree => {
+                let count = self.dir_tree_entries.len();
+                if count == 0 {
+                    return;
+                }
+                let ix = self
+                    .dir_tree_selected_index
+                    .map(|i| (i + 1).min(count - 1))
+                    .unwrap_or(0);
+                self.dir_tree_selected_index = Some(ix);
+                self.dir_tree_scroll
+                    .scroll_to_item(ix, ScrollStrategy::Nearest);
+            }
+            ActivePane::FileList => {
+                let count = self.file_list_entries.len();
+                if count == 0 {
+                    return;
+                }
+                let ix = self
+                    .file_list_selected_index
+                    .map(|i| (i + 1).min(count - 1))
+                    .unwrap_or(0);
+                self.file_list_selected_index = Some(ix);
+                self.file_list_scroll
+                    .scroll_to_item(ix, ScrollStrategy::Nearest);
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.active_pane {
+            ActivePane::DirTree => {
+                let count = self.dir_tree_entries.len();
+                if count == 0 {
+                    return;
+                }
+                let ix = self
+                    .dir_tree_selected_index
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                self.dir_tree_selected_index = Some(ix);
+                self.dir_tree_scroll
+                    .scroll_to_item(ix, ScrollStrategy::Nearest);
+            }
+            ActivePane::FileList => {
+                let count = self.file_list_entries.len();
+                if count == 0 {
+                    return;
+                }
+                let ix = self
+                    .file_list_selected_index
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                self.file_list_selected_index = Some(ix);
+                self.file_list_scroll
+                    .scroll_to_item(ix, ScrollStrategy::Nearest);
+            }
+        }
+        cx.notify();
+    }
+
+    fn expand_selected_entry(
+        &mut self,
+        _: &ExpandSelectedEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.active_pane, ActivePane::DirTree) {
+            return;
+        }
+        let Some(ix) = self.dir_tree_selected_index else {
+            return;
+        };
+        let Some(entry) = self.dir_tree_entries.get(ix) else {
+            return;
+        };
+
+        if !entry.is_expanded {
+            let entry_id = entry.entry_id;
+            self.expanded_dirs.insert(entry_id);
+            self.try_expand_pending_dir(entry_id, cx);
+            self.update_dir_tree(cx);
+        }
+    }
+
+    fn collapse_selected_entry(
+        &mut self,
+        _: &CollapseSelectedEntry,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.active_pane, ActivePane::DirTree) {
+            return;
+        }
+        let Some(ix) = self.dir_tree_selected_index else {
+            return;
+        };
+        let Some(entry) = self.dir_tree_entries.get(ix) else {
+            return;
+        };
+
+        if entry.is_expanded {
+            let entry_id = entry.entry_id;
+            self.expanded_dirs.remove(&entry_id);
+            self.update_dir_tree(cx);
+        }
+    }
+
+    fn confirm_entry(
+        &mut self,
+        _: &ConfirmEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.active_pane {
+            ActivePane::DirTree => {
+                if let Some(ix) = self.dir_tree_selected_index {
+                    self.select_dir(ix, cx);
+                }
+            }
+            ActivePane::FileList => {
+                if let Some(ix) = self.file_list_selected_index {
+                    self.on_file_list_click(ix, window, cx);
+                }
+            }
+        }
+    }
+
+    fn switch_pane(
+        &mut self,
+        _: &SwitchPane,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_pane = match self.active_pane {
+            ActivePane::DirTree => ActivePane::FileList,
+            ActivePane::FileList => ActivePane::DirTree,
+        };
+        cx.notify();
+    }
+
+    // --- Data updates ---
+
     fn update_dir_tree(&mut self, cx: &mut Context<Self>) {
         self.dir_tree_entries.clear();
 
@@ -113,6 +294,13 @@ impl FileBrowserView {
 
         let root_path = RelPathBuf::new();
         self.build_dir_tree_recursive(&worktree, root_path.as_ref(), 0);
+
+        if let Some(ix) = self.dir_tree_selected_index {
+            if ix >= self.dir_tree_entries.len() {
+                self.dir_tree_selected_index = self.dir_tree_entries.len().checked_sub(1);
+            }
+        }
+
         cx.notify();
     }
 
@@ -135,11 +323,7 @@ impl FileBrowserView {
 
         for entry in dirs {
             let is_expanded = self.expanded_dirs.contains(&entry.id);
-            let name = entry
-                .path
-                .file_name()
-                .unwrap_or("")
-                .to_string();
+            let name = entry.path.file_name().unwrap_or("").to_string();
 
             self.dir_tree_entries.push(DirTreeEntry {
                 entry_id: entry.id,
@@ -210,8 +394,16 @@ impl FileBrowserView {
             });
         }
 
+        if let Some(ix) = self.file_list_selected_index {
+            if ix >= self.file_list_entries.len() {
+                self.file_list_selected_index = self.file_list_entries.len().checked_sub(1);
+            }
+        }
+
         cx.notify();
     }
+
+    // --- User interactions ---
 
     fn toggle_dir(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(entry) = self.dir_tree_entries.get(ix) else {
@@ -235,6 +427,7 @@ impl FileBrowserView {
         };
         self.selected_dir_id = Some(entry.entry_id);
         self.selected_dir_path = Some(entry.path.clone());
+        self.file_list_selected_index = None;
         self.update_file_list(cx);
     }
 
@@ -248,7 +441,12 @@ impl FileBrowserView {
 
         let entry = worktree.read(cx).entry_for_id(entry_id);
         let needs_expand = entry
-            .map(|e| matches!(e.kind, project::EntryKind::PendingDir | project::EntryKind::UnloadedDir))
+            .map(|e| {
+                matches!(
+                    e.kind,
+                    project::EntryKind::PendingDir | project::EntryKind::UnloadedDir
+                )
+            })
             .unwrap_or(false);
 
         if needs_expand {
@@ -275,6 +473,7 @@ impl FileBrowserView {
                 self.try_expand_pending_dir(entry.entry_id, cx);
             }
 
+            self.file_list_selected_index = None;
             self.update_dir_tree(cx);
             self.update_file_list(cx);
         } else {
@@ -315,16 +514,16 @@ impl FileBrowserView {
         .detach();
     }
 
-    fn render_dir_tree_entry(
-        &self,
-        ix: usize,
-        cx: &Context<Self>,
-    ) -> AnyElement {
+    // --- Rendering ---
+
+    fn render_dir_tree_entry(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let Some(entry) = self.dir_tree_entries.get(ix) else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors();
-        let is_selected = self.selected_dir_id == Some(entry.entry_id);
+        let is_selected_dir = self.selected_dir_id == Some(entry.entry_id);
+        let is_cursor = self.dir_tree_selected_index == Some(ix)
+            && matches!(self.active_pane, ActivePane::DirTree);
 
         let chevron_icon = if entry.is_expanded {
             IconName::ChevronDown
@@ -349,7 +548,10 @@ impl FileBrowserView {
             .text_sm()
             .text_color(colors.text)
             .cursor_pointer()
-            .when(is_selected, |el| el.bg(colors.element_selected))
+            .when(is_cursor, |el| el.bg(colors.element_active))
+            .when(is_selected_dir && !is_cursor, |el| {
+                el.bg(colors.element_selected)
+            })
             .hover(|style| style.bg(colors.element_hover))
             .child(
                 Icon::new(chevron_icon)
@@ -359,21 +561,20 @@ impl FileBrowserView {
             .child(folder_icon.size(IconSize::Small).color(Color::Muted))
             .child(entry.name.clone())
             .on_click(cx.listener(move |this, _, _window, cx| {
+                this.dir_tree_selected_index = Some(ix);
                 this.select_dir(ix, cx);
                 this.toggle_dir(ix, cx);
             }))
             .into_any_element()
     }
 
-    fn render_file_list_entry(
-        &self,
-        ix: usize,
-        cx: &Context<Self>,
-    ) -> AnyElement {
+    fn render_file_list_entry(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let Some(entry) = self.file_list_entries.get(ix) else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors();
+        let is_cursor = self.file_list_selected_index == Some(ix)
+            && matches!(self.active_pane, ActivePane::FileList);
 
         let icon = if entry.is_dir {
             FileIcons::get_folder_icon(false, entry.path.as_std_path(), cx)
@@ -396,10 +597,12 @@ impl FileBrowserView {
             .text_sm()
             .text_color(colors.text)
             .cursor_pointer()
+            .when(is_cursor, |el| el.bg(colors.element_active))
             .hover(|style| style.bg(colors.element_hover))
             .child(icon.size(IconSize::Small).color(Color::Muted))
             .child(entry.name.clone())
             .on_click(cx.listener(move |this, _, window, cx| {
+                this.file_list_selected_index = Some(ix);
                 this.on_file_list_click(ix, window, cx);
             }))
             .into_any_element()
@@ -435,6 +638,13 @@ impl Render for FileBrowserView {
 
         div()
             .track_focus(&self.focus_handle)
+            .key_context(self.dispatch_context())
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::expand_selected_entry))
+            .on_action(cx.listener(Self::collapse_selected_entry))
+            .on_action(cx.listener(Self::confirm_entry))
+            .on_action(cx.listener(Self::switch_pane))
             .size_full()
             .flex()
             .flex_row()
