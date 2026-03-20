@@ -12,7 +12,7 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **Git status** — view changed files grouped by Conflicts/Tracked/Untracked, with staging checkboxes and click-to-open
 - **Markdown preview** — preview markdown files side-by-side
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
-- **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu
+- **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
 
 ## Claude Code Hook Setup
 
@@ -25,11 +25,14 @@ Add the following to your Claude Code `settings.json`:
     "Stop": [{ "hooks": [{ "type": "command", "command": "agentium claude hook stop" }] }],
     "Notification": [{ "matcher": "", "hooks": [{ "type": "command", "command": "agentium claude hook notification" }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentium claude hook user-prompt-submit" }] }]
-  }
+  },
+  "statusLine": "agentium claude statusline"
 }
 ```
 
 When Claude Code completes a response, the corresponding terminal tab shows a blue dot indicator and the arena sidebar shows a badge count. Switching to the tab clears the notification.
+
+The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info for display. A "!" indicator appears if no update has been received for over 1 hour.
 
 ## CLI
 
@@ -64,6 +67,10 @@ agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 ### `agentium claude hook <event>`
 
 Claude Code hook integration. Events: `session-start`, `stop`, `notification`, `user-prompt-submit`.
+
+### `agentium claude statusline`
+
+Claude Code statusline pass-through. Reads JSON from stdin, writes it back to stdout unchanged, and sends rate limit data to the running Agentium instance via IPC.
 
 ## Building
 
