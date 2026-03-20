@@ -1311,6 +1311,29 @@ pub(crate) fn new_agentium_pane(
             },
         )));
 
+        let split_handler_arena = arena.clone();
+        let split_handler_workspace = workspace.clone();
+        let split_handler_project = project.clone();
+        let split_handler_session = session_state.clone();
+        pane.set_custom_split_handler(Some(Arc::new(
+            move |pane_to_split, direction, window, cx| {
+                split_handler_arena
+                    .update(cx, |arena, cx| {
+                        let new_pane = new_agentium_pane(
+                            split_handler_workspace.clone(),
+                            split_handler_project.clone(),
+                            split_handler_session.clone(),
+                            window,
+                            cx,
+                        );
+                        arena.center.split(&pane_to_split, &new_pane, direction, cx);
+                        cx.notify();
+                        new_pane
+                    })
+                    .unwrap_or(pane_to_split)
+            },
+        )));
+
         let toolbar = pane.toolbar().clone();
         if let Some(callbacks) = cx.try_global::<workspace::PaneSearchBarCallbacks>() {
             let languages = Some(project.read(cx).languages().clone());

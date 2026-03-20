@@ -417,6 +417,8 @@ pub struct Pane {
     can_drop_predicate: Option<Arc<dyn Fn(&dyn Any, &mut Window, &mut App) -> bool>>,
     can_split_predicate:
         Option<Arc<dyn Fn(&mut Self, &dyn Any, &mut Window, &mut Context<Self>) -> bool>>,
+    custom_split_handler:
+        Option<Arc<dyn Fn(Entity<Pane>, SplitDirection, &mut Window, &mut App) -> Entity<Pane>>>,
     can_toggle_zoom: bool,
     show_external_drop_overlay: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
@@ -615,6 +617,7 @@ impl Pane {
             project: project.downgrade(),
             can_drop_predicate,
             can_split_predicate: None,
+            custom_split_handler: None,
             can_toggle_zoom: true,
             show_external_drop_overlay: true,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
@@ -863,6 +866,15 @@ impl Pane {
         >,
     ) {
         self.can_split_predicate = can_split_predicate;
+    }
+
+    pub fn set_custom_split_handler(
+        &mut self,
+        handler: Option<
+            Arc<dyn Fn(Entity<Pane>, SplitDirection, &mut Window, &mut App) -> Entity<Pane>>,
+        >,
+    ) {
+        self.custom_split_handler = handler;
     }
 
     pub fn set_can_toggle_zoom(&mut self, can_toggle_zoom: bool, cx: &mut Context<Self>) {
@@ -3884,6 +3896,23 @@ impl Pane {
         }
     }
 
+    fn split_pane_for_drop(
+        custom_split_handler: &Option<
+            Arc<dyn Fn(Entity<Pane>, SplitDirection, &mut Window, &mut App) -> Entity<Pane>>,
+        >,
+        workspace: &mut Workspace,
+        to_pane: Entity<Pane>,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Pane> {
+        if let Some(handler) = custom_split_handler {
+            handler(to_pane, direction, window, cx)
+        } else {
+            workspace.split_pane(to_pane, direction, window, cx)
+        }
+    }
+
     pub fn handle_tab_drop(
         &mut self,
         dragged_tab: &DraggedTab,
@@ -3909,12 +3938,20 @@ impl Pane {
             || cfg!(not(target_os = "macos")) && window.modifiers().control;
 
         let from_pane = dragged_tab.pane.clone();
+        let custom_split_handler = self.custom_split_handler.clone();
 
         self.workspace
             .update(cx, |_, cx| {
                 cx.defer_in(window, move |workspace, window, cx| {
                     if let Some(split_direction) = split_direction {
-                        to_pane = workspace.split_pane(to_pane, split_direction, window, cx);
+                        to_pane = Self::split_pane_for_drop(
+                            &custom_split_handler,
+                            workspace,
+                            to_pane,
+                            split_direction,
+                            window,
+                            cx,
+                        );
                     }
                     let database_id = workspace.database_id();
                     let was_pinned_in_from_pane = from_pane.read_with(cx, |pane, _| {
@@ -4074,6 +4111,7 @@ impl Pane {
         let mut to_pane = cx.entity();
         let split_direction = self.drag_split_direction;
         let project_entry_id = *project_entry_id;
+        let custom_split_handler = self.custom_split_handler.clone();
         self.workspace
             .update(cx, |_, cx| {
                 cx.defer_in(window, move |workspace, window, cx| {
@@ -4091,7 +4129,9 @@ impl Pane {
                                 let (to_pane, new_item_handle) = workspace
                                     .update_in(cx, |workspace, window, cx| {
                                         if let Some(split_direction) = split_direction {
-                                            to_pane = workspace.split_pane(
+                                            to_pane = Self::split_pane_for_drop(
+                                                &custom_split_handler,
+                                                workspace,
                                                 to_pane,
                                                 split_direction,
                                                 window,
@@ -4151,6 +4191,7 @@ impl Pane {
         let mut to_pane = cx.entity();
         let mut split_direction = self.drag_split_direction;
         let paths = paths.paths().to_vec();
+        let custom_split_handler = self.custom_split_handler.clone();
         let (should_block, needs_wsl_translation) = self
             .workspace
             .update(cx, |workspace, cx| {
@@ -4236,8 +4277,14 @@ impl Pane {
                     if let Ok((open_task, to_pane)) =
                         workspace.update_in(cx, |workspace, window, cx| {
                             if let Some(split_direction) = split_direction {
-                                to_pane =
-                                    workspace.split_pane(to_pane, split_direction, window, cx);
+                                to_pane = Self::split_pane_for_drop(
+                                    &custom_split_handler,
+                                    workspace,
+                                    to_pane,
+                                    split_direction,
+                                    window,
+                                    cx,
+                                );
                             }
                             (
                                 workspace.open_paths(
