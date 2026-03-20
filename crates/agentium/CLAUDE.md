@@ -51,6 +51,10 @@ Additionally, many default keybindings in `assets/keymaps/` are scoped to `"cont
 
 The `ready_shell_pids` set is shared between `AgentiumApp` (which writes it when Claude Code sessions become ready or are cleared) and per-pane indicator closures (which read it to decide whether to show a dot on a terminal tab). Because all access is on the single foreground thread, `Rc<RefCell<...>>` is used instead of `Arc<Mutex<...>>`. The `AgentiumApp` owns the canonical `claude_sessions: HashMap<String, ClaudeSession>` and syncs the derived `HashSet<u32>` cache via `sync_ready_shell_pids()` after every mutation.
 
+## Statusline command must pass through stdin before parsing
+
+`agentium claude statusline` is a Claude Code statusLine command. The protocol requires that stdin is echoed to stdout verbatim — Claude Code reads stdout to verify the command is working. The implementation must: (1) read all stdin, (2) write it to stdout and flush (stdout is a pipe, so explicit flush is required before process exit), (3) only then parse JSON and send rate limit data via IPC. If parsing fails, the stdout pass-through must still have succeeded.
+
 ## IPC protocol distinguishes messages by first byte
 
 The Unix datagram socket at `agentium.sock` carries two message formats: raw UTF-8 paths (for `agentium arena new`) and JSON objects (for `agentium claude hook`). The receiver distinguishes them by checking whether the first byte is `{`. This works because UNIX paths start with `/`, never `{`.
