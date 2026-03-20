@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{prelude::*, *};
@@ -43,6 +44,17 @@ struct ClaudeSession {
     is_ready: bool,
     user_prompt: String,
     status_message: String,
+}
+
+struct RateLimitEntry {
+    used_pct: f32,
+    resets_at: i64,
+}
+
+struct RateLimits {
+    five_hour: RateLimitEntry,
+    seven_day: RateLimitEntry,
+    received_at: Instant,
 }
 
 struct ReadyTerminalInfo {
@@ -83,6 +95,8 @@ pub struct AgentiumApp {
     pub(crate) claude_sessions: HashMap<String, ClaudeSession>,
     session_state: SharedSessionState,
     should_move_window: bool,
+    rate_limits: Option<RateLimits>,
+    _rate_limits_refresh_task: Option<Task<()>>,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
 }
@@ -121,6 +135,8 @@ impl AgentiumApp {
             renaming_arena: None,
             claude_sessions: HashMap::new(),
             should_move_window: false,
+            rate_limits: None,
+            _rate_limits_refresh_task: None,
             session_state: SharedSessionState::new(),
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
@@ -522,6 +538,40 @@ impl AgentiumApp {
         }
     }
 
+    pub fn update_rate_limits(
+        &mut self,
+        five_hour_used_pct: f32,
+        five_hour_resets_at: i64,
+        seven_day_used_pct: f32,
+        seven_day_resets_at: i64,
+        cx: &mut Context<Self>,
+    ) {
+        self.rate_limits = Some(RateLimits {
+            five_hour: RateLimitEntry {
+                used_pct: five_hour_used_pct,
+                resets_at: five_hour_resets_at,
+            },
+            seven_day: RateLimitEntry {
+                used_pct: seven_day_used_pct,
+                resets_at: seven_day_resets_at,
+            },
+            received_at: Instant::now(),
+        });
+
+        self._rate_limits_refresh_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
+
+        cx.notify();
+    }
+
     fn notify_all_panes(&self, cx: &mut Context<Self>) {
         let panes: Vec<_> = self
             .arenas
@@ -708,6 +758,73 @@ fn truncate_for_menu(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+fn format_resets_in(resets_at: i64) -> String {
+    if resets_at <= 0 {
+        return "Unknown".to_string();
+    }
+    let now = chrono::Local::now().timestamp();
+    let remaining = resets_at - now;
+    if remaining <= 0 {
+        return "Reset".to_string();
+    }
+    let hours = remaining / 3600;
+    let minutes = (remaining % 3600) / 60;
+    if hours > 0 {
+        format!("Resets in {}h {}m", hours, minutes)
+    } else {
+        format!("Resets in {}m", minutes)
+    }
+}
+
+fn format_resets_at_day(resets_at: i64) -> String {
+    use chrono::{Local, TimeZone};
+    if resets_at <= 0 {
+        return "Unknown".to_string();
+    }
+    let Some(dt) = Local.timestamp_opt(resets_at, 0).single() else {
+        return "Unknown".to_string();
+    };
+    dt.format("Resets %a %-H:%M").to_string()
+}
+
+fn render_rate_limit_row(
+    label: &str,
+    used_pct: f32,
+    reset_text: &str,
+    cx: &App,
+) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    v_flex()
+        .px_1()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child(reset_text.to_string()),
+                ),
+        )
+        .child(
+            ui::ProgressBar::new(
+                SharedString::from(format!("rate-limit-{label}")),
+                used_pct,
+                100.0,
+                cx,
+            )
+            .bg_color(colors.border),
+        )
 }
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
@@ -958,6 +1075,51 @@ impl Render for AgentiumApp {
                                 })),
                         ),
                     )
+                    .when_some(self.rate_limits.as_ref(), |sidebar, rate_limits| {
+                        let is_stale =
+                            rate_limits.received_at.elapsed() > Duration::from_secs(3600);
+                        sidebar.child(
+                            v_flex()
+                                .px_2()
+                                .pb_2()
+                                .gap_1()
+                                .child(div().h_px().mx_1().mb_1().bg(colors.border))
+                                .child(
+                                    h_flex()
+                                        .px_1()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(colors.text_muted)
+                                                .child("Rate limits"),
+                                        )
+                                        .when(is_stale, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(cx.theme().status().warning)
+                                                    .child("!"),
+                                            )
+                                        }),
+                                )
+                                .child(render_rate_limit_row(
+                                    "session",
+                                    rate_limits.five_hour.used_pct,
+                                    &format_resets_in(rate_limits.five_hour.resets_at),
+                                    cx,
+                                ))
+                                .child(render_rate_limit_row(
+                                    "week",
+                                    rate_limits.seven_day.used_pct,
+                                    &format_resets_at_day(rate_limits.seven_day.resets_at),
+                                    cx,
+                                )),
+                        )
+                    })
                     .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                         deferred(
                             anchored()
