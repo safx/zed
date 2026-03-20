@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::HashSet;
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use ui::{ActiveTheme, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::pane::render_item_indicator;
 use workspace::{
-    pane, move_active_item, move_item, ActivateNextPane, ActivatePane,
+    pane, move_active_item, ActivateNextPane, ActivatePane,
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
     DraggedTab, LeaderDecoration, ModalLayer, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal,
@@ -459,8 +458,7 @@ impl Arena {
             pane.add_item(item, true, true, None, window, cx);
         });
         self.center
-            .split(&self.active_pane, &new_pane, direction, cx)
-            .log_err();
+            .split(&self.active_pane, &new_pane, direction, cx);
         if !keep_focus {
             window.focus(&new_pane.focus_handle(cx), cx);
         }
@@ -521,8 +519,7 @@ impl Arena {
                     pane.add_item(terminal_view, true, true, None, window, cx);
                 });
                 this.center
-                    .split(&active_pane, &new_pane, direction, cx)
-                    .log_err();
+                    .split(&active_pane, &new_pane, direction, cx);
                 if !keep_focus {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
@@ -571,8 +568,7 @@ impl Arena {
                     pane.add_item(Box::new(project_diff), true, true, None, window, cx);
                 });
                 this.center
-                    .split(&active_pane, &new_pane, direction, cx)
-                    .log_err();
+                    .split(&active_pane, &new_pane, direction, cx);
                 if !keep_focus {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
@@ -677,8 +673,7 @@ impl Arena {
                         };
                         this.update_in(cx, |this, window, cx| {
                             this.center
-                                .split(&pane, &new_pane, direction, cx)
-                                .log_err();
+                                .split(&pane, &new_pane, direction, cx);
                             window.focus(&new_pane.focus_handle(cx), cx);
                         })
                         .ok();
@@ -701,7 +696,7 @@ impl Arena {
                     new_pane.update(cx, |pane, cx| {
                         pane.add_item(item, true, true, None, window, cx);
                     });
-                    self.center.split(pane, &new_pane, direction, cx).log_err();
+                    self.center.split(pane, &new_pane, direction, cx);
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
             },
@@ -792,8 +787,7 @@ impl Arena {
                         cx,
                     );
                     self.center
-                        .split(&active_pane, &new_pane, SplitDirection::Right, cx)
-                        .log_err();
+                        .split(&active_pane, &new_pane, SplitDirection::Right, cx);
                     new_pane
                 }
             }
@@ -1328,85 +1322,6 @@ pub(crate) fn new_agentium_pane(
             toolbar.add_item(project_search_bar, window, cx);
         });
 
-        let drop_project = project.downgrade();
-        let drop_arena = arena.clone();
-        let drop_workspace = workspace.clone();
-        let drop_session_state = session_state.clone();
-        pane.set_custom_drop_handle(cx, move |pane, dropped_item, window, cx| {
-            if !drop_project.upgrade().is_some() {
-                return ControlFlow::Break(());
-            }
-            if let Some(tab) = dropped_item.downcast_ref::<DraggedTab>() {
-                let this_pane = cx.entity();
-                let item = if tab.pane == this_pane {
-                    pane.item_for_index(tab.ix)
-                } else {
-                    tab.pane.read(cx).item_for_index(tab.ix)
-                };
-                if let Some(item) = item {
-                    {
-                        let source = tab.pane.clone();
-                        let item_id_to_move = item.item_id();
-
-                        let Some(split_direction) = pane.drag_split_direction() else {
-                            return ControlFlow::Continue(());
-                        };
-
-                        let workspace_handle = drop_workspace.clone();
-                        let arena = drop_arena.clone();
-                        let project = drop_project.clone();
-                        let session_state = drop_session_state.clone();
-
-                        cx.spawn_in(window, async move |_, cx| {
-                            cx.update(|window, cx| {
-                                let Some(project) = project.upgrade() else {
-                                    return;
-                                };
-                                let Ok(new_pane) =
-                                    arena.update(cx, |workspace, cx| {
-                                        let new_pane = new_agentium_pane(
-                                            workspace_handle,
-                                            project,
-                                            session_state,
-                                            window,
-                                            cx,
-                                        );
-                                        workspace.center.split(
-                                            &this_pane,
-                                            &new_pane,
-                                            split_direction,
-                                            cx,
-                                        )?;
-                                        anyhow::Ok(new_pane)
-                                    })
-                                else {
-                                    return;
-                                };
-                                let Some(new_pane) = new_pane.log_err() else {
-                                    return;
-                                };
-                                move_item(
-                                    &source,
-                                    &new_pane,
-                                    item_id_to_move,
-                                    new_pane.read(cx).active_item_index(),
-                                    true,
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                        })
-                        .detach();
-                    }
-                }
-                return ControlFlow::Break(());
-            } else if let Some(paths) = dropped_item.downcast_ref::<ExternalPaths>() {
-                add_paths_to_terminal(pane, paths.paths(), window, cx);
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        });
 
         pane
     });
@@ -1525,27 +1440,3 @@ pub(crate) fn new_agentium_pane(
     pane
 }
 
-fn add_paths_to_terminal(
-    pane: &mut Pane,
-    paths: &[PathBuf],
-    window: &mut Window,
-    cx: &mut Context<Pane>,
-) {
-    if let Some(terminal_view) = pane
-        .active_item()
-        .and_then(|item| item.downcast::<TerminalView>())
-    {
-        window.focus(&terminal_view.focus_handle(cx), cx);
-        let mut new_text = String::new();
-        for path in paths {
-            new_text.push(' ');
-            new_text.push_str(&format!("{path:?}"));
-        }
-        new_text.push(' ');
-        terminal_view.update(cx, |terminal_view, cx| {
-            terminal_view.terminal().update(cx, |terminal, _| {
-                terminal.paste(&new_text);
-            });
-        });
-    }
-}
