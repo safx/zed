@@ -497,6 +497,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Quit Agentium", Quit),
                 ],
+                disabled: false,
             }]);
 
             let clock = Arc::new(clock::RealSystemClock);
