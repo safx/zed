@@ -32,6 +32,7 @@ futures.workspace = true
 git.workspace = true
 git_ui.workspace = true
 gpui.workspace = true
+gpui_platform = {workspace = true, features=["font-kit"]}
 http_client.workspace = true
 language.workspace = true
 markdown_preview.workspace = true
