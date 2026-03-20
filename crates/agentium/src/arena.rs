@@ -28,7 +28,8 @@ use workspace::{
 };
 
 use crate::{
-    NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitStatus, NewProjectSearch,
+    NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
+    NewProjectSearch,
     PaneContentType, file_browser_view::FileBrowserView, git_status_view::GitStatusView,
 };
 
@@ -307,6 +308,16 @@ impl Arena {
         });
     }
 
+    fn add_git_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
+        let view = cx.new(|cx| {
+            git_graph::GitGraph::new(self.project.clone(), self.workspace.clone(), window, cx)
+        });
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(view), true, true, None, window, cx);
+        });
+    }
+
     pub(crate) fn add_tab(
         &mut self,
         content_type: PaneContentType,
@@ -372,6 +383,9 @@ impl Arena {
             PaneContentType::FileBrowser => {
                 self.add_file_browser(window, cx);
             }
+            PaneContentType::GitGraph => {
+                self.add_git_graph(window, cx);
+            }
         }
     }
 
@@ -431,6 +445,18 @@ impl Arena {
                         self.project.clone(),
                         self.workspace.clone(),
                         worktree_id,
+                        cx,
+                    )
+                });
+                self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
+            }
+            PaneContentType::GitGraph => {
+                self.activate_context(cx);
+                let item = cx.new(|cx| {
+                    git_graph::GitGraph::new(
+                        self.project.clone(),
+                        self.workspace.clone(),
+                        window,
                         cx,
                     )
                 });
@@ -1003,6 +1029,11 @@ impl Render for Arena {
                         }),
                     )
                     .on_action(
+                        cx.listener(|this, _: &NewGitGraph, window, cx| {
+                            this.add_git_graph(window, cx);
+                        }),
+                    )
+                    .on_action(
                         cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                             this.activate_pane_in_direction(SplitDirection::Left, window, cx);
                         }),
@@ -1394,6 +1425,10 @@ pub(crate) fn new_agentium_pane(
                                     .action(
                                         "New File Browser",
                                         NewFileBrowser.boxed_clone(),
+                                    )
+                                    .action(
+                                        "New Git Graph",
+                                        NewGitGraph.boxed_clone(),
                                     )
                             }))
                         }),

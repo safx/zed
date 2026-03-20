@@ -96,6 +96,7 @@ enum PaneContentType {
     BranchDiff,
     GitStatus,
     ProjectSearch,
+    GitGraph,
 }
 
 #[derive(clap::Subcommand)]
@@ -269,6 +270,7 @@ fn start_ipc_listener(
                                     Some("branch-diff") => agentium::PaneContentType::BranchDiff,
                                     Some("git-status") => agentium::PaneContentType::GitStatus,
                                     Some("project-search") => agentium::PaneContentType::ProjectSearch,
+                                    Some("git-graph") => agentium::PaneContentType::GitGraph,
                                     _ => continue,
                                 };
                                 let keep_focus = json["keep_focus"].as_bool().unwrap_or(false);
@@ -289,6 +291,7 @@ fn start_ipc_listener(
                                     Some("branch-diff") => agentium::PaneContentType::BranchDiff,
                                     Some("git-status") => agentium::PaneContentType::GitStatus,
                                     Some("project-search") => agentium::PaneContentType::ProjectSearch,
+                                    Some("git-graph") => agentium::PaneContentType::GitGraph,
                                     _ => continue,
                                 };
                                 let command: Vec<String> = json["command"]
@@ -400,6 +403,7 @@ fn main() {
                 PaneContentType::BranchDiff => "branch-diff",
                 PaneContentType::GitStatus => "git-status",
                 PaneContentType::ProjectSearch => "project-search",
+                PaneContentType::GitGraph => "git-graph",
             };
             let msg = serde_json::json!({
                 "type": "pane_split",
@@ -426,6 +430,7 @@ fn main() {
                 PaneContentType::BranchDiff => "branch-diff",
                 PaneContentType::GitStatus => "git-status",
                 PaneContentType::ProjectSearch => "project-search",
+                PaneContentType::GitGraph => "git-graph",
             };
             let msg = serde_json::json!({
                 "type": "tab_new",
