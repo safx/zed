@@ -461,7 +461,7 @@ fn main() {
 
     let socket_path = agentium_socket_path();
 
-    Application::new()
+    Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
@@ -525,9 +525,14 @@ fn main() {
             let node_runtime_for_window = node_runtime.clone();
 
             cx.spawn(async move |cx| {
-                let session = session::Session::new(uuid::Uuid::new_v4().to_string()).await;
+                let app_db = db::AppDatabase::new();
+                let session = session::Session::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    db::kvp::KeyValueStore::from_app_db(&app_db),
+                ).await;
 
                 cx.update(|cx| {
+                    cx.set_global(app_db);
                     let app_session = cx.new(|cx| session::AppSession::new(session, cx));
                     let workspace_store =
                         cx.new(|cx| workspace::WorkspaceStore::new(client.clone(), cx));

@@ -461,6 +461,7 @@ dependencies = [
  "git",
  "git_ui",
  "gpui",
+ "gpui_platform",
  "http_client",
  "language",
  "languages",
