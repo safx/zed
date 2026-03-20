@@ -110,6 +110,8 @@ enum ClaudeAction {
         #[command(subcommand)]
         event: ClaudeHookEvent,
     },
+    /// Claude Code statusline pass-through (extracts rate limits)
+    Statusline,
 }
 
 #[derive(clap::Subcommand)]
@@ -150,6 +152,12 @@ enum IpcMessage {
     TabNew {
         content_type: agentium::PaneContentType,
         command: Vec<String>,
+    },
+    ClaudeStatusline {
+        five_hour_used_pct: f32,
+        five_hour_resets_at: i64,
+        seven_day_used_pct: f32,
+        seven_day_resets_at: i64,
     },
 }
 
@@ -284,6 +292,24 @@ fn start_ipc_listener(
                                     .unwrap_or_default();
                                 IpcMessage::PaneSplit { direction, content_type, keep_focus, command }
                             }
+                            Some("claude_statusline") => {
+                                let five_hour = &json["rate_limits"]["five_hour"];
+                                let seven_day = &json["rate_limits"]["seven_day"];
+                                IpcMessage::ClaudeStatusline {
+                                    five_hour_used_pct: five_hour["used_percentage"]
+                                        .as_f64()
+                                        .unwrap_or(0.0) as f32,
+                                    five_hour_resets_at: five_hour["resets_at"]
+                                        .as_i64()
+                                        .unwrap_or(0),
+                                    seven_day_used_pct: seven_day["used_percentage"]
+                                        .as_f64()
+                                        .unwrap_or(0.0) as f32,
+                                    seven_day_resets_at: seven_day["resets_at"]
+                                        .as_i64()
+                                        .unwrap_or(0),
+                                }
+                            }
                             Some("tab_new") => {
                                 let content_type = match json["content_type"].as_str() {
                                     Some("terminal") => agentium::PaneContentType::Terminal,
@@ -374,6 +400,51 @@ fn main() {
             if let Ok(socket) = UnixDatagram::unbound() {
                 if socket.connect(&socket_path).is_ok() {
                     socket.send(msg.to_string().as_bytes()).ok();
+                }
+            }
+            return;
+        }
+        Some(Command::Claude {
+            action: ClaudeAction::Statusline,
+        }) => {
+            use std::io::{Read, Write};
+
+            let mut input = String::new();
+            if let Err(err) = std::io::stdin().read_to_string(&mut input) {
+                eprintln!("agentium statusline: failed to read stdin: {err}");
+                return;
+            }
+
+            if let Err(error) = std::io::stdout()
+                .write_all(input.as_bytes())
+                .and_then(|_| std::io::stdout().flush())
+            {
+                eprintln!("agentium statusline: failed to write stdout: {error}");
+            }
+
+            let json: serde_json::Value = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("agentium statusline: failed to parse JSON: {err}");
+                    return;
+                }
+            };
+
+            if let Some(rate_limits) = json.get("rate_limits") {
+                let msg = serde_json::json!({
+                    "type": "claude_statusline",
+                    "rate_limits": rate_limits,
+                });
+                let socket_path = agentium_socket_path();
+                match UnixDatagram::unbound().and_then(|socket| {
+                    socket.connect(&socket_path)?;
+                    socket.send(msg.to_string().as_bytes())?;
+                    Ok(())
+                }) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        eprintln!("agentium statusline: failed to send IPC: {err}");
+                    }
                 }
             }
             return;
@@ -739,6 +810,24 @@ fn main() {
                                                         keep_focus,
                                                         command,
                                                         window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudeStatusline {
+                                            five_hour_used_pct,
+                                            five_hour_resets_at,
+                                            seven_day_used_pct,
+                                            seven_day_resets_at,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.update_rate_limits(
+                                                        five_hour_used_pct,
+                                                        five_hour_resets_at,
+                                                        seven_day_used_pct,
+                                                        seven_day_resets_at,
                                                         cx,
                                                     );
                                                 })
