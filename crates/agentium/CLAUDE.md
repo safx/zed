@@ -77,6 +77,18 @@ Resources at `crates/agentium/resources/info/` contain plist fragments that `car
 
 Agentium does **not** set `ZED_BUNDLE=true` at build time. This env var controls whether the `git` crate looks for a bundled git binary at `Contents/MacOS/git`. Since Agentium does not bundle git, the system git is used instead.
 
+## Modal layer is rendered by AgentiumApp, not Arena
+
+The `ModalLayer` entity (from the shared `Workspace`) is rendered as a child of `AgentiumApp::render()`, not inside `Arena::render()`. This is because `AgentiumApp` can have zero arenas (initial state, all arenas closed), and modals must still work — e.g. the recent projects picker is opened from the sidebar before any arena exists. If the modal layer were only rendered inside Arena, `workspace.toggle_modal()` would add the modal to the entity but it would have nowhere to render when no arenas exist.
+
+When adding new modal-triggering features, do not assume an active arena exists. The modal layer is always available via `self.workspace_entity.read(cx).modal_layer()`.
+
+## Workspace `database_id` is None — DB writes must be explicit
+
+Agentium creates its `Workspace` entity with `Workspace::new(None, ...)`, so `database_id` is always `None`. Zed's `serialize_workspace_internal()` checks `self.database_id()` and returns immediately if `None`, meaning **no automatic persistence occurs** — not for worktrees, panes, dock state, or recent projects.
+
+Any feature that needs data in `WorkspaceDb` (e.g. recent projects list) must write to the DB explicitly using `WorkspaceDb::global(cx)` methods like `save_local_workspace_paths()`. Do not rely on Zed's event-driven serialization (`WorktreeAdded` → `serialize_workspace()`) — it is a no-op in Agentium.
+
 ## TERM_PROGRAM is derived from the binary name
 
 `terminal::insert_zed_terminal_env` uses `std::env::current_exe()` to determine the value of `TERM_PROGRAM`. When the running binary is `agentium` (including inside `Agentium.app/Contents/MacOS/agentium`), terminals get `TERM_PROGRAM=agentium`. When running as `zed`, they get `TERM_PROGRAM=zed`. This is important for tools like Claude Code that inspect `TERM_PROGRAM` to detect the host terminal.
