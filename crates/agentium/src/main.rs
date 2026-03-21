@@ -355,6 +355,8 @@ fn main() {
         return;
     }
 
+    paths::set_app_name("Agentium");
+
     let args = Args::parse();
     let theme_name = args.theme;
 
@@ -671,8 +673,7 @@ fn main() {
                         cx.bind_keys(bindings);
                     }
 
-                    let worktree_path = initial_workspace_path
-                        .or_else(|| std::env::current_dir().ok());
+                    let worktree_path = initial_workspace_path;
 
                     let window_handle = cx
                         .open_window(
