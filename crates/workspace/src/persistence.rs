@@ -2471,6 +2471,30 @@ impl WorkspaceDb {
         }
     }
 
+    pub async fn save_local_workspace_paths(&self, paths: &[PathBuf]) {
+        let path_list = PathList::new(paths);
+        let serialized = path_list.serialize();
+        self.write(move |conn| {
+            conn.with_savepoint("save_local_workspace_paths", || {
+                // Delete any existing workspace with the same paths
+                conn.exec_bound(sql!(
+                    DELETE FROM workspaces
+                    WHERE paths IS ?1 AND remote_connection_id IS NULL
+                ))?(serialized.paths.clone())
+                    .context("clearing old workspace")?;
+                // Insert a new entry
+                conn.exec_bound(sql!(
+                    INSERT INTO workspaces(paths, paths_order, timestamp)
+                    VALUES (?1, ?2, CURRENT_TIMESTAMP)
+                ))?((serialized.paths, serialized.order))
+                    .context("inserting workspace paths")?;
+                Ok(())
+            })
+            .log_err();
+        })
+        .await;
+    }
+
     query! {
         pub(crate) async fn set_window_open_status(workspace_id: WorkspaceId, bounds: SerializedWindowBounds, display: Uuid) -> Result<()> {
             UPDATE workspaces
