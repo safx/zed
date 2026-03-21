@@ -542,6 +542,14 @@ fn main() {
         .run(move |cx: &mut App| {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
             settings::init(cx);
+
+            #[cfg(unix)]
+            cx.background_executor()
+                .spawn(async {
+                    util::load_login_shell_environment().await.log_err();
+                })
+                .detach();
+
             theme::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
 
             if let Some(ref name) = theme_name {
