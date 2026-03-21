@@ -9,14 +9,23 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use editor::{Editor, EditorEvent};
+use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{prelude::*, *};
+use picker::{
+    Picker, PickerDelegate,
+    highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
+};
 use project::Project;
 use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
-use ui::{ActiveTheme, ContextMenu, prelude::*};
+use ui::{ActiveTheme, ContextMenu, KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui_input::ErasedEditor;
+use util::{ResultExt as _, paths::PathExt};
 use workspace::{
-    AppState, Pane, SplitDirection, Workspace, ZoomOut,
+    AppState, ModalView, Pane, PathList, SerializedWorkspaceLocation, SplitDirection, Workspace,
+    WorkspaceDb, WorkspaceId, ZoomOut,
 };
 
 use arena::{Arena, ArenaEvent};
@@ -154,18 +163,27 @@ impl AgentiumApp {
                 project.create_worktree(&path, true, cx)
             })
             .detach_and_log_err(cx);
+
+        let db = WorkspaceDb::global(cx);
+        let paths = vec![path.clone()];
+        cx.background_spawn(async move {
+            db.save_local_workspace_paths(&paths).await;
+        })
+        .detach();
+
         self.add_arena_inner(Some(path), window, cx);
     }
 
-    fn add_arena(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let working_directory = self
-            .project
-            .read(cx)
-            .worktrees(cx)
-            .next()
-            .map(|wt| wt.read(cx).abs_path().to_path_buf());
-        self.add_arena_inner(working_directory, window, cx);
+    fn open_recent_projects_picker(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let agentium_weak = cx.entity().downgrade();
+        let fs = self.app_state.fs.clone();
+        self.workspace_entity.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                AgentiumRecentProjects::new(agentium_weak, fs, window, cx)
+            });
+        });
     }
+
 
     fn add_arena_inner(
         &mut self,
@@ -180,11 +198,10 @@ impl AgentiumApp {
 
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
-        let modal_layer = self.workspace_entity.read(cx).modal_layer().clone();
         let session_state = self.session_state.clone();
 
         let arena_entity = cx.new(|cx| {
-            Arena::new(arena_id, name, workspace_weak, project, modal_layer, working_directory, session_state, window, cx)
+            Arena::new(arena_id, name, workspace_weak, project, working_directory, session_state, window, cx)
         });
 
         let subscription = cx.subscribe(
@@ -1071,7 +1088,7 @@ impl Render for AgentiumApp {
                                 .hover(|d| d.bg(colors.element_hover))
                                 .child("+ New Arena")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_arena(window, cx)
+                                    this.open_recent_projects_picker(window, cx);
                                 })),
                         ),
                     )
@@ -1157,5 +1174,445 @@ impl Render for AgentiumApp {
                         ),
                     }),
             )
+            .child(self.workspace_entity.read(cx).modal_layer().clone())
+    }
+}
+
+struct AgentiumRecentProjects {
+    picker: Entity<Picker<AgentiumRecentProjectsDelegate>>,
+    _subscription: Subscription,
+}
+
+impl AgentiumRecentProjects {
+    fn new(
+        agentium_app: WeakEntity<AgentiumApp>,
+        fs: Arc<dyn fs::Fs>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let delegate = AgentiumRecentProjectsDelegate {
+            agentium_app,
+            fs: fs.clone(),
+            workspaces: Vec::new(),
+            filtered_workspaces: Vec::new(),
+            selected_index: 0,
+            focus_handle: cx.focus_handle(),
+        };
+
+        let picker = cx.new(|cx| {
+            Picker::list(delegate, window, cx)
+                .list_measure_all()
+                .show_scrollbar(true)
+        });
+
+        let picker_focus_handle = picker.focus_handle(cx);
+        picker.update(cx, |picker, _| {
+            picker.delegate.focus_handle = picker_focus_handle;
+        });
+
+        let _subscription =
+            cx.subscribe(&picker, |_this: &mut Self, _, _, cx| cx.emit(DismissEvent));
+
+        let db = WorkspaceDb::global(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let workspaces = db
+                .recent_workspaces_on_disk(fs.as_ref())
+                .await
+                .log_err()
+                .unwrap_or_default();
+            this.update_in(cx, move |this, window, cx| {
+                this.picker.update(cx, move |picker, cx| {
+                    picker.delegate.set_workspaces(workspaces);
+                    picker.update_matches(picker.query(cx), window, cx)
+                })
+            })
+            .ok();
+        })
+        .detach();
+
+        picker.focus_handle(cx).focus(window, cx);
+
+        Self {
+            picker,
+            _subscription,
+        }
+    }
+}
+
+impl ModalView for AgentiumRecentProjects {}
+impl EventEmitter<DismissEvent> for AgentiumRecentProjects {}
+
+impl Focusable for AgentiumRecentProjects {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+
+impl Render for AgentiumRecentProjects {
+    fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("AgentiumRecentProjects")
+            .w(rems(28.))
+            .child(self.picker.clone())
+    }
+}
+
+struct AgentiumRecentProjectsDelegate {
+    agentium_app: WeakEntity<AgentiumApp>,
+    fs: Arc<dyn fs::Fs>,
+    workspaces: Vec<(
+        WorkspaceId,
+        SerializedWorkspaceLocation,
+        PathList,
+        DateTime<Utc>,
+    )>,
+    filtered_workspaces: Vec<StringMatch>,
+    selected_index: usize,
+    focus_handle: FocusHandle,
+}
+
+impl AgentiumRecentProjectsDelegate {
+    fn set_workspaces(&mut self, workspaces: Vec<workspace::RecentWorkspace>) {
+        self.workspaces = workspaces
+            .into_iter()
+            .map(|w| (w.workspace_id, w.location, w.paths, w.timestamp))
+            .collect();
+    }
+
+    fn delete_recent_project(
+        &self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(hit) = self.filtered_workspaces.get(ix) else {
+            return;
+        };
+        let Some((workspace_id, _, _, _)) = self.workspaces.get(hit.candidate_id) else {
+            return;
+        };
+        let workspace_id = *workspace_id;
+        let fs = self.fs.clone();
+        let db = WorkspaceDb::global(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            db.delete_workspace_by_id(workspace_id).await.log_err();
+            let workspaces = db
+                .recent_workspaces_on_disk(fs.as_ref())
+                .await
+                .log_err()
+                .unwrap_or_default();
+            this.update_in(cx, move |picker, window, cx| {
+                picker.delegate.set_workspaces(workspaces);
+                picker
+                    .delegate
+                    .set_selected_index(ix.saturating_sub(1), window, cx);
+                picker.update_matches(picker.query(cx), window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_arena_for_entry(
+        &self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(hit) = self.filtered_workspaces.get(ix) else {
+            return;
+        };
+        let Some((_, location, paths, _)) = self.workspaces.get(hit.candidate_id) else {
+            return;
+        };
+        if !matches!(location, SerializedWorkspaceLocation::Local) {
+            return;
+        }
+        let Some(path) = paths.paths().first().cloned() else {
+            return;
+        };
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            if let Some(handle) = window_handle.downcast::<AgentiumApp>() {
+                handle
+                    .update(cx, |app, window, cx| {
+                        app.add_arena_with_path(path, window, cx);
+                    })
+                    .ok();
+            }
+        });
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for AgentiumRecentProjectsDelegate {}
+
+impl PickerDelegate for AgentiumRecentProjectsDelegate {
+    type ListItem = AnyElement;
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Search projects…".into()
+    }
+
+    fn render_editor(
+        &self,
+        editor: &Arc<dyn ErasedEditor>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Div {
+        h_flex()
+            .flex_none()
+            .h_9()
+            .px_2p5()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(editor.render(window, cx))
+    }
+
+    fn match_count(&self) -> usize {
+        self.filtered_workspaces.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        let query = query.trim_start();
+        let smart_case = query.chars().any(|c| c.is_uppercase());
+        let is_empty_query = query.is_empty();
+
+        let candidates: Vec<_> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, location, _, _))| {
+                matches!(location, SerializedWorkspaceLocation::Local)
+            })
+            .map(|(id, (_, _, paths, _))| {
+                let combined_string = paths
+                    .ordered_paths()
+                    .map(|path| path.compact().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("");
+                StringMatchCandidate::new(id, &combined_string)
+            })
+            .collect();
+
+        if is_empty_query {
+            self.filtered_workspaces = candidates
+                .into_iter()
+                .map(|candidate| StringMatch {
+                    candidate_id: candidate.id,
+                    score: 0.0,
+                    positions: Vec::new(),
+                    string: candidate.string,
+                })
+                .collect();
+        } else {
+            let mut matches = smol::block_on(fuzzy::match_strings(
+                &candidates,
+                query,
+                smart_case,
+                true,
+                100,
+                &Default::default(),
+                cx.background_executor().clone(),
+            ));
+            matches.sort_unstable_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.candidate_id.cmp(&b.candidate_id))
+            });
+            self.filtered_workspaces = matches;
+        }
+
+        self.selected_index = 0;
+        Task::ready(())
+    }
+
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(hit) = self.filtered_workspaces.get(self.selected_index) else {
+            return;
+        };
+        let Some((_, location, paths, _)) = self.workspaces.get(hit.candidate_id) else {
+            return;
+        };
+        if !matches!(location, SerializedWorkspaceLocation::Local) {
+            return;
+        }
+        let Some(path) = paths.paths().first().cloned() else {
+            return;
+        };
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            if let Some(handle) = window_handle.downcast::<AgentiumApp>() {
+                handle
+                    .update(cx, |app, window, cx| {
+                        app.add_arena_with_path(path, window, cx);
+                    })
+                    .ok();
+            }
+        });
+        cx.emit(DismissEvent);
+    }
+
+    fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        if self.workspaces.is_empty() {
+            Some("Recently opened projects will show up here".into())
+        } else {
+            Some("No matches".into())
+        }
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let hit = self.filtered_workspaces.get(ix)?;
+        let (_, _, paths, _) = self.workspaces.get(hit.candidate_id)?;
+
+        let ordered_paths: Vec<_> = paths
+            .ordered_paths()
+            .map(|p| p.compact().to_string_lossy().to_string())
+            .collect();
+        let tooltip_path: SharedString = ordered_paths.join("\n").into();
+
+        let compact_path = ordered_paths.join(", ");
+        let match_label = HighlightedMatch {
+            text: compact_path,
+            highlight_positions: hit.positions.clone(),
+            color: Color::Default,
+        };
+        let highlighted = HighlightedMatchWithPaths {
+            prefix: None,
+            match_label,
+            paths: Vec::new(),
+        };
+
+        let secondary_actions = h_flex()
+            .gap_px()
+            .child(
+                IconButton::new(("add_to_arena", ix), IconName::FolderPlus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Open as New Arena"))
+                    .on_click(cx.listener(move |picker, _, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        picker.delegate.open_arena_for_entry(ix, window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new(("delete", ix), IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Delete from Recent Projects"))
+                    .on_click(cx.listener(move |picker, _, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        picker.delegate.delete_recent_project(ix, window, cx);
+                    })),
+            )
+            .into_any_element();
+
+        Some(
+            ListItem::new(ix)
+                .toggle_state(selected)
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .flex_grow()
+                        .child(highlighted.render(window, cx)),
+                )
+                .tooltip(Tooltip::text(tooltip_path))
+                .map(|el| {
+                    if self.selected_index == ix {
+                        el.end_slot(secondary_actions)
+                    } else {
+                        el.end_hover_slot(secondary_actions)
+                    }
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_footer(
+        &self,
+        _: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        let focus_handle = self.focus_handle.clone();
+
+        Some(
+            h_flex()
+                .flex_1()
+                .p_1p5()
+                .gap_1()
+                .justify_end()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Button::new("open_local_project", "Open Local Project…").on_click(
+                        cx.listener(|picker, _, window, cx| {
+                            let paths_receiver =
+                                cx.prompt_for_paths(gpui::PathPromptOptions {
+                                    files: false,
+                                    directories: true,
+                                    multiple: false,
+                                    prompt: None,
+                                });
+                            let agentium_app = picker.delegate.agentium_app.clone();
+                            cx.spawn_in(window, async move |_, cx| {
+                                if let Ok(Ok(Some(paths))) = paths_receiver.await {
+                                    if let Some(path) = paths.into_iter().next() {
+                                        agentium_app
+                                            .update_in(cx, |app, window, cx| {
+                                                app.add_arena_with_path(path, window, cx);
+                                            })
+                                            .ok();
+                                    }
+                                }
+                                anyhow::Ok(())
+                            })
+                            .detach_and_log_err(cx);
+                            cx.emit(DismissEvent);
+                        }),
+                    ),
+                )
+                .child(
+                    Button::new("open_confirm", "Open")
+                        .key_binding(KeyBinding::for_action_in(
+                            &menu::Confirm,
+                            &focus_handle,
+                            cx,
+                        ))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
+                        }),
+                )
+                .into_any(),
+        )
     }
 }

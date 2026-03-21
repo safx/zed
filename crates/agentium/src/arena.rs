@@ -20,7 +20,7 @@ use workspace::pane::render_item_indicator;
 use workspace::{
     pane, move_active_item, ActivateNextPane, ActivatePane,
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
-    DraggedTab, LeaderDecoration, ModalLayer, MoveItemToPane,
+    DraggedTab, LeaderDecoration, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal,
     Pane, PaneGroup, PaneLeaderDecorator, Save, SaveAs, SaveIntent, SaveWithoutFormat,
     SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
@@ -46,7 +46,6 @@ pub(crate) struct Arena {
     pub(crate) zoomed_pane: Option<AnyWeakView>,
     pub(crate) workspace: WeakEntity<Workspace>,
     pub(crate) project: Entity<Project>,
-    modal_layer: Entity<ModalLayer>,
     pub(crate) session_state: crate::SharedSessionState,
 }
 
@@ -56,7 +55,6 @@ impl Arena {
         name: String,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
-        modal_layer: Entity<ModalLayer>,
         working_directory: Option<PathBuf>,
         session_state: crate::SharedSessionState,
         window: &mut Window,
@@ -98,7 +96,6 @@ impl Arena {
             zoomed_pane: None,
             workspace,
             project,
-            modal_layer,
             session_state,
         }
     }
@@ -1186,7 +1183,6 @@ impl Render for Arena {
                             .detach_and_log_err(cx);
                         }),
                     )
-                    .child(self.modal_layer.clone())
             })
             .unwrap_or_else(|| div().size_full())
     }
