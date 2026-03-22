@@ -121,14 +121,18 @@ impl Arena {
             });
         }
 
+        let git_store = self.project.read(cx).git_store().clone();
         if let Some(worktree_id) = worktree_id {
             let project_path = ProjectPath {
                 worktree_id,
                 path: Arc::from(util::rel_path::RelPath::empty()),
             };
-            let git_store = self.project.read(cx).git_store().clone();
             git_store.update(cx, |git_store, cx| {
                 git_store.set_active_repo_for_path(&project_path, cx);
+            });
+        } else {
+            git_store.update(cx, |git_store, cx| {
+                git_store.clear_active_repository(cx);
             });
         }
     }

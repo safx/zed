@@ -1006,6 +1006,15 @@ impl GitStore {
     pub fn set_active_repo_for_path(&mut self, project_path: &ProjectPath, cx: &mut Context<Self>) {
         if let Some((repo, _)) = self.repository_and_path_for_project_path(project_path, cx) {
             self.set_active_repo_id(repo.read(cx).id, cx);
+        } else {
+            self.clear_active_repository(cx);
+        }
+    }
+
+    pub fn clear_active_repository(&mut self, cx: &mut Context<Self>) {
+        if self.active_repo_id.is_some() {
+            self.active_repo_id = None;
+            cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
         }
     }
 
