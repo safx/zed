@@ -110,17 +110,7 @@ impl GitStatusView {
     }
 
     fn active_repository(&self, cx: &App) -> Option<Entity<Repository>> {
-        self.project
-            .read(cx)
-            .active_repository(cx)
-            .or_else(|| {
-                self.project
-                    .read(cx)
-                    .repositories(cx)
-                    .values()
-                    .next()
-                    .cloned()
-            })
+        self.project.read(cx).active_repository(cx)
     }
 
     fn toggle_staged(&mut self, ix: usize, cx: &mut Context<Self>) {
