@@ -431,6 +431,21 @@ impl FileBrowserView {
         self.update_file_list(cx);
     }
 
+    fn select_root_dir(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree_id) = self.worktree_id else {
+            return;
+        };
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        if let Some(root) = worktree.read(cx).root_entry() {
+            self.selected_dir_id = Some(root.id);
+            self.selected_dir_path = Some(root.path.clone());
+            self.file_list_selected_index = None;
+            self.update_file_list(cx);
+        }
+    }
+
     fn try_expand_pending_dir(&self, entry_id: ProjectEntryId, cx: &mut Context<Self>) {
         let Some(worktree_id) = self.worktree_id else {
             return;
@@ -516,6 +531,27 @@ impl FileBrowserView {
 
     // --- Rendering ---
 
+    fn root_dir_name(&self, cx: &App) -> SharedString {
+        let name = self
+            .worktree_id
+            .and_then(|id| self.project.read(cx).worktree_for_id(id, cx))
+            .map(|wt| wt.read(cx).root_name_str().to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            "/".into()
+        } else {
+            SharedString::from(name)
+        }
+    }
+
+    fn is_root_selected(&self, cx: &App) -> bool {
+        let root_id = self
+            .worktree_id
+            .and_then(|id| self.project.read(cx).worktree_for_id(id, cx))
+            .and_then(|wt| wt.read(cx).root_entry().map(|e| e.id));
+        root_id.is_some() && self.selected_dir_id == root_id
+    }
+
     fn render_dir_tree_entry(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let Some(entry) = self.dir_tree_entries.get(ix) else {
             return div().into_any_element();
@@ -552,7 +588,9 @@ impl FileBrowserView {
             .when(is_selected_dir && !is_cursor, |el| {
                 el.bg(colors.element_selected)
             })
-            .hover(|style| style.bg(colors.element_hover))
+            .when(!is_cursor && !is_selected_dir, |el| {
+                el.hover(|style| style.bg(colors.element_hover))
+            })
             .child(
                 Icon::new(chevron_icon)
                     .size(IconSize::Small)
@@ -561,6 +599,7 @@ impl FileBrowserView {
             .child(folder_icon.size(IconSize::Small).color(Color::Muted))
             .child(entry.name.clone())
             .on_click(cx.listener(move |this, _, _window, cx| {
+                this.active_pane = ActivePane::DirTree;
                 this.dir_tree_selected_index = Some(ix);
                 this.select_dir(ix, cx);
                 this.toggle_dir(ix, cx);
@@ -573,8 +612,8 @@ impl FileBrowserView {
             return div().into_any_element();
         };
         let colors = cx.theme().colors();
-        let is_cursor = self.file_list_selected_index == Some(ix)
-            && matches!(self.active_pane, ActivePane::FileList);
+        let is_selected = self.file_list_selected_index == Some(ix);
+        let is_cursor = is_selected && matches!(self.active_pane, ActivePane::FileList);
 
         let icon = if entry.is_dir {
             FileIcons::get_folder_icon(false, entry.path.as_std_path(), cx)
@@ -598,12 +637,21 @@ impl FileBrowserView {
             .text_color(colors.text)
             .cursor_pointer()
             .when(is_cursor, |el| el.bg(colors.element_active))
-            .hover(|style| style.bg(colors.element_hover))
+            .when(is_selected && !is_cursor, |el| {
+                el.bg(colors.element_selected)
+            })
+            .when(!is_selected, |el| {
+                el.hover(|style| style.bg(colors.element_hover))
+            })
             .child(icon.size(IconSize::Small).color(Color::Muted))
             .child(entry.name.clone())
-            .on_click(cx.listener(move |this, _, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.active_pane = ActivePane::FileList;
                 this.file_list_selected_index = Some(ix);
-                this.on_file_list_click(ix, window, cx);
+                if event.click_count() >= 2 {
+                    this.on_file_list_click(ix, window, cx);
+                }
+                cx.notify();
             }))
             .into_any_element()
     }
@@ -650,6 +698,7 @@ impl Render for FileBrowserView {
             .flex_row()
             .child(
                 div()
+                    .id("dir-tree-pane")
                     .w(px(200.0))
                     .flex_shrink_0()
                     .border_color(colors.border)
@@ -657,15 +706,42 @@ impl Render for FileBrowserView {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .child(
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.active_pane = ActivePane::DirTree;
+                        cx.notify();
+                    }))
+                    .child({
+                        let root_name = self.root_dir_name(cx);
+                        let is_root_selected = self.is_root_selected(cx);
                         div()
-                            .px_2()
-                            .py_1()
+                            .id("dir-tree-root")
+                            .pl(px(4.0))
+                            .pr_2()
+                            .py_0p5()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
                             .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(colors.text_muted)
-                            .child("Directories"),
-                    )
+                            .text_color(colors.text)
+                            .cursor_pointer()
+                            .when(is_root_selected, |el| el.bg(colors.element_selected))
+                            .hover(|style| style.bg(colors.element_hover))
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Icon::new(IconName::Folder)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(root_name)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.select_root_dir(cx);
+                            }))
+                    })
                     .child(
                         uniform_list(
                             "dir-tree",
@@ -684,10 +760,20 @@ impl Render for FileBrowserView {
             )
             .child(
                 div()
+                    .id("file-list-pane")
                     .flex_1()
                     .overflow_hidden()
                     .flex()
                     .flex_col()
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.active_pane = ActivePane::FileList;
+                        if this.file_list_selected_index.is_none()
+                            && !this.file_list_entries.is_empty()
+                        {
+                            this.file_list_selected_index = Some(0);
+                        }
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .px_2()
@@ -695,20 +781,22 @@ impl Render for FileBrowserView {
                             .text_sm()
                             .font_weight(FontWeight::BOLD)
                             .text_color(colors.text_muted)
-                            .child(
-                                self.selected_dir_path
+                            .child({
+                                let header = self
+                                    .selected_dir_path
                                     .as_ref()
-                                    .and_then(|p| {
-                                        let s = p.as_unix_str();
-                                        if s.is_empty() {
-                                            Some("/")
+                                    .map(|p| {
+                                        if p.as_unix_str().is_empty() {
+                                            self.root_dir_name(cx)
                                         } else {
-                                            p.file_name()
+                                            SharedString::from(
+                                                p.file_name().unwrap_or("/").to_string(),
+                                            )
                                         }
                                     })
-                                    .unwrap_or("Files")
-                                    .to_string(),
-                            ),
+                                    .unwrap_or_else(|| "Files".into());
+                                header
+                            }),
                     )
                     .child(if file_count == 0 {
                         div()
