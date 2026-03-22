@@ -47,9 +47,11 @@ When integrating a Zed crate that registers workspace actions (e.g. `markdown_pr
 
 Additionally, many default keybindings in `assets/keymaps/` are scoped to `"context": "Workspace"`. GPUI matches this predicate against `KeyContext` values set on elements in the tree via `.key_context()`. Since `Workspace` is not rendered, its `KeyContext` with `"Workspace"` is never in the dispatch path. The `Arena` render method must set `.key_context("Workspace")` on a wrapper div that is an ancestor of focused elements, so that keybindings scoped to `"Workspace"` context (e.g. `cmd-p` for `file_finder::Toggle`) can match.
 
+`AgentiumApp::render()` also sets `.key_context("Agentium")` on its root div. This context is always in the dispatch path regardless of focus location (sidebar or arena). Agentium-specific keybindings that must work from anywhere (e.g. `cmd-1`...`cmd-9` for arena switching) are bound to the `"Agentium"` context in `main.rs`. GPUI uses depth-based precedence — deeper contexts win — so bindings that need to override default `"Workspace"`-scoped bindings inside arenas must also be registered at the `"Workspace"` context level.
+
 ## Claude Code hook IPC uses `Rc<RefCell<HashSet<u32>>>` for cross-closure state
 
-The `ready_shell_pids` set is shared between `AgentiumApp` (which writes it when Claude Code sessions become ready or are cleared) and per-pane indicator closures (which read it to decide whether to show a dot on a terminal tab). Because all access is on the single foreground thread, `Rc<RefCell<...>>` is used instead of `Arc<Mutex<...>>`. The `AgentiumApp` owns the canonical `claude_sessions: HashMap<String, ClaudeSession>` and syncs the derived `HashSet<u32>` cache via `sync_ready_shell_pids()` after every mutation.
+The `ready_shell_pids` set is shared between `AgentiumApp` (which writes it when Claude Code sessions become ready or are cleared) and per-pane indicator closures (which read it to decide whether to show a dot on a terminal tab). Because all access is on the single foreground thread, `Rc<RefCell<...>>` is used instead of `Arc<Mutex<...>>`. The `AgentiumApp` owns the canonical `claude_sessions: HashMap<String, ClaudeSession>` and syncs the derived `SharedSessionState` (which wraps both `ready_shell_pids` and a `pid_to_session_id` map) via `sync_session_derived_state()` after every mutation.
 
 ## Statusline command must pass through stdin before parsing
 
