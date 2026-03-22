@@ -48,6 +48,12 @@ pub(crate) struct ForkClaudeSession {
     pub session_id: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
+#[action(namespace = agentium)]
+pub struct ActivateArena {
+    pub index: usize,
+}
+
 struct ClaudeSession {
     ancestor_pids: Vec<u32>,
     is_ready: bool,
@@ -866,6 +872,10 @@ impl Render for AgentiumApp {
         let active_index = self.active_arena_index;
 
         div()
+            .key_context("Agentium")
+            .on_action(cx.listener(|this, action: &ActivateArena, window, cx| {
+                this.switch_arena(action.index, window, cx);
+            }))
             .flex()
             .flex_row()
             .size_full()
