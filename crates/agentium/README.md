@@ -11,8 +11,20 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **Project search** — full-text search across the project
 - **Git status** — view changed files grouped by Conflicts/Tracked/Untracked, with staging checkboxes and click-to-open
 - **Markdown preview** — preview markdown files side-by-side
+- **File browser** — navigate project files with expand/collapse, open files for editing
+- **Git graph** — visualize git commit history
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Cmd+1`...`Cmd+9` | Switch to arena 1-9 |
+| `Ctrl+[` / `Ctrl+]` | Previous / next pane |
+| `Cmd+[` / `Cmd+]` | Previous / next tab |
+| `Cmd+P` | File finder |
+| `Cmd+W` | Close active tab |
 
 ## Claude Code Hook Setup
 
@@ -51,7 +63,7 @@ agentium pane split [--horizontal|--vertical] [--before] [--type <TYPE>] [--keep
 - `--horizontal` — split horizontally (new pane to the right, or left with `--before`)
 - `--vertical` — split vertically (new pane below, or above with `--before`). This is the default.
 - `--before` — place the new pane before the active one
-- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`
+- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`, `git-graph`
 - `--keep-focus` — keep focus on the current pane instead of switching to the new one
 
 ### `agentium tab new`
@@ -62,7 +74,7 @@ Add a new tab to the active pane.
 agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 ```
 
-- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`
+- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
 
 ### `agentium claude hook <event>`
 
