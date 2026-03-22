@@ -673,6 +673,31 @@ fn main() {
                         cx.bind_keys(bindings);
                     }
 
+                    cx.bind_keys([
+                        KeyBinding::new("cmd-1", agentium::ActivateArena { index: 0 }, Some("Workspace")),
+                        KeyBinding::new("cmd-2", agentium::ActivateArena { index: 1 }, Some("Workspace")),
+                        KeyBinding::new("cmd-3", agentium::ActivateArena { index: 2 }, Some("Workspace")),
+                        KeyBinding::new("cmd-4", agentium::ActivateArena { index: 3 }, Some("Workspace")),
+                        KeyBinding::new("cmd-5", agentium::ActivateArena { index: 4 }, Some("Workspace")),
+                        KeyBinding::new("cmd-6", agentium::ActivateArena { index: 5 }, Some("Workspace")),
+                        KeyBinding::new("cmd-7", agentium::ActivateArena { index: 6 }, Some("Workspace")),
+                        KeyBinding::new("cmd-8", agentium::ActivateArena { index: 7 }, Some("Workspace")),
+                        KeyBinding::new("cmd-9", agentium::ActivateArena { index: 8 }, Some("Workspace")),
+                        KeyBinding::new("cmd-1", agentium::ActivateArena { index: 0 }, Some("Agentium")),
+                        KeyBinding::new("cmd-2", agentium::ActivateArena { index: 1 }, Some("Agentium")),
+                        KeyBinding::new("cmd-3", agentium::ActivateArena { index: 2 }, Some("Agentium")),
+                        KeyBinding::new("cmd-4", agentium::ActivateArena { index: 3 }, Some("Agentium")),
+                        KeyBinding::new("cmd-5", agentium::ActivateArena { index: 4 }, Some("Agentium")),
+                        KeyBinding::new("cmd-6", agentium::ActivateArena { index: 5 }, Some("Agentium")),
+                        KeyBinding::new("cmd-7", agentium::ActivateArena { index: 6 }, Some("Agentium")),
+                        KeyBinding::new("cmd-8", agentium::ActivateArena { index: 7 }, Some("Agentium")),
+                        KeyBinding::new("cmd-9", agentium::ActivateArena { index: 8 }, Some("Agentium")),
+                        KeyBinding::new("ctrl-[", workspace::ActivatePreviousPane, Some("Workspace")),
+                        KeyBinding::new("ctrl-]", workspace::ActivateNextPane, Some("Workspace")),
+                        KeyBinding::new("cmd-[", workspace::ActivatePreviousItem, Some("Pane")),
+                        KeyBinding::new("cmd-]", workspace::ActivateNextItem, Some("Pane")),
+                    ]);
+
                     let worktree_path = initial_workspace_path;
 
                     let window_handle = cx
