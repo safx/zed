@@ -18,19 +18,19 @@ use ui::{ActiveTheme, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::pane::render_item_indicator;
 use workspace::{
-    pane, move_active_item, ActivateNextPane, ActivatePane,
-    ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivatePreviousPane,
-    DraggedTab, LeaderDecoration, MoveItemToPane,
+    ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
+    ActivatePaneUp, ActivatePreviousPane, DraggedTab, LeaderDecoration, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal,
     Pane, PaneGroup, PaneLeaderDecorator, Save, SaveAs, SaveIntent, SaveWithoutFormat,
     SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
     SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
+    move_active_item, pane,
 };
 
 use crate::{
     NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
-    NewProjectSearch,
-    PaneContentType, file_browser_view::FileBrowserView, git_status_view::GitStatusView,
+    NewProjectSearch, PaneContentType, file_browser_view::FileBrowserView,
+    git_status_view::GitStatusView,
 };
 
 pub(crate) enum ArenaEvent {
@@ -60,7 +60,13 @@ impl Arena {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let pane = new_agentium_pane(workspace.clone(), project.clone(), session_state.clone(), window, cx);
+        let pane = new_agentium_pane(
+            workspace.clone(),
+            project.clone(),
+            session_state.clone(),
+            window,
+            cx,
+        );
         let center = PaneGroup::new(pane.clone());
 
         let terminal_task = project.update(cx, |project, cx| {
@@ -138,11 +144,9 @@ impl Arena {
     }
 
     fn add_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let terminal_task = self
-            .project
-            .update(cx, |project, cx| {
-                project.create_terminal_shell(self.working_directory.clone(), cx)
-            });
+        let terminal_task = self.project.update(cx, |project, cx| {
+            project.create_terminal_shell(self.working_directory.clone(), cx)
+        });
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
@@ -172,11 +176,9 @@ impl Arena {
             args: vec![],
             title_override: Some("Claude Code".to_string()),
         };
-        let terminal_task = self
-            .project
-            .update(cx, |project, cx| {
-                project.create_terminal_with_shell(self.working_directory.clone(), shell, cx)
-            });
+        let terminal_task = self.project.update(cx, |project, cx| {
+            project.create_terminal_with_shell(self.working_directory.clone(), shell, cx)
+        });
         let workspace_weak = self.workspace.clone();
         let project_weak = self.project.downgrade();
         let active_pane = self.active_pane.clone();
@@ -226,12 +228,7 @@ impl Arena {
             return;
         };
         let project_diff = cx.new(|cx| {
-            git_ui::project_diff::ProjectDiff::new(
-                self.project.clone(),
-                workspace,
-                window,
-                cx,
-            )
+            git_ui::project_diff::ProjectDiff::new(self.project.clone(), workspace, window, cx)
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(project_diff), true, true, None, window, cx);
@@ -275,9 +272,8 @@ impl Arena {
         self.activate_context(cx);
         let project_search = self.new_project_search(cx);
         let workspace_weak = self.workspace.clone();
-        let view = cx.new(|cx| {
-            ProjectSearchView::new(workspace_weak, project_search, window, cx, None)
-        });
+        let view =
+            cx.new(|cx| ProjectSearchView::new(workspace_weak, project_search, window, cx, None));
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
         });
@@ -285,9 +281,8 @@ impl Arena {
 
     fn add_git_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
-        let view = cx.new(|cx| {
-            GitStatusView::new(self.project.clone(), self.workspace.clone(), cx)
-        });
+        let view =
+            cx.new(|cx| GitStatusView::new(self.project.clone(), self.workspace.clone(), cx));
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
         });
@@ -424,9 +419,8 @@ impl Arena {
             }
             PaneContentType::GitStatus => {
                 self.activate_context(cx);
-                let item = cx.new(|cx| {
-                    GitStatusView::new(self.project.clone(), self.workspace.clone(), cx)
-                });
+                let item = cx
+                    .new(|cx| GitStatusView::new(self.project.clone(), self.workspace.clone(), cx));
                 self.split_with_item(Box::new(item), direction, keep_focus, window, cx);
             }
             PaneContentType::ProjectSearch => {
@@ -535,18 +529,12 @@ impl Arena {
                         cx,
                     )
                 }));
-                let new_pane = new_agentium_pane(
-                    workspace_weak,
-                    project,
-                    session_state,
-                    window,
-                    cx,
-                );
+                let new_pane =
+                    new_agentium_pane(workspace_weak, project, session_state, window, cx);
                 new_pane.update(cx, |pane, cx| {
                     pane.add_item(terminal_view, true, true, None, window, cx);
                 });
-                this.center
-                    .split(&active_pane, &new_pane, direction, cx);
+                this.center.split(&active_pane, &new_pane, direction, cx);
                 if !keep_focus {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
@@ -584,18 +572,12 @@ impl Arena {
                 .await?;
 
             this.update_in(cx, |this, window, cx| {
-                let new_pane = new_agentium_pane(
-                    workspace_weak,
-                    project,
-                    session_state,
-                    window,
-                    cx,
-                );
+                let new_pane =
+                    new_agentium_pane(workspace_weak, project, session_state, window, cx);
                 new_pane.update(cx, |pane, cx| {
                     pane.add_item(Box::new(project_diff), true, true, None, window, cx);
                 });
-                this.center
-                    .split(&active_pane, &new_pane, direction, cx);
+                this.center.split(&active_pane, &new_pane, direction, cx);
                 if !keep_focus {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
@@ -632,7 +614,13 @@ impl Arena {
             let terminal = terminal_task.await.log_err()?;
 
             this.update_in(cx, move |_this, window, cx| {
-                let pane = new_agentium_pane(workspace_weak.clone(), project.clone(), session_state.clone(), window, cx);
+                let pane = new_agentium_pane(
+                    workspace_weak.clone(),
+                    project.clone(),
+                    session_state.clone(),
+                    window,
+                    cx,
+                );
                 add_terminal_view_to_pane(
                     terminal,
                     workspace_weak,
@@ -699,8 +687,7 @@ impl Arena {
                             return;
                         };
                         this.update_in(cx, |this, window, cx| {
-                            this.center
-                                .split(&pane, &new_pane, direction, cx);
+                            this.center.split(&pane, &new_pane, direction, cx);
                             window.focus(&new_pane.focus_handle(cx), cx);
                         })
                         .ok();
@@ -708,8 +695,7 @@ impl Arena {
                     .detach();
                 }
                 SplitMode::MovePane => {
-                    let Some(item) =
-                        pane.update(cx, |pane, cx| pane.take_active_item(window, cx))
+                    let Some(item) = pane.update(cx, |pane, cx| pane.take_active_item(window, cx))
                     else {
                         return;
                     };
@@ -777,12 +763,7 @@ impl Arena {
         }
     }
 
-    fn open_markdown_preview(
-        &mut self,
-        side: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_markdown_preview(&mut self, side: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace_entity) = self.workspace.upgrade() else {
             return;
         };
@@ -822,12 +803,11 @@ impl Arena {
             active_pane.clone()
         };
 
-        let existing_preview_idx =
-            MarkdownPreviewView::find_existing_independent_preview_item_idx(
-                target_pane.read(cx),
-                &editor,
-                cx,
-            );
+        let existing_preview_idx = MarkdownPreviewView::find_existing_independent_preview_item_idx(
+            target_pane.read(cx),
+            &editor,
+            cx,
+        );
 
         if let Some(existing_idx) = existing_preview_idx {
             target_pane.update(cx, |pane, cx| {
@@ -897,12 +877,10 @@ impl Render for Arena {
                 search_actions_div
                     .relative()
                     .size_full()
-                    .child(self.center.render(
-                        self.zoomed_pane.as_ref(),
-                        &decorator,
-                        window,
-                        cx,
-                    ))
+                    .child(
+                        self.center
+                            .render(self.zoomed_pane.as_ref(), &decorator, window, cx),
+                    )
                     .children(self.zoomed_pane.as_ref().and_then(|view| {
                         let zoomed_view = view.upgrade()?;
                         let colors = cx.theme().colors();
@@ -927,163 +905,113 @@ impl Render for Arena {
                     .key_context(context)
                     .relative()
                     .size_full()
-                    .on_action(
-                        cx.listener(|this, action: &ToggleFileFinder, window, cx| {
-                            let worktree_id = this.worktree_id(cx);
-                            let Some(workspace) = this.workspace.upgrade() else {
-                                return;
-                            };
-                            workspace.update(cx, |workspace, cx| {
-                                if workspace
-                                    .active_modal::<file_finder::FileFinder>(cx)
-                                    .is_some()
-                                {
-                                    workspace.hide_modal(window, cx);
-                                } else if let Some(worktree_id) = worktree_id {
-                                    file_finder::FileFinder::open_scoped(
-                                        workspace,
-                                        action.separate_history,
-                                        worktree_id,
-                                        window,
-                                        cx,
-                                    )
-                                    .detach();
-                                } else {
-                                    file_finder::FileFinder::open(
-                                        workspace,
-                                        action.separate_history,
-                                        window,
-                                        cx,
-                                    )
-                                    .detach();
-                                }
-                            });
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, action: &Save, window, cx| {
-                            this.save_active_item(
-                                action.save_intent.unwrap_or(SaveIntent::Save),
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &SaveWithoutFormat, window, cx| {
-                            this.save_active_item(
-                                SaveIntent::SaveWithoutFormat,
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &SaveAs, window, cx| {
-                            this.save_active_item(SaveIntent::SaveAs, window, cx);
-                        }),
-                    )
+                    .on_action(cx.listener(|this, action: &ToggleFileFinder, window, cx| {
+                        let worktree_id = this.worktree_id(cx);
+                        let Some(workspace) = this.workspace.upgrade() else {
+                            return;
+                        };
+                        workspace.update(cx, |workspace, cx| {
+                            if workspace
+                                .active_modal::<file_finder::FileFinder>(cx)
+                                .is_some()
+                            {
+                                workspace.hide_modal(window, cx);
+                            } else if let Some(worktree_id) = worktree_id {
+                                file_finder::FileFinder::open_scoped(
+                                    workspace,
+                                    action.separate_history,
+                                    worktree_id,
+                                    window,
+                                    cx,
+                                )
+                                .detach();
+                            } else {
+                                file_finder::FileFinder::open(
+                                    workspace,
+                                    action.separate_history,
+                                    window,
+                                    cx,
+                                )
+                                .detach();
+                            }
+                        });
+                    }))
+                    .on_action(cx.listener(|this, action: &Save, window, cx| {
+                        this.save_active_item(
+                            action.save_intent.unwrap_or(SaveIntent::Save),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .on_action(cx.listener(|this, _: &SaveWithoutFormat, window, cx| {
+                        this.save_active_item(SaveIntent::SaveWithoutFormat, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &SaveAs, window, cx| {
+                        this.save_active_item(SaveIntent::SaveAs, window, cx);
+                    }))
                     .child(pane_group)
-                    .on_action(
-                        cx.listener(|this, _: &OpenPreview, window, cx| {
-                            this.open_markdown_preview(false, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &OpenPreviewToTheSide, window, cx| {
-                            this.open_markdown_preview(true, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewClaudeCode, window, cx| {
-                            this.add_claude_code(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewTerminal, window, cx| {
-                            this.add_terminal(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewDiffView, window, cx| {
-                            this.add_diff_view(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewBranchDiff, window, cx| {
-                            this.add_branch_diff(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewProjectSearch, window, cx| {
-                            this.add_project_search(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewGitStatus, window, cx| {
-                            this.add_git_status(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewFileBrowser, window, cx| {
-                            this.add_file_browser(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &NewGitGraph, window, cx| {
-                            this.add_git_graph(window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
-                            this.activate_pane_in_direction(SplitDirection::Left, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ActivatePaneRight, window, cx| {
-                            this.activate_pane_in_direction(SplitDirection::Right, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ActivatePaneUp, window, cx| {
-                            this.activate_pane_in_direction(SplitDirection::Up, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ActivatePaneDown, window, cx| {
-                            this.activate_pane_in_direction(SplitDirection::Down, window, cx);
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ActivateNextPane, window, cx| {
-                            let panes = this.center.panes();
-                            if let Some(ix) =
-                                panes.iter().position(|pane| **pane == this.active_pane)
-                            {
-                                let next_ix = (ix + 1) % panes.len();
-                                window.focus(&panes[next_ix].focus_handle(cx), cx);
-                            }
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ActivatePreviousPane, window, cx| {
-                            let panes = this.center.panes();
-                            if let Some(ix) =
-                                panes.iter().position(|pane| **pane == this.active_pane)
-                            {
-                                let prev_ix = cmp::min(ix.wrapping_sub(1), panes.len() - 1);
-                                window.focus(&panes[prev_ix].focus_handle(cx), cx);
-                            }
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, action: &ActivatePane, window, cx| {
-                            let panes = this.center.panes();
-                            if let Some(&pane) = panes.get(action.0) {
-                                window.focus(&pane.read(cx).focus_handle(cx), cx);
-                            }
-                        }),
-                    )
+                    .on_action(cx.listener(|this, _: &OpenPreview, window, cx| {
+                        this.open_markdown_preview(false, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &OpenPreviewToTheSide, window, cx| {
+                        this.open_markdown_preview(true, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewClaudeCode, window, cx| {
+                        this.add_claude_code(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
+                        this.add_terminal(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewDiffView, window, cx| {
+                        this.add_diff_view(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewBranchDiff, window, cx| {
+                        this.add_branch_diff(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewProjectSearch, window, cx| {
+                        this.add_project_search(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewGitStatus, window, cx| {
+                        this.add_git_status(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewFileBrowser, window, cx| {
+                        this.add_file_browser(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &NewGitGraph, window, cx| {
+                        this.add_git_graph(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
+                        this.activate_pane_in_direction(SplitDirection::Left, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ActivatePaneRight, window, cx| {
+                        this.activate_pane_in_direction(SplitDirection::Right, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ActivatePaneUp, window, cx| {
+                        this.activate_pane_in_direction(SplitDirection::Up, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ActivatePaneDown, window, cx| {
+                        this.activate_pane_in_direction(SplitDirection::Down, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &ActivateNextPane, window, cx| {
+                        let panes = this.center.panes();
+                        if let Some(ix) = panes.iter().position(|pane| **pane == this.active_pane) {
+                            let next_ix = (ix + 1) % panes.len();
+                            window.focus(&panes[next_ix].focus_handle(cx), cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &ActivatePreviousPane, window, cx| {
+                        let panes = this.center.panes();
+                        if let Some(ix) = panes.iter().position(|pane| **pane == this.active_pane) {
+                            let prev_ix = cmp::min(ix.wrapping_sub(1), panes.len() - 1);
+                            window.focus(&panes[prev_ix].focus_handle(cx), cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, action: &ActivatePane, window, cx| {
+                        let panes = this.center.panes();
+                        if let Some(&pane) = panes.get(action.0) {
+                            window.focus(&pane.read(cx).focus_handle(cx), cx);
+                        }
+                    }))
                     .on_action(cx.listener(|this, _: &SwapPaneLeft, _, cx| {
                         this.swap_pane_in_direction(SplitDirection::Left, cx);
                     }))
@@ -1108,32 +1036,24 @@ impl Render for Arena {
                     .on_action(cx.listener(|this, _: &MovePaneDown, _, cx| {
                         this.move_pane_to_border(SplitDirection::Down, cx);
                     }))
-                    .on_action(
-                        cx.listener(|this, action: &MoveItemToPane, window, cx| {
-                            let Some(&target_pane) =
-                                this.center.panes().get(action.destination)
-                            else {
-                                return;
-                            };
-                            move_active_item(
-                                &this.active_pane,
-                                target_pane,
-                                action.focus,
-                                true,
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
+                    .on_action(cx.listener(|this, action: &MoveItemToPane, window, cx| {
+                        let Some(&target_pane) = this.center.panes().get(action.destination) else {
+                            return;
+                        };
+                        move_active_item(
+                            &this.active_pane,
+                            target_pane,
+                            action.focus,
+                            true,
+                            window,
+                            cx,
+                        );
+                    }))
                     .on_action(cx.listener(
                         |this, action: &MoveItemToPaneInDirection, window, cx| {
                             if let Some(destination) = this
                                 .center
-                                .find_pane_in_direction(
-                                    &this.active_pane,
-                                    action.direction,
-                                    cx,
-                                )
+                                .find_pane_in_direction(&this.active_pane, action.direction, cx)
                                 .cloned()
                             {
                                 move_active_item(
@@ -1147,8 +1067,8 @@ impl Render for Arena {
                             }
                         },
                     ))
-                    .on_action(
-                        cx.listener(|this, action: &crate::ForkClaudeSession, window, cx| {
+                    .on_action(cx.listener(
+                        |this, action: &crate::ForkClaudeSession, window, cx| {
                             let shell = Shell::WithArguments {
                                 program: "claude".to_string(),
                                 args: vec![
@@ -1185,8 +1105,8 @@ impl Render for Arena {
                                 anyhow::Ok(())
                             })
                             .detach_and_log_err(cx);
-                        }),
-                    )
+                        },
+                    ))
             })
             .unwrap_or_else(|| div().size_full())
     }
@@ -1209,9 +1129,7 @@ impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
             .and_then(|item| item.downcast::<TerminalView>())
             .and_then(|tv| {
                 let terminal = tv.read(cx).terminal().read(cx);
-                terminal
-                    .pid_getter()
-                    .map(|g| g.fallback_pid().as_u32())
+                terminal.pid_getter().map(|g| g.fallback_pid().as_u32())
             })
             .is_some_and(|pid| self.ready_shell_pids.contains(&pid));
 
@@ -1282,8 +1200,7 @@ pub(crate) fn new_agentium_pane(
         pane.set_tab_context_menu_extension({
             let pid_to_session_id = session_state.pid_to_session_id.clone();
             move |item, _window, cx| {
-                let Some(entity) =
-                    item.act_as_type(std::any::TypeId::of::<TerminalView>(), cx)
+                let Some(entity) = item.act_as_type(std::any::TypeId::of::<TerminalView>(), cx)
                 else {
                     return Vec::new();
                 };
@@ -1291,9 +1208,7 @@ pub(crate) fn new_agentium_pane(
                     return Vec::new();
                 };
                 let terminal = terminal_view.read(cx).terminal().read(cx);
-                let Some(shell_pid) = terminal
-                    .pid_getter()
-                    .map(|g| g.fallback_pid().as_u32())
+                let Some(shell_pid) = terminal.pid_getter().map(|g| g.fallback_pid().as_u32())
                 else {
                     return Vec::new();
                 };
@@ -1304,43 +1219,39 @@ pub(crate) fn new_agentium_pane(
                 let session_id = session_id.clone();
                 vec![(
                     "Fork Session".into(),
-                    Box::new(crate::ForkClaudeSession {
-                        session_id,
-                    }) as Box<dyn Action>,
+                    Box::new(crate::ForkClaudeSession { session_id }) as Box<dyn Action>,
                 )]
             }
         });
 
         let split_predicate_workspace = arena.clone();
-        pane.set_can_split(Some(Arc::new(
-            move |pane, dragged_item, _window, cx| {
-                if let Some(tab) = dragged_item.downcast_ref::<DraggedTab>() {
-                    let is_current_pane = tab.pane == cx.entity();
-                    let Some(can_drag_away) = split_predicate_workspace
-                        .read_with(cx, |arena, _| {
-                            let panes = arena.center.panes();
-                            !panes.contains(&&tab.pane)
-                                || panes.len() > 1
-                                || (!is_current_pane || pane.items_len() > 1)
-                        })
-                        .ok()
-                    else {
-                        return false;
+        pane.set_can_split(Some(Arc::new(move |pane, dragged_item, _window, cx| {
+            if let Some(tab) = dragged_item.downcast_ref::<DraggedTab>() {
+                let is_current_pane = tab.pane == cx.entity();
+                let Some(can_drag_away) = split_predicate_workspace
+                    .read_with(cx, |arena, _| {
+                        let panes = arena.center.panes();
+                        !panes.contains(&&tab.pane)
+                            || panes.len() > 1
+                            || (!is_current_pane || pane.items_len() > 1)
+                    })
+                    .ok()
+                else {
+                    return false;
+                };
+                if can_drag_away {
+                    let item = if is_current_pane {
+                        pane.item_for_index(tab.ix)
+                    } else {
+                        tab.pane.read(cx).item_for_index(tab.ix)
                     };
-                    if can_drag_away {
-                        let item = if is_current_pane {
-                            pane.item_for_index(tab.ix)
-                        } else {
-                            tab.pane.read(cx).item_for_index(tab.ix)
-                        };
-                        if item.is_some() {
-                            return true;
-                        }
+                    if item.is_some() {
+                        return true;
                     }
                 }
-                false
-            },
-        )));
+            }
+            false
+        })));
 
         let split_handler_arena = arena.clone();
         let split_handler_workspace = workspace.clone();
@@ -1376,7 +1287,6 @@ pub(crate) fn new_agentium_pane(
             toolbar.add_item(project_search_bar, window, cx);
         });
 
-
         pane
     });
 
@@ -1388,49 +1298,28 @@ pub(crate) fn new_agentium_pane(
                 .child(
                     PopoverMenu::new("agentium-tab-bar-popover-menu")
                         .trigger_with_tooltip(
-                            IconButton::new("plus", IconName::Plus)
-                                .icon_size(IconSize::Small),
+                            IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
                             Tooltip::text("New…"),
                         )
                         .anchor(Corner::TopRight)
                         .with_handle(pane.new_item_context_menu_handle.clone())
                         .menu(move |_window, cx| {
                             let focus_handle = focus_handle.clone();
-                            Some(ContextMenu::build(_window, cx, |menu: ui::ContextMenu, _, _| {
-                                menu.context(focus_handle.clone())
-                                    .action(
-                                        "New Claude Code",
-                                        NewClaudeCode.boxed_clone(),
-                                    )
-                                    .action(
-                                        "New Terminal",
-                                        NewTerminal::default().boxed_clone(),
-                                    )
-                                    .action(
-                                        "New Diff View",
-                                        NewDiffView.boxed_clone(),
-                                    )
-                                    .action(
-                                        "New Branch Diff",
-                                        NewBranchDiff.boxed_clone(),
-                                    )
-                                    .action(
-                                        "New Project Search",
-                                        NewProjectSearch.boxed_clone(),
-                                    )
-                                    .action(
-                                        "New Git Status",
-                                        NewGitStatus.boxed_clone(),
-                                    )
-                                    .action(
-                                        "New File Browser",
-                                        NewFileBrowser.boxed_clone(),
-                                    )
-                                    .action(
-                                        "New Git Graph",
-                                        NewGitGraph.boxed_clone(),
-                                    )
-                            }))
+                            Some(ContextMenu::build(
+                                _window,
+                                cx,
+                                |menu: ui::ContextMenu, _, _| {
+                                    menu.context(focus_handle.clone())
+                                        .action("Claude Code", NewClaudeCode.boxed_clone())
+                                        .action("Terminal", NewTerminal::default().boxed_clone())
+                                        .action("Git Status", NewGitStatus.boxed_clone())
+                                        .action("Git Graph", NewGitGraph.boxed_clone())
+                                        .action("Git Diff", NewDiffView.boxed_clone())
+                                        .action("Git Diff (Branch)", NewBranchDiff.boxed_clone())
+                                        .action("Project Search", NewProjectSearch.boxed_clone())
+                                        .action("File Browser", NewFileBrowser.boxed_clone())
+                                },
+                            ))
                         }),
                 )
                 .child(
@@ -1497,4 +1386,3 @@ pub(crate) fn new_agentium_pane(
 
     pane
 }
-
