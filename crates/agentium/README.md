@@ -63,7 +63,7 @@ agentium pane split [--horizontal|--vertical] [--before] [--type <TYPE>] [--keep
 - `--horizontal` — split horizontally (new pane to the right, or left with `--before`)
 - `--vertical` — split vertically (new pane below, or above with `--before`). This is the default.
 - `--before` — place the new pane before the active one
-- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`, `git-graph`
+- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
 - `--keep-focus` — keep focus on the current pane instead of switching to the new one
 
 ### `agentium tab new`

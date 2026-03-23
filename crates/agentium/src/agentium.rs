@@ -20,11 +20,14 @@ use picker::{
 use project::Project;
 use project::git_store::GitStoreEvent;
 use terminal_view::TerminalView;
-use ui::{ActiveTheme, ContextMenu, KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    ActiveTheme, ButtonStyle, ContextMenu, ListItem, ListItemSpacing, PopoverMenu, Tooltip,
+    prelude::*,
+};
 use ui_input::ErasedEditor;
 use util::{ResultExt as _, paths::PathExt};
 use workspace::{
-    AppState, ModalView, Pane, PathList, SerializedWorkspaceLocation, SplitDirection, Workspace,
+    AppState, Pane, PathList, SerializedWorkspaceLocation, SplitDirection, Workspace,
     WorkspaceDb, WorkspaceId, ZoomOut,
 };
 
@@ -180,15 +183,7 @@ impl AgentiumApp {
         self.add_arena_inner(Some(path), window, cx);
     }
 
-    fn open_recent_projects_picker(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let agentium_weak = cx.entity().downgrade();
-        let fs = self.app_state.fs.clone();
-        self.workspace_entity.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                AgentiumRecentProjects::new(agentium_weak, fs, window, cx)
-            });
-        });
-    }
+
 
 
     fn add_arena_inner(
@@ -1085,23 +1080,27 @@ impl Render for AgentiumApp {
                                 },
                             )),
                     )
-                    .child(
-                        div().p_2().child(
-                            div()
-                                .id("add-workspace")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .text_sm()
-                                .text_color(colors.text)
-                                .cursor_pointer()
-                                .hover(|d| d.bg(colors.element_hover))
-                                .child("+ New Arena")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_recent_projects_picker(window, cx);
-                                })),
-                        ),
-                    )
+                    .child(div().p_2().child({
+                        let agentium_weak = cx.entity().downgrade();
+                        let fs = self.app_state.fs.clone();
+                        PopoverMenu::new("new-arena-menu")
+                            .menu(move |window, cx| {
+                                Some(cx.new(|cx| {
+                                    AgentiumRecentProjects::new(
+                                        agentium_weak.clone(),
+                                        fs.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                }))
+                            })
+                            .trigger(
+                                Button::new("add-workspace", "+ New Arena")
+                                    .full_width()
+                                    .style(ButtonStyle::Subtle),
+                            )
+                            .anchor(Corner::BottomLeft)
+                    }))
                     .when_some(self.rate_limits.as_ref(), |sidebar, rate_limits| {
                         let is_stale =
                             rate_limits.received_at.elapsed() > Duration::from_secs(3600);
@@ -1249,7 +1248,6 @@ impl AgentiumRecentProjects {
     }
 }
 
-impl ModalView for AgentiumRecentProjects {}
 impl EventEmitter<DismissEvent> for AgentiumRecentProjects {}
 
 impl Focusable for AgentiumRecentProjects {
@@ -1262,7 +1260,7 @@ impl Render for AgentiumRecentProjects {
     fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("AgentiumRecentProjects")
-            .w(rems(28.))
+            .w(px(235.0))
             .child(self.picker.clone())
     }
 }
@@ -1323,36 +1321,6 @@ impl AgentiumRecentProjectsDelegate {
         .detach();
     }
 
-    fn open_arena_for_entry(
-        &self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) {
-        let Some(hit) = self.filtered_workspaces.get(ix) else {
-            return;
-        };
-        let Some((_, location, paths, _)) = self.workspaces.get(hit.candidate_id) else {
-            return;
-        };
-        if !matches!(location, SerializedWorkspaceLocation::Local) {
-            return;
-        }
-        let Some(path) = paths.paths().first().cloned() else {
-            return;
-        };
-        let window_handle = window.window_handle();
-        cx.defer(move |cx| {
-            if let Some(handle) = window_handle.downcast::<AgentiumApp>() {
-                handle
-                    .update(cx, |app, window, cx| {
-                        app.add_arena_with_path(path, window, cx);
-                    })
-                    .ok();
-            }
-        });
-        cx.emit(DismissEvent);
-    }
 }
 
 impl EventEmitter<DismissEvent> for AgentiumRecentProjectsDelegate {}
@@ -1509,10 +1477,15 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
             .collect();
         let tooltip_path: SharedString = ordered_paths.join("\n").into();
 
-        let compact_path = ordered_paths.join(", ");
+        let dir_name = paths
+            .ordered_paths()
+            .next()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| ordered_paths.first().cloned().unwrap_or_default());
+
         let match_label = HighlightedMatch {
-            text: compact_path,
-            highlight_positions: hit.positions.clone(),
+            text: dir_name,
+            highlight_positions: Vec::new(),
             color: Color::Default,
         };
         let highlighted = HighlightedMatchWithPaths {
@@ -1521,28 +1494,14 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
             paths: Vec::new(),
         };
 
-        let secondary_actions = h_flex()
-            .gap_px()
-            .child(
-                IconButton::new(("add_to_arena", ix), IconName::FolderPlus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Open as New Arena"))
-                    .on_click(cx.listener(move |picker, _, window, cx| {
-                        cx.stop_propagation();
-                        window.prevent_default();
-                        picker.delegate.open_arena_for_entry(ix, window, cx);
-                    })),
-            )
-            .child(
-                IconButton::new(("delete", ix), IconName::Close)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Delete from Recent Projects"))
-                    .on_click(cx.listener(move |picker, _, window, cx| {
-                        cx.stop_propagation();
-                        window.prevent_default();
-                        picker.delegate.delete_recent_project(ix, window, cx);
-                    })),
-            )
+        let delete_button = IconButton::new(("delete", ix), IconName::Close)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text("Delete from Recent Projects"))
+            .on_click(cx.listener(move |picker, _, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+                picker.delegate.delete_recent_project(ix, window, cx);
+            }))
             .into_any_element();
 
         Some(
@@ -1559,9 +1518,9 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
                 .tooltip(Tooltip::text(tooltip_path))
                 .map(|el| {
                     if self.selected_index == ix {
-                        el.end_slot(secondary_actions)
+                        el.end_slot(delete_button)
                     } else {
-                        el.end_hover_slot(secondary_actions)
+                        el.end_hover_slot(delete_button)
                     }
                 })
                 .into_any_element(),
@@ -1573,19 +1532,16 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
         _: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
-        let focus_handle = self.focus_handle.clone();
-
         Some(
-            h_flex()
-                .flex_1()
-                .p_1p5()
-                .gap_1()
-                .justify_end()
+            div()
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
                 .child(
-                    Button::new("open_local_project", "Open Local Project…").on_click(
-                        cx.listener(|picker, _, window, cx| {
+                    ListItem::new("open_local_project")
+                        .inset(true)
+                        .spacing(ListItemSpacing::Sparse)
+                        .child(Label::new("Open Local Project…").size(LabelSize::Small))
+                        .on_click(cx.listener(|picker, _, window, cx| {
                             let paths_receiver =
                                 cx.prompt_for_paths(gpui::PathPromptOptions {
                                     files: false,
@@ -1608,19 +1564,7 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
                             })
                             .detach_and_log_err(cx);
                             cx.emit(DismissEvent);
-                        }),
-                    ),
-                )
-                .child(
-                    Button::new("open_confirm", "Open")
-                        .key_binding(KeyBinding::for_action_in(
-                            &menu::Confirm,
-                            &focus_handle,
-                            cx,
-                        ))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
-                        }),
+                        })),
                 )
                 .into_any(),
         )
