@@ -4,7 +4,7 @@
 
 Agentium uses two distinct concepts that must not be confused:
 
-- **Arena** (`Arena` struct in `agentium.rs`): An Agentium-specific concept representing an isolated work area for an AI agent. Each arena has its own name, pane layout, working directory, and active pane. Multiple arenas are listed in the left sidebar and can be switched between. This is the unit the user creates via "+ New Arena".
+- **Arena** (`Arena` struct in `arena.rs`): An Agentium-specific concept representing an isolated work area for an AI agent. Each arena has its own name, pane layout, working directory, and active pane. Multiple arenas are listed in the left sidebar and can be switched between. This is the unit the user creates via "+ New Arena".
 
 - **Workspace** (`workspace::Workspace` from the `workspace` crate): A Zed infrastructure entity that provides project, language registry, modal layer, and other shared services. It is **not rendered** in Agentium's element tree — it exists only as a data store. There is one `Workspace` entity shared across all arenas.
 
@@ -81,9 +81,11 @@ Agentium does **not** set `ZED_BUNDLE=true` at build time. This env var controls
 
 ## Modal layer is rendered by AgentiumApp, not Arena
 
-The `ModalLayer` entity (from the shared `Workspace`) is rendered as a child of `AgentiumApp::render()`, not inside `Arena::render()`. This is because `AgentiumApp` can have zero arenas (initial state, all arenas closed), and modals must still work — e.g. the recent projects picker is opened from the sidebar before any arena exists. If the modal layer were only rendered inside Arena, `workspace.toggle_modal()` would add the modal to the entity but it would have nowhere to render when no arenas exist.
+The `ModalLayer` entity (from the shared `Workspace`) is rendered as a child of `AgentiumApp::render()`, not inside `Arena::render()`. This is because `AgentiumApp` can have zero arenas (initial state, all arenas closed), and modals must still work. If the modal layer were only rendered inside Arena, `workspace.toggle_modal()` would add the modal to the entity but it would have nowhere to render when no arenas exist.
 
 When adding new modal-triggering features, do not assume an active arena exists. The modal layer is always available via `self.workspace_entity.read(cx).modal_layer()`.
+
+Note: The recent projects picker ("+ New Arena") uses a `PopoverMenu` anchored to the button, not `ModalLayer`. But other features may still use the modal layer.
 
 ## Workspace `database_id` is None — DB writes must be explicit
 
