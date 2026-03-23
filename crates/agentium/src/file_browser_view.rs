@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use file_icons::FileIcons;
 use gpui::{prelude::*, *};
 use project::{Entry, Project, ProjectEntryId, ProjectPath, Worktree, WorktreeId};
-use ui::{ActiveTheme, Icon, IconName, prelude::*};
+use ui::{ActiveTheme, ContextMenu, Icon, IconName, prelude::*};
 use util::ResultExt as _;
 use util::rel_path::{RelPath, RelPathBuf};
 use workspace::notifications::NotifyResultExt as _;
@@ -13,7 +14,18 @@ use workspace::{Item, Workspace};
 
 actions!(
     file_browser,
-    [ExpandSelectedEntry, CollapseSelectedEntry, ConfirmEntry, SwitchPane]
+    [
+        ExpandSelectedEntry,
+        CollapseSelectedEntry,
+        ConfirmEntry,
+        SwitchPane,
+        RevealInFileManager,
+        Cut,
+        Copy,
+        Paste,
+        Duplicate,
+        Trash,
+    ]
 );
 
 enum ActivePane {
@@ -36,6 +48,17 @@ struct FileListEntry {
     is_dir: bool,
 }
 
+enum ClipboardEntry {
+    Copied { entry_id: ProjectEntryId },
+    Cut { entry_id: ProjectEntryId },
+}
+
+struct ContextMenuTarget {
+    entry_id: ProjectEntryId,
+    path: Arc<RelPath>,
+    is_dir: bool,
+}
+
 pub(crate) struct FileBrowserView {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
@@ -54,6 +77,9 @@ pub(crate) struct FileBrowserView {
 
     active_pane: ActivePane,
     focus_handle: FocusHandle,
+    clipboard: Option<ClipboardEntry>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    context_menu_entry: Option<ContextMenuTarget>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -97,6 +123,9 @@ impl FileBrowserView {
             file_list_selected_index: None,
             active_pane: ActivePane::DirTree,
             focus_handle: cx.focus_handle(),
+            clipboard: None,
+            context_menu: None,
+            context_menu_entry: None,
             _subscriptions: subscriptions,
         };
 
@@ -529,6 +558,280 @@ impl FileBrowserView {
         .detach();
     }
 
+    // --- Context menu ---
+
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        entry_id: ProjectEntryId,
+        path: Arc<RelPath>,
+        is_dir: bool,
+        is_root: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu_entry = Some(ContextMenuTarget {
+            entry_id,
+            path,
+            is_dir,
+        });
+
+        let has_pasteable = self.clipboard.is_some();
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _cx| {
+            menu.context(self.focus_handle.clone())
+                .action("Cut", Box::new(Cut))
+                .action("Copy", Box::new(Copy))
+                .action("Duplicate", Box::new(Duplicate))
+                .action_disabled_when(!has_pasteable, "Paste", Box::new(Paste))
+                .separator()
+                .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
+                .action(
+                    "Copy Relative Path",
+                    Box::new(zed_actions::workspace::CopyRelativePath),
+                )
+                .separator()
+                .action("Reveal in Finder", Box::new(RevealInFileManager))
+                .when(!is_root, |menu| {
+                    menu.separator().action("Trash", Box::new(Trash))
+                })
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            this.context_menu_entry.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn write_entry_to_system_clipboard(&self, path: &RelPath, cx: &mut Context<Self>) {
+        let Some(worktree_id) = self.worktree_id else {
+            return;
+        };
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        let abs_path = worktree.read(cx).absolutize(path);
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            abs_path.to_string_lossy().to_string(),
+        ));
+    }
+
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = &self.context_menu_entry else {
+            return;
+        };
+        self.write_entry_to_system_clipboard(&target.path, cx);
+        self.clipboard = Some(ClipboardEntry::Cut {
+            entry_id: target.entry_id,
+        });
+        cx.notify();
+    }
+
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = &self.context_menu_entry else {
+            return;
+        };
+        self.write_entry_to_system_clipboard(&target.path, cx);
+        self.clipboard = Some(ClipboardEntry::Copied {
+            entry_id: target.entry_id,
+        });
+        cx.notify();
+    }
+
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.context_menu_entry.as_ref() else {
+            return;
+        };
+        let Some(clipboard) = self.clipboard.take() else {
+            return;
+        };
+        let Some(worktree_id) = self.worktree_id else {
+            return;
+        };
+
+        let mut dest_dir = target.path.to_rel_path_buf();
+        if !target.is_dir {
+            dest_dir.pop();
+        }
+
+        let (source_entry_id, is_cut) = match &clipboard {
+            ClipboardEntry::Cut { entry_id, .. } => (*entry_id, true),
+            ClipboardEntry::Copied { entry_id, .. } => (*entry_id, false),
+        };
+
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        let Some(source_entry) = worktree.read(cx).entry_for_id(source_entry_id) else {
+            return;
+        };
+        let Some(file_name) = source_entry.path.file_name() else {
+            return;
+        };
+
+        let Some(new_path) =
+            self.compute_paste_path(&dest_dir, file_name, source_entry.is_file(), worktree.read(cx))
+        else {
+            return;
+        };
+        let destination = ProjectPath {
+            worktree_id,
+            path: new_path,
+        };
+
+        if is_cut {
+            let task = self.project.update(cx, |project, cx| {
+                project.rename_entry(source_entry_id, destination, cx)
+            });
+            cx.spawn_in(window, async move |_this, _cx| {
+                task.await.log_err();
+            })
+            .detach();
+        } else {
+            let task = self.project.update(cx, |project, cx| {
+                project.copy_entry(source_entry_id, destination, cx)
+            });
+            cx.spawn_in(window, async move |_this, _cx| {
+                task.await.log_err();
+            })
+            .detach();
+        }
+
+        if !is_cut {
+            self.clipboard = Some(clipboard);
+        }
+    }
+
+    fn compute_paste_path(
+        &self,
+        dest_dir: &RelPathBuf,
+        file_name: &str,
+        is_file: bool,
+        worktree: &Worktree,
+    ) -> Option<Arc<RelPath>> {
+        let (stem, extension) = if is_file {
+            let path = std::path::Path::new(file_name);
+            (
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| file_name.to_string()),
+                path.extension().map(|s| s.to_string_lossy().to_string()),
+            )
+        } else {
+            (file_name.to_string(), None)
+        };
+
+        let mut candidate = dest_dir.clone();
+        candidate.push(RelPath::unix(file_name).ok()?);
+
+        if worktree.entry_for_path(&candidate).is_none() {
+            return Some(Arc::from(candidate.as_ref()));
+        }
+
+        for ix in 0.. {
+            let mut new_name = stem.clone();
+            new_name.push_str(" copy");
+            if ix > 0 {
+                new_name.push_str(&format!(" {ix}"));
+            }
+            if let Some(ext) = &extension {
+                new_name.push('.');
+                new_name.push_str(ext);
+            }
+            candidate = dest_dir.clone();
+            candidate.push(RelPath::unix(&new_name).ok()?);
+            if worktree.entry_for_path(&candidate).is_none() {
+                return Some(Arc::from(candidate.as_ref()));
+            }
+        }
+        None
+    }
+
+    fn duplicate(&mut self, _: &Duplicate, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy(&Copy, window, cx);
+        self.paste(&Paste, window, cx);
+    }
+
+    fn trash(&mut self, _: &Trash, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.context_menu_entry.as_ref() else {
+            return;
+        };
+        let entry_id = target.entry_id;
+        let file_name = target.path.file_name().unwrap_or("this item").to_string();
+
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &format!("Do you want to trash {file_name}?"),
+            None,
+            &["Trash", "Cancel"],
+            cx,
+        );
+
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if let Some(task) = this.project.update(cx, |project, cx| {
+                    project.delete_entry(entry_id, true, cx)
+                }) {
+                    task.detach_and_log_err(cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn context_menu_abs_path(&self, cx: &App) -> Option<PathBuf> {
+        let target = self.context_menu_entry.as_ref()?;
+        let worktree_id = self.worktree_id?;
+        let worktree = self.project.read(cx).worktree_for_id(worktree_id, cx)?;
+        Some(worktree.read(cx).absolutize(&target.path))
+    }
+
+    fn copy_path(
+        &mut self,
+        _: &zed_actions::workspace::CopyPath,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(abs_path) = self.context_menu_abs_path(cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                abs_path.to_string_lossy().to_string(),
+            ));
+        }
+    }
+
+    fn copy_relative_path(
+        &mut self,
+        _: &zed_actions::workspace::CopyRelativePath,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = &self.context_menu_entry {
+            let path_style = self.project.read(cx).path_style(cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                target.path.display(path_style).into_owned(),
+            ));
+        }
+    }
+
+    fn reveal_in_file_manager(
+        &mut self,
+        _: &RevealInFileManager,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(abs_path) = self.context_menu_abs_path(cx) {
+            self.project
+                .update(cx, |project, cx| project.reveal_path(&abs_path, cx));
+        }
+    }
+
     // --- Rendering ---
 
     fn root_dir_name(&self, cx: &App) -> SharedString {
@@ -560,6 +863,8 @@ impl FileBrowserView {
         let is_selected_dir = self.selected_dir_id == Some(entry.entry_id);
         let is_cursor = self.dir_tree_selected_index == Some(ix)
             && matches!(self.active_pane, ActivePane::DirTree);
+        let entry_id = entry.entry_id;
+        let entry_path = entry.path.clone();
 
         let chevron_icon = if entry.is_expanded {
             IconName::ChevronDown
@@ -604,6 +909,23 @@ impl FileBrowserView {
                 this.select_dir(ix, cx);
                 this.toggle_dir(ix, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.active_pane = ActivePane::DirTree;
+                    this.dir_tree_selected_index = Some(ix);
+                    this.deploy_context_menu(
+                        event.position,
+                        entry_id,
+                        entry_path.clone(),
+                        true,
+                        false,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .into_any_element()
     }
 
@@ -614,6 +936,9 @@ impl FileBrowserView {
         let colors = cx.theme().colors();
         let is_selected = self.file_list_selected_index == Some(ix);
         let is_cursor = is_selected && matches!(self.active_pane, ActivePane::FileList);
+        let entry_id = entry.entry_id;
+        let entry_path = entry.path.clone();
+        let is_dir = entry.is_dir;
 
         let icon = if entry.is_dir {
             FileIcons::get_folder_icon(false, entry.path.as_std_path(), cx)
@@ -653,6 +978,23 @@ impl FileBrowserView {
                 }
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.active_pane = ActivePane::FileList;
+                    this.file_list_selected_index = Some(ix);
+                    this.deploy_context_menu(
+                        event.position,
+                        entry_id,
+                        entry_path.clone(),
+                        is_dir,
+                        false,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .into_any_element()
     }
 }
@@ -693,6 +1035,14 @@ impl Render for FileBrowserView {
             .on_action(cx.listener(Self::collapse_selected_entry))
             .on_action(cx.listener(Self::confirm_entry))
             .on_action(cx.listener(Self::switch_pane))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::duplicate))
+            .on_action(cx.listener(Self::trash))
+            .on_action(cx.listener(Self::copy_path))
+            .on_action(cx.listener(Self::copy_relative_path))
+            .on_action(cx.listener(Self::reveal_in_file_manager))
             .size_full()
             .flex()
             .flex_row()
@@ -713,6 +1063,14 @@ impl Render for FileBrowserView {
                     .child({
                         let root_name = self.root_dir_name(cx);
                         let is_root_selected = self.is_root_selected(cx);
+                        let root_path: Arc<RelPath> =
+                            Arc::from(RelPathBuf::new().as_ref());
+                        let root_entry_id = self
+                            .worktree_id
+                            .and_then(|id| {
+                                self.project.read(cx).worktree_for_id(id, cx)
+                            })
+                            .and_then(|wt| wt.read(cx).root_entry().map(|e| e.id));
                         div()
                             .id("dir-tree-root")
                             .pl(px(4.0))
@@ -741,6 +1099,26 @@ impl Render for FileBrowserView {
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.select_root_dir(cx);
                             }))
+                            .when_some(root_entry_id, |el, root_id| {
+                                el.on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(
+                                        move |this, event: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.active_pane = ActivePane::DirTree;
+                                            this.deploy_context_menu(
+                                                event.position,
+                                                root_id,
+                                                root_path.clone(),
+                                                true,
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    ),
+                                )
+                            })
                     })
                     .child(
                         uniform_list(
@@ -825,6 +1203,15 @@ impl Render for FileBrowserView {
                         .into_any_element()
                     }),
             )
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(Corner::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(3)
+            }))
             .into_any_element()
     }
 }
