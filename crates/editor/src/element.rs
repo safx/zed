@@ -8430,7 +8430,18 @@ pub(crate) fn render_buffer_header(
     let file = buffer.file();
     let can_open_excerpts = file.is_none_or(|file| file.can_open());
     let path_style = file.map(|file| file.path_style(cx));
-    let relative_path = buffer.resolve_file_path(include_root, cx);
+    let relative_path = multi_buffer
+        .path_for_excerpt(for_excerpt.id)
+        .and_then(|path_key| {
+            let file = for_excerpt.buffer.file()?;
+            // Prefer the multibuffer's path when it differs (e.g., git linked worktree repo-relative path).
+            if path_key.path.as_ref() != file.path().as_ref() {
+                Some(path_key.path.display(file.path_style(cx)).into_owned())
+            } else {
+                None
+            }
+        })
+        .or_else(|| for_excerpt.buffer.resolve_file_path(include_root, cx));
     let (parent_path, filename) = if let Some(path) = &relative_path {
         if let Some(path_style) = path_style {
             let (dir, file_name) = path_style.split(path);
