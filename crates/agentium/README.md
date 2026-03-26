@@ -42,7 +42,14 @@ Add the following to your Claude Code `settings.json`:
 }
 ```
 
-When Claude Code completes a response, the corresponding terminal tab shows a blue dot indicator and the arena sidebar shows a badge count. Switching to the tab clears the notification.
+Terminal tabs show dot indicators based on execution state:
+
+- **Claude terminals**: green dot while a prompt is running, blue dot + blue pane border when completed
+- **Non-Claude task terminals**: green dot while running, blue dot on success, red dot on failure
+
+Pressing any key while focused on a terminal clears its dot (and border). Selecting a terminal from the arena badge menu also clears it.
+
+The arena sidebar shows pill-shaped badges: a green pill for the count of running Claude sessions and a blue pill for completed ones. Clicking the blue pill opens a menu to jump to specific completed terminals.
 
 The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info for display. A "!" indicator appears if no update has been received for over 1 hour.
 
