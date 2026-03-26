@@ -57,9 +57,16 @@ pub struct ActivateArena {
     pub index: usize,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ClaudeSessionState {
+    Idle,
+    Running,
+    Completed,
+}
+
 struct ClaudeSession {
     ancestor_pids: Vec<u32>,
-    is_ready: bool,
+    state: ClaudeSessionState,
     user_prompt: String,
     status_message: String,
 }
@@ -85,6 +92,8 @@ struct ReadyTerminalInfo {
 #[derive(Clone)]
 pub(crate) struct SharedSessionState {
     pub ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    pub running_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    pub acknowledged_task_pids: Rc<RefCell<HashSet<u32>>>,
     pub pid_to_session_id: Rc<RefCell<HashMap<u32, String>>>,
 }
 
@@ -92,6 +101,8 @@ impl SharedSessionState {
     fn new() -> Self {
         Self {
             ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
+            running_shell_pids: Rc::new(RefCell::new(HashSet::new())),
+            acknowledged_task_pids: Rc::new(RefCell::new(HashSet::new())),
             pid_to_session_id: Rc::new(RefCell::new(HashMap::new())),
         }
     }
@@ -208,8 +219,12 @@ impl AgentiumApp {
         let subscription = cx.subscribe(
             &arena_entity,
             |this, _ws, event: &ArenaEvent, cx| match event {
-                ArenaEvent::TerminalActivated { shell_pid } => {
-                    this.clear_ready_for_shell_pid(*shell_pid, cx);
+                // Claude session clearing routes through AgentiumApp because
+                // claude_sessions state lives here. Non-Claude task acknowledgment
+                // is handled locally in Arena::handle_key_input via the shared
+                // acknowledged_task_pids set.
+                ArenaEvent::TerminalKeyInput { shell_pid } => {
+                    this.clear_session_for_shell_pid(*shell_pid, cx);
                 }
             },
         );
@@ -415,13 +430,21 @@ impl AgentiumApp {
     }
 
     fn sync_session_derived_state(&self) {
-        let pids: HashSet<u32> = self
-            .claude_sessions
-            .values()
-            .filter(|s| s.is_ready)
-            .flat_map(|s| s.ancestor_pids.iter().copied())
-            .collect();
-        *self.session_state.ready_shell_pids.borrow_mut() = pids;
+        let mut ready_pids = HashSet::new();
+        let mut running_pids = HashSet::new();
+        for session in self.claude_sessions.values() {
+            match session.state {
+                ClaudeSessionState::Completed => {
+                    ready_pids.extend(session.ancestor_pids.iter().copied());
+                }
+                ClaudeSessionState::Running => {
+                    running_pids.extend(session.ancestor_pids.iter().copied());
+                }
+                ClaudeSessionState::Idle => {}
+            }
+        }
+        *self.session_state.ready_shell_pids.borrow_mut() = ready_pids;
+        *self.session_state.running_shell_pids.borrow_mut() = running_pids;
 
         // Includes all sessions (not just ready ones) so that Fork Session
         // is available while Claude is still running.
@@ -444,7 +467,7 @@ impl AgentiumApp {
             session_id,
             ClaudeSession {
                 ancestor_pids,
-                is_ready: false,
+                state: ClaudeSessionState::Idle,
                 user_prompt: String::new(),
                 status_message: String::new(),
             },
@@ -462,7 +485,7 @@ impl AgentiumApp {
     ) {
         let status_message = title.unwrap_or_else(|| "Ready".to_string());
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
-            session.is_ready = true;
+            session.state = ClaudeSessionState::Completed;
             session.ancestor_pids = ancestor_pids;
             session.status_message = status_message;
         } else {
@@ -470,7 +493,7 @@ impl AgentiumApp {
                 session_id.to_string(),
                 ClaudeSession {
                     ancestor_pids,
-                    is_ready: true,
+                    state: ClaudeSessionState::Completed,
                     user_prompt: String::new(),
                     status_message,
                 },
@@ -491,14 +514,14 @@ impl AgentiumApp {
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             session.user_prompt = prompt;
             session.ancestor_pids = ancestor_pids;
-            session.is_ready = false;
+            session.state = ClaudeSessionState::Running;
             session.status_message.clear();
         } else {
             self.claude_sessions.insert(
                 session_id.to_string(),
                 ClaudeSession {
                     ancestor_pids,
-                    is_ready: false,
+                    state: ClaudeSessionState::Running,
                     user_prompt: prompt,
                     status_message: String::new(),
                 },
@@ -541,11 +564,13 @@ impl AgentiumApp {
         });
     }
 
-    fn clear_ready_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
+    fn clear_session_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
         let mut changed = false;
         for session in self.claude_sessions.values_mut() {
-            if session.is_ready && session.ancestor_pids.contains(&shell_pid) {
-                session.is_ready = false;
+            if session.state == ClaudeSessionState::Completed
+                && session.ancestor_pids.contains(&shell_pid)
+            {
+                session.state = ClaudeSessionState::Idle;
                 changed = true;
             }
         }
@@ -629,6 +654,35 @@ impl AgentiumApp {
             .sum()
     }
 
+    fn count_running_claudes_in_arena(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> usize {
+        let running_pids = self.session_state.running_shell_pids.borrow();
+        if running_pids.is_empty() {
+            return 0;
+        }
+        let arena = arena_entity.read(cx);
+        arena
+            .center
+            .panes()
+            .iter()
+            .map(|pane| {
+                pane.read(cx)
+                    .items_of_type::<TerminalView>()
+                    .filter(|tv| {
+                        tv.read(cx)
+                            .terminal()
+                            .read(cx)
+                            .pid_getter()
+                            .is_some_and(|g| running_pids.contains(&g.fallback_pid().as_u32()))
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
     fn collect_ready_terminal_infos(
         &self,
         arena_entity: &Entity<Arena>,
@@ -655,7 +709,10 @@ impl AgentiumApp {
                 let (user_prompt, status_message) = self
                     .claude_sessions
                     .values()
-                    .find(|s| s.is_ready && s.ancestor_pids.contains(&pid))
+                    .find(|s| {
+                        s.state == ClaudeSessionState::Completed
+                            && s.ancestor_pids.contains(&pid)
+                    })
                     .map(|s| (s.user_prompt.clone(), s.status_message.clone()))
                     .unwrap_or_default();
                 infos.push(ReadyTerminalInfo {
@@ -776,6 +833,23 @@ fn truncate_for_menu(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+fn render_arena_pill(
+    id: impl Into<ElementId>,
+    count: usize,
+    bg_color: Hsla,
+    text_color: Hsla,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_1p5()
+        .rounded_full()
+        .bg(bg_color)
+        .text_color(text_color)
+        .text_xs()
+        .line_height(relative(1.4))
+        .child(format!("{count}"))
 }
 
 fn format_resets_in(resets_at: i64) -> String {
@@ -983,7 +1057,9 @@ impl Render for AgentiumApp {
                                         })
                                         .child({
                                             let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
+                                            let running_count = self.count_running_claudes_in_arena(arena_entity, cx);
                                             let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
+                                            let has_pills = running_count > 0 || ready_count > 0;
                                             div()
                                                 .flex()
                                                 .flex_row()
@@ -993,31 +1069,43 @@ impl Render for AgentiumApp {
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
                                                 .when(!is_renaming, |d| d.child(arena.name.clone()))
-                                                .when(ready_count > 0, |d| {
+                                                .when(has_pills, |d| {
                                                     let arena_entity_for_badge = arena_entity.clone();
+                                                    let status_colors = cx.theme().status();
                                                     d.child(
-                                                        div()
-                                                            .id(("arena-badge", arena.id))
-                                                            .px_1p5()
-                                                            .rounded_full()
-                                                            .bg(colors.text_accent)
-                                                            .text_color(colors.surface_background)
-                                                            .text_xs()
-                                                            .line_height(relative(1.4))
-                                                            .cursor_pointer()
-                                                            .child(format!("{ready_count}"))
-                                                            .on_click(cx.listener(
-                                                                move |this, event: &ClickEvent, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.switch_arena(i, window, cx);
-                                                                    let infos = this.collect_ready_terminal_infos(
-                                                                        &arena_entity_for_badge, cx,
-                                                                    );
-                                                                    this.deploy_badge_menu(
-                                                                        i, infos, event.position(), window, cx,
-                                                                    );
-                                                                },
-                                                            ))
+                                                        h_flex()
+                                                            .gap_0p5()
+                                                            .when(running_count > 0, |d| {
+                                                                d.child(render_arena_pill(
+                                                                    ("arena-running-badge", arena.id),
+                                                                    running_count,
+                                                                    status_colors.success,
+                                                                    colors.surface_background,
+                                                                ))
+                                                            })
+                                                            .when(ready_count > 0, |d| {
+                                                                d.child(
+                                                                    render_arena_pill(
+                                                                        ("arena-ready-badge", arena.id),
+                                                                        ready_count,
+                                                                        colors.text_accent,
+                                                                        colors.surface_background,
+                                                                    )
+                                                                    .cursor_pointer()
+                                                                    .on_click(cx.listener(
+                                                                        move |this, event: &ClickEvent, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.switch_arena(i, window, cx);
+                                                                            let infos = this.collect_ready_terminal_infos(
+                                                                                &arena_entity_for_badge, cx,
+                                                                            );
+                                                                            this.deploy_badge_menu(
+                                                                                i, infos, event.position(), window, cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                )
+                                                            })
                                                     )
                                                 })
                                         })
