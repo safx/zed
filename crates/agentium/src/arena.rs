@@ -12,7 +12,7 @@ use project::{Project, ProjectPath, WorktreeId};
 use search::ProjectSearchView;
 use search::project_search::{ProjectSearch, ProjectSearchBar};
 use task::Shell;
-use terminal::Terminal;
+use terminal::{TaskStatus, Terminal};
 use terminal_view::TerminalView;
 use ui::{ActiveTheme, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -34,7 +34,7 @@ use crate::{
 };
 
 pub(crate) enum ArenaEvent {
-    TerminalActivated { shell_pid: u32 },
+    TerminalKeyInput { shell_pid: u32 },
 }
 
 pub(crate) struct Arena {
@@ -637,6 +637,51 @@ impl Arena {
         })
     }
 
+    fn handle_key_input(
+        &mut self,
+        _event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal_view) = self
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<TerminalView>())
+        else {
+            return;
+        };
+        let terminal = terminal_view.read(cx).terminal().read(cx);
+        let Some(pid) = terminal
+            .pid_getter()
+            .map(|g| g.fallback_pid().as_u32())
+        else {
+            return;
+        };
+
+        // Claude session clearing routes through AgentiumApp (via event) because
+        // claude_sessions state lives there. Non-Claude task acknowledgment is
+        // handled locally via the shared acknowledged_task_pids set.
+        let is_claude_completed = self.session_state.ready_shell_pids.borrow().contains(&pid);
+        if is_claude_completed {
+            cx.emit(ArenaEvent::TerminalKeyInput { shell_pid: pid });
+            return;
+        }
+
+        if let Some(task) = terminal.task() {
+            if matches!(task.status, TaskStatus::Completed { .. }) {
+                let was_new = self
+                    .session_state
+                    .acknowledged_task_pids
+                    .borrow_mut()
+                    .insert(pid);
+                if was_new {
+                    self.active_pane.update(cx, |_, cx| cx.notify());
+                }
+            }
+        }
+    }
+
     fn handle_pane_event(
         &mut self,
         pane: &Entity<Pane>,
@@ -713,18 +758,7 @@ impl Arena {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
             },
-            pane::Event::ActivateItem { .. } => {
-                if let Some(item) = pane.read(cx).active_item() {
-                    if let Some(terminal_view) = item.downcast::<TerminalView>() {
-                        let terminal = terminal_view.read(cx).terminal().read(cx);
-                        if let Some(pid_getter) = terminal.pid_getter() {
-                            cx.emit(ArenaEvent::TerminalActivated {
-                                shell_pid: pid_getter.fallback_pid().as_u32(),
-                            });
-                        }
-                    }
-                }
-            }
+            pane::Event::ActivateItem { .. } => {}
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
                 if let Some(workspace) = self.workspace.upgrade() {
@@ -905,6 +939,7 @@ impl Render for Arena {
                     .key_context(context)
                     .relative()
                     .size_full()
+                    .capture_key_down(cx.listener(Self::handle_key_input))
                     .on_action(cx.listener(|this, action: &ToggleFileFinder, window, cx| {
                         let worktree_id = this.worktree_id(cx);
                         let Some(workspace) = this.workspace.upgrade() else {
@@ -1365,14 +1400,41 @@ pub(crate) fn new_agentium_pane(
 
         pane.set_tab_bar_drag_area(true);
 
+        let running_pids = session_state.running_shell_pids.clone();
         let ready_pids = session_state.ready_shell_pids.clone();
+        let acknowledged_pids = session_state.acknowledged_task_pids.clone();
         pane.set_render_item_indicator(move |item, cx| {
             if let Some(terminal_view) = item.downcast::<TerminalView>() {
                 let terminal = terminal_view.read(cx).terminal().read(cx);
                 if let Some(pid_getter) = terminal.pid_getter() {
                     let pid = pid_getter.fallback_pid().as_u32();
+
+                    // Claude sessions: running (green) or completed (blue)
+                    if running_pids.borrow().contains(&pid) {
+                        return Some(Indicator::dot().color(Color::Success));
+                    }
                     if ready_pids.borrow().contains(&pid) {
                         return Some(Indicator::dot().color(Color::Accent));
+                    }
+
+                    // Non-Claude task terminals
+                    if let Some(task) = terminal.task() {
+                        match task.status {
+                            TaskStatus::Running => {
+                                return Some(Indicator::dot().color(Color::Success));
+                            }
+                            TaskStatus::Completed { success } => {
+                                if !acknowledged_pids.borrow().contains(&pid) {
+                                    let color = if success {
+                                        Color::Accent
+                                    } else {
+                                        Color::Error
+                                    };
+                                    return Some(Indicator::dot().color(color));
+                                }
+                            }
+                            TaskStatus::Unknown => {}
+                        }
                     }
                 }
             }
