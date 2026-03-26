@@ -51,7 +51,16 @@ Additionally, many default keybindings in `assets/keymaps/` are scoped to `"cont
 
 ## Claude Code hook IPC uses `Rc<RefCell<HashSet<u32>>>` for cross-closure state
 
-The `ready_shell_pids` set is shared between `AgentiumApp` (which writes it when Claude Code sessions become ready or are cleared) and per-pane indicator closures (which read it to decide whether to show a dot on a terminal tab). Because all access is on the single foreground thread, `Rc<RefCell<...>>` is used instead of `Arc<Mutex<...>>`. The `AgentiumApp` owns the canonical `claude_sessions: HashMap<String, ClaudeSession>` and syncs the derived `SharedSessionState` (which wraps both `ready_shell_pids` and a `pid_to_session_id` map) via `sync_session_derived_state()` after every mutation.
+`SharedSessionState` holds several `Rc<RefCell<...>>` sets shared between `AgentiumApp` (which writes them) and per-pane indicator closures (which read them to decide dot colors). Because all access is on the single foreground thread, `Rc<RefCell<...>>` is used instead of `Arc<Mutex<...>>`.
+
+The canonical state lives in `AgentiumApp::claude_sessions: HashMap<String, ClaudeSession>`, where each session has a `ClaudeSessionState` enum (`Idle`, `Running`, `Completed`). After every mutation, `sync_session_derived_state()` rebuilds the derived PID sets:
+
+- `running_shell_pids` — PIDs of sessions in `Running` state (green dot)
+- `ready_shell_pids` — PIDs of sessions in `Completed` state (blue dot + border)
+- `acknowledged_task_pids` — PIDs of non-Claude task terminals the user has acknowledged via key input (suppresses dot)
+- `pid_to_session_id` — all sessions, for Fork Session lookups
+
+Clearing Claude session state (Completed → Idle) routes through `AgentiumApp` via `ArenaEvent::TerminalKeyInput` because the canonical `claude_sessions` map lives there. Non-Claude task acknowledgment is handled locally in `Arena::handle_key_input` by inserting into `acknowledged_task_pids` directly — no upstream state needs syncing.
 
 ## Statusline command must pass through stdin before parsing
 
