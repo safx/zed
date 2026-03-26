@@ -822,6 +822,16 @@ impl AgentiumApp {
                 pane.activate_item(index, true, true, window, cx);
             });
         }
+
+        let shell_pid = terminal_view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .pid_getter()
+            .map(|g| g.fallback_pid().as_u32());
+        if let Some(pid) = shell_pid {
+            self.clear_session_for_shell_pid(pid, cx);
+        }
     }
 }
 
@@ -889,6 +899,7 @@ fn render_rate_limit_row(
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
     v_flex()
+        .id(SharedString::from(format!("rate-limit-row-{label}")))
         .px_1()
         .gap_0p5()
         .child(
@@ -917,6 +928,7 @@ fn render_rate_limit_row(
             )
             .bg_color(colors.border),
         )
+        .tooltip(Tooltip::text(format!("{:.0}%", used_pct)))
 }
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
