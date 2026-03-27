@@ -1155,9 +1155,6 @@ struct AgentiumPaneDecorator<'a> {
 
 impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
-        if pane != self.active_pane {
-            return LeaderDecoration::default();
-        }
         let is_ready = pane
             .read(cx)
             .active_item()
