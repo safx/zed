@@ -61,6 +61,7 @@ pub struct ActivateArena {
 enum ClaudeSessionState {
     Idle,
     Running,
+    WaitingPermission,
     Completed,
 }
 
@@ -93,6 +94,7 @@ struct ReadyTerminalInfo {
 pub(crate) struct SharedSessionState {
     pub ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
     pub running_shell_pids: Rc<RefCell<HashSet<u32>>>,
+    pub permission_shell_pids: Rc<RefCell<HashSet<u32>>>,
     pub acknowledged_task_pids: Rc<RefCell<HashSet<u32>>>,
     pub pid_to_session_id: Rc<RefCell<HashMap<u32, String>>>,
 }
@@ -102,6 +104,7 @@ impl SharedSessionState {
         Self {
             ready_shell_pids: Rc::new(RefCell::new(HashSet::new())),
             running_shell_pids: Rc::new(RefCell::new(HashSet::new())),
+            permission_shell_pids: Rc::new(RefCell::new(HashSet::new())),
             acknowledged_task_pids: Rc::new(RefCell::new(HashSet::new())),
             pid_to_session_id: Rc::new(RefCell::new(HashMap::new())),
         }
@@ -432,6 +435,7 @@ impl AgentiumApp {
     fn sync_session_derived_state(&self) {
         let mut ready_pids = HashSet::new();
         let mut running_pids = HashSet::new();
+        let mut permission_pids = HashSet::new();
         for session in self.claude_sessions.values() {
             match session.state {
                 ClaudeSessionState::Completed => {
@@ -440,11 +444,15 @@ impl AgentiumApp {
                 ClaudeSessionState::Running => {
                     running_pids.extend(session.ancestor_pids.iter().copied());
                 }
+                ClaudeSessionState::WaitingPermission => {
+                    permission_pids.extend(session.ancestor_pids.iter().copied());
+                }
                 ClaudeSessionState::Idle => {}
             }
         }
         *self.session_state.ready_shell_pids.borrow_mut() = ready_pids;
         *self.session_state.running_shell_pids.borrow_mut() = running_pids;
+        *self.session_state.permission_shell_pids.borrow_mut() = permission_pids;
 
         // Includes all sessions (not just ready ones) so that Fork Session
         // is available while Claude is still running.
@@ -565,6 +573,52 @@ impl AgentiumApp {
         self.sync_session_derived_state();
         self.notify_all_panes(cx);
         cx.notify();
+    }
+
+    pub fn handle_claude_permission_request(
+        &mut self,
+        session_id: &str,
+        ancestor_pids: Vec<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.claude_sessions.get_mut(session_id) {
+            if session.state == ClaudeSessionState::Running
+                || session.state == ClaudeSessionState::Idle
+            {
+                session.ancestor_pids = ancestor_pids;
+                session.state = ClaudeSessionState::WaitingPermission;
+            }
+        } else {
+            self.claude_sessions.insert(
+                session_id.to_string(),
+                ClaudeSession {
+                    ancestor_pids,
+                    state: ClaudeSessionState::WaitingPermission,
+                    user_prompt: String::new(),
+                    status_message: String::new(),
+                },
+            );
+        }
+        self.sync_session_derived_state();
+        self.notify_all_panes(cx);
+        cx.notify();
+    }
+
+    pub fn handle_claude_post_tool_use(
+        &mut self,
+        session_id: &str,
+        ancestor_pids: Vec<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.claude_sessions.get_mut(session_id) {
+            if session.state == ClaudeSessionState::WaitingPermission {
+                session.ancestor_pids = ancestor_pids;
+                session.state = ClaudeSessionState::Running;
+                self.sync_session_derived_state();
+                self.notify_all_panes(cx);
+                cx.notify();
+            }
+        }
     }
 
     pub fn handle_pane_split(
@@ -712,6 +766,37 @@ impl AgentiumApp {
                             .read(cx)
                             .pid_getter()
                             .is_some_and(|g| running_pids.contains(&g.fallback_pid().as_u32()))
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    fn count_waiting_claudes_in_arena(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> usize {
+        let permission_pids = self.session_state.permission_shell_pids.borrow();
+        if permission_pids.is_empty() {
+            return 0;
+        }
+        let arena = arena_entity.read(cx);
+        arena
+            .center
+            .panes()
+            .iter()
+            .map(|pane| {
+                pane.read(cx)
+                    .items_of_type::<TerminalView>()
+                    .filter(|tv| {
+                        tv.read(cx)
+                            .terminal()
+                            .read(cx)
+                            .pid_getter()
+                            .is_some_and(|g| {
+                                permission_pids.contains(&g.fallback_pid().as_u32())
+                            })
                     })
                     .count()
             })
@@ -1104,9 +1189,10 @@ impl Render for AgentiumApp {
                                         })
                                         .child({
                                             let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
+                                            let permission_count = self.count_waiting_claudes_in_arena(arena_entity, cx);
                                             let running_count = self.count_running_claudes_in_arena(arena_entity, cx);
                                             let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
-                                            let has_pills = running_count > 0 || ready_count > 0;
+                                            let has_pills = permission_count > 0 || running_count > 0 || ready_count > 0;
                                             div()
                                                 .flex()
                                                 .flex_row()
@@ -1122,6 +1208,14 @@ impl Render for AgentiumApp {
                                                     d.child(
                                                         h_flex()
                                                             .gap_0p5()
+                                                            .when(permission_count > 0, |d| {
+                                                                d.child(render_arena_pill(
+                                                                    ("arena-permission-badge", arena.id),
+                                                                    permission_count,
+                                                                    status_colors.warning,
+                                                                    colors.surface_background,
+                                                                ))
+                                                            })
                                                             .when(running_count > 0, |d| {
                                                                 d.child(render_arena_pill(
                                                                     ("arena-running-badge", arena.id),

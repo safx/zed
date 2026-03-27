@@ -120,6 +120,9 @@ enum ClaudeHookEvent {
     Stop,
     Notification,
     UserPromptSubmit,
+    PermissionRequest,
+    PostToolUse,
+    PostToolUseFailure,
 }
 
 fn truncate_string(s: &str, max_chars: usize) -> String {
@@ -143,6 +146,8 @@ enum IpcMessage {
     ClaudeStop { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeNotification { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeUserPromptSubmit { session_id: String, ancestor_pids: Vec<u32>, prompt: String },
+    ClaudePermissionRequest { session_id: String, ancestor_pids: Vec<u32> },
+    ClaudePostToolUse { session_id: String, ancestor_pids: Vec<u32> },
     PaneSplit {
         direction: SplitDirection,
         content_type: agentium::PaneContentType,
@@ -264,6 +269,12 @@ fn start_ipc_listener(
                             Some("claude_user_prompt_submit") => {
                                 IpcMessage::ClaudeUserPromptSubmit { session_id, ancestor_pids, prompt }
                             }
+                            Some("claude_permission_request") => {
+                                IpcMessage::ClaudePermissionRequest { session_id, ancestor_pids }
+                            }
+                            Some("claude_post_tool_use") => {
+                                IpcMessage::ClaudePostToolUse { session_id, ancestor_pids }
+                            }
                             Some("pane_split") => {
                                 let direction = match json["direction"].as_str() {
                                     Some("right") => SplitDirection::Right,
@@ -383,6 +394,10 @@ fn main() {
                 ClaudeHookEvent::Stop => "claude_stop",
                 ClaudeHookEvent::Notification => "claude_notification",
                 ClaudeHookEvent::UserPromptSubmit => "claude_user_prompt_submit",
+                ClaudeHookEvent::PermissionRequest => "claude_permission_request",
+                ClaudeHookEvent::PostToolUse => "claude_post_tool_use",
+                // Both map to the same IPC type: both transition WaitingPermission → Running.
+                ClaudeHookEvent::PostToolUseFailure => "claude_post_tool_use",
             };
             let mut msg = serde_json::json!({
                 "type": msg_type,
@@ -826,6 +841,30 @@ fn main() {
                                                 .update(cx, |app, _window, cx| {
                                                     app.set_claude_session_prompt(
                                                         &session_id, ancestor_pids, prompt, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudePermissionRequest {
+                                            session_id,
+                                            ancestor_pids,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.handle_claude_permission_request(
+                                                        &session_id, ancestor_pids, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudePostToolUse {
+                                            session_id,
+                                            ancestor_pids,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.handle_claude_post_tool_use(
+                                                        &session_id, ancestor_pids, cx,
                                                     );
                                                 })
                                                 .log_err();
