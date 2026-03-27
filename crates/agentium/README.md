@@ -36,7 +36,10 @@ Add the following to your Claude Code `settings.json`:
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command", "command": "agentium claude hook session-start" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "agentium claude hook stop" }] }],
     "Notification": [{ "matcher": "", "hooks": [{ "type": "command", "command": "agentium claude hook notification" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentium claude hook user-prompt-submit" }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentium claude hook user-prompt-submit" }] }],
+    "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook permission-request" }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook post-tool-use" }] }],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook post-tool-use-failure" }] }]
   },
   "statusLine": "agentium claude statusline"
 }
@@ -85,7 +88,7 @@ agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 
 ### `agentium claude hook <event>`
 
-Claude Code hook integration. Events: `session-start`, `stop`, `notification`, `user-prompt-submit`.
+Claude Code hook integration. Events: `session-start`, `stop`, `notification`, `user-prompt-submit`, `permission-request`, `post-tool-use`, `post-tool-use-failure`.
 
 ### `agentium claude statusline`
 
