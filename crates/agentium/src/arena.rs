@@ -19,11 +19,11 @@ use util::ResultExt as _;
 use workspace::pane::render_item_indicator;
 use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
-    ActivatePaneUp, ActivatePreviousPane, DraggedTab, LeaderDecoration, MoveItemToPane,
-    MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, NewTerminal,
-    Pane, PaneGroup, PaneLeaderDecorator, Save, SaveAs, SaveIntent, SaveWithoutFormat,
-    SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
+    ActivatePaneUp, ActivatePreviousPane, DeploySearch, DraggedTab, LeaderDecoration,
+    MoveItemToPane, MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight,
+    MovePaneUp, NewTerminal, Pane, PaneGroup, PaneLeaderDecorator, Save, SaveAs, SaveIntent,
+    SaveWithoutFormat, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp,
+    SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleFileFinder, ToggleZoom, Workspace,
     move_active_item, pane,
 };
 
@@ -266,6 +266,26 @@ impl Arena {
             Some(id) => ProjectSearch::new_scoped(self.project.clone(), id, cx),
             None => ProjectSearch::new(self.project.clone(), cx),
         })
+    }
+
+    fn deploy_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for pane in self.center.panes() {
+            let found = pane.read(cx).items_of_type::<ProjectSearchView>().next();
+            if let Some(search_view) = found {
+                let entity_id = search_view.entity_id();
+                self.active_pane = pane.clone();
+                pane.update(cx, |pane, cx| {
+                    let index = pane
+                        .items()
+                        .position(|item| item.item_id() == entity_id);
+                    if let Some(index) = index {
+                        pane.activate_item(index, true, true, window, cx);
+                    }
+                });
+                return;
+            }
+        }
+        self.add_project_search(window, cx);
     }
 
     fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1005,6 +1025,9 @@ impl Render for Arena {
                     }))
                     .on_action(cx.listener(|this, _: &NewProjectSearch, window, cx| {
                         this.add_project_search(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &DeploySearch, window, cx| {
+                        this.deploy_project_search(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &NewGitStatus, window, cx| {
                         this.add_git_status(window, cx);
