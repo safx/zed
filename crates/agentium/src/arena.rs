@@ -282,6 +282,9 @@ impl Arena {
                         pane.activate_item(index, true, true, window, cx);
                     }
                 });
+                search_view.update(cx, |view, cx| {
+                    view.focus_query_editor(window, cx);
+                });
                 return;
             }
         }
@@ -294,6 +297,9 @@ impl Arena {
         let workspace_weak = self.workspace.clone();
         let view =
             cx.new(|cx| ProjectSearchView::new(workspace_weak, project_search, window, cx, None));
+        view.update(cx, |view, cx| {
+            view.focus_query_editor(window, cx);
+        });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
         });
