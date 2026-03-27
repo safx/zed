@@ -567,7 +567,10 @@ fn main() {
                 })
                 .detach();
 
-            theme::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
+            theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
+            *theme::SystemAppearance::global_mut(cx) =
+                theme::SystemAppearance(theme::Appearance::Dark);
+            theme_settings::reload_theme(cx);
 
             if let Some(ref name) = theme_name {
                 let registry = theme::ThemeRegistry::default_global(cx);
@@ -581,10 +584,6 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-
-            *theme::SystemAppearance::global_mut(cx) =
-                theme::SystemAppearance(theme::Appearance::Dark);
-            theme::GlobalTheme::reload_theme(cx);
             load_embedded_fonts(cx);
 
             cx.on_action(quit);
