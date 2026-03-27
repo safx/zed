@@ -1722,7 +1722,7 @@ impl ProjectSearchView {
         }
     }
 
-    fn focus_query_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_query_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.query_editor.update(cx, |query_editor, cx| {
             query_editor.select_all(&SelectAll, window, cx);
         });
