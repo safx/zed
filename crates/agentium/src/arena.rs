@@ -921,12 +921,14 @@ impl Render for Arena {
             })
             .unwrap_or_else(div);
         let ready_pids = self.session_state.ready_shell_pids.borrow().clone();
+        let permission_pids = self.session_state.permission_shell_pids.borrow().clone();
         self.workspace
             .update(cx, |_workspace, cx| {
                 let decorator = AgentiumPaneDecorator {
                     active_pane: &self.active_pane,
                     workspace: &self.workspace,
                     ready_shell_pids: &ready_pids,
+                    permission_shell_pids: &permission_pids,
                 };
                 search_actions_div
                     .relative()
@@ -1174,28 +1176,35 @@ struct AgentiumPaneDecorator<'a> {
     active_pane: &'a Entity<Pane>,
     workspace: &'a WeakEntity<Workspace>,
     ready_shell_pids: &'a HashSet<u32>,
+    permission_shell_pids: &'a HashSet<u32>,
 }
 
 impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
-        let is_ready = pane
+        let active_pid = pane
             .read(cx)
             .active_item()
             .and_then(|item| item.downcast::<TerminalView>())
             .and_then(|tv| {
                 let terminal = tv.read(cx).terminal().read(cx);
                 terminal.pid_getter().map(|g| g.fallback_pid().as_u32())
-            })
-            .is_some_and(|pid| self.ready_shell_pids.contains(&pid));
+            });
 
-        if is_ready {
-            LeaderDecoration {
-                border: Some(cx.theme().colors().border_focused),
-                status_box: None,
+        if let Some(pid) = active_pid {
+            if self.permission_shell_pids.contains(&pid) {
+                return LeaderDecoration {
+                    border: Some(cx.theme().status().warning),
+                    status_box: None,
+                };
             }
-        } else {
-            LeaderDecoration::default()
+            if self.ready_shell_pids.contains(&pid) {
+                return LeaderDecoration {
+                    border: Some(cx.theme().colors().border_focused),
+                    status_box: None,
+                };
+            }
         }
+        LeaderDecoration::default()
     }
 
     fn active_pane(&self) -> &Entity<Pane> {
@@ -1420,6 +1429,7 @@ pub(crate) fn new_agentium_pane(
 
         pane.set_tab_bar_drag_area(true);
 
+        let permission_pids = session_state.permission_shell_pids.clone();
         let running_pids = session_state.running_shell_pids.clone();
         let ready_pids = session_state.ready_shell_pids.clone();
         let acknowledged_pids = session_state.acknowledged_task_pids.clone();
@@ -1429,7 +1439,10 @@ pub(crate) fn new_agentium_pane(
                 if let Some(pid_getter) = terminal.pid_getter() {
                     let pid = pid_getter.fallback_pid().as_u32();
 
-                    // Claude sessions: running (green) or completed (blue)
+                    // Claude sessions: permission (orange) > running (green) > completed (blue)
+                    if permission_pids.borrow().contains(&pid) {
+                        return Some(Indicator::dot().color(Color::Warning));
+                    }
                     if running_pids.borrow().contains(&pid) {
                         return Some(Indicator::dot().color(Color::Success));
                     }
