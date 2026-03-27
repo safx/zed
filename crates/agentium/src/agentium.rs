@@ -463,15 +463,19 @@ impl AgentiumApp {
         ancestor_pids: Vec<u32>,
         cx: &mut Context<Self>,
     ) {
-        self.claude_sessions.insert(
-            session_id,
-            ClaudeSession {
-                ancestor_pids,
+        // Use or_insert to avoid overwriting a session that was already
+        // created by a UserPromptSubmit arriving before this SessionStart
+        // (the two hooks run as separate IPC processes with no ordering guarantee).
+        let session = self
+            .claude_sessions
+            .entry(session_id)
+            .or_insert_with(|| ClaudeSession {
+                ancestor_pids: Vec::new(),
                 state: ClaudeSessionState::Idle,
                 user_prompt: String::new(),
                 status_message: String::new(),
-            },
-        );
+            });
+        session.ancestor_pids = ancestor_pids;
         self.sync_session_derived_state();
         cx.notify();
     }
@@ -496,6 +500,37 @@ impl AgentiumApp {
                     state: ClaudeSessionState::Completed,
                     user_prompt: String::new(),
                     status_message,
+                },
+            );
+        }
+        self.sync_session_derived_state();
+        self.notify_all_panes(cx);
+        cx.notify();
+    }
+
+    pub fn handle_claude_notification(
+        &mut self,
+        session_id: &str,
+        ancestor_pids: Vec<u32>,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.claude_sessions.get_mut(session_id) {
+            session.ancestor_pids = ancestor_pids;
+            session.status_message = title;
+            // Don't overwrite Running → Completed for notifications;
+            // only upgrade Idle → Completed so the blue badge appears.
+            if session.state == ClaudeSessionState::Idle {
+                session.state = ClaudeSessionState::Completed;
+            }
+        } else {
+            self.claude_sessions.insert(
+                session_id.to_string(),
+                ClaudeSession {
+                    ancestor_pids,
+                    state: ClaudeSessionState::Completed,
+                    user_prompt: String::new(),
+                    status_message: title,
                 },
             );
         }
