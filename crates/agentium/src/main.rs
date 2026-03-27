@@ -811,8 +811,8 @@ fn main() {
                                         } => {
                                             window_handle
                                                 .update(cx, |app, _window, cx| {
-                                                    app.mark_claude_session_ready(
-                                                        &session_id, ancestor_pids, Some(title), cx,
+                                                    app.handle_claude_notification(
+                                                        &session_id, ancestor_pids, title, cx,
                                                     );
                                                 })
                                                 .log_err();
