@@ -488,6 +488,7 @@ dependencies = [
  "terminal",
  "terminal_view",
  "theme",
+ "theme_settings",
  "ui",
  "ui_input",
  "util",
