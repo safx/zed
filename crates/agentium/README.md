@@ -9,11 +9,13 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **LSP** — language server support for Go to Definition, Find All References, etc.
 - **Diff view** — view uncommitted changes (powered by `git_ui::ProjectDiff`)
 - **Project search** — full-text search across the project
-- **Git status** — view changed files grouped by Conflicts/Tracked/Untracked, with staging checkboxes and click-to-open
+- **Git status** — view changed files grouped by Conflicts/Tracked/Untracked, with staging checkboxes, per-file diff stats (+N/-N lines), and click-to-open
 - **Markdown preview** — preview markdown files side-by-side
 - **File browser** — navigate project files with expand/collapse, open files for editing
 - **Git graph** — visualize git commit history
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
+- **GitHub PR tracking** — display PR status (draft/open/merged/closed/conflicted) with colored icons per arena, clickable to open in browser. Requires `gh` CLI.
+- **CI status** — poll GitHub Actions check status for PRs with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
 
 ## Keyboard Shortcuts
