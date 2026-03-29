@@ -1946,7 +1946,6 @@ impl Render for AgentiumApp {
                                                             div()
                                                                 .id(("arena-name", arena.id))
                                                                 .cursor_pointer()
-                                                                .px_1()
                                                                 .rounded_sm()
                                                                 .hover(|d| d.bg(colors.element_hover))
                                                                 .child(arena.name.clone())
@@ -2008,73 +2007,77 @@ impl Render for AgentiumApp {
                                                     )
                                                 })
                                         })
-                                        .when_some(display_path, |d, path| {
-                                            let diff_stats = git_info.as_ref().map(|(_, _, added, deleted)| (*added, *deleted));
-                                            d.child(
-                                                h_flex()
-                                                    .gap_1()
-                                                    .items_center()
-                                                    .child(
+                                        // Row 2: branch name (left) + diff stats (right)
+                                        .child({
+                                            let branch_label: SharedString = git_info.as_ref()
+                                                .and_then(|(branch, _, _, _)| branch.clone())
+                                                .unwrap_or_default()
+                                                .into();
+                                            let diff_stats = git_info.as_ref()
+                                                .map(|(_, _, added, deleted)| (*added, *deleted));
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_xs()
+                                                .min_h(px(16.0))
+                                                .when(!branch_label.is_empty(), |d| {
+                                                    d.child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .flex_shrink()
+                                                            .text_color(colors.text_muted)
+                                                            .truncate()
+                                                            .child(branch_label),
+                                                    )
+                                                })
+                                                .child(div().flex_grow())
+                                                .when_some(diff_stats, |d, (added, deleted)| {
+                                                    d.child(
+                                                        h_flex()
+                                                            .flex_shrink_0()
+                                                            .gap_1()
+                                                            .when(added > 0, |d| {
+                                                                d.child(
+                                                                    div()
+                                                                        .text_color(status_colors.created)
+                                                                        .child(format!("+{added}")),
+                                                                )
+                                                            })
+                                                            .when(deleted > 0, |d| {
+                                                                d.child(
+                                                                    div()
+                                                                        .text_color(status_colors.deleted)
+                                                                        .child(format!("-{deleted}")),
+                                                                )
+                                                            }),
+                                                    )
+                                                })
+                                        })
+                                        // Row 3: directory name (if different from arena name) + PR element (right)
+                                        .child({
+                                            let show_dir = display_path.as_ref()
+                                                .map_or(false, |path| path != &arena.name);
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_xs()
+                                                .min_h(px(16.0))
+                                                .when(show_dir, |d| {
+                                                    let path = display_path.as_ref().cloned().unwrap_or_default();
+                                                    d.child(
                                                         Icon::new(IconName::Folder)
                                                             .size(IconSize::XSmall)
                                                             .color(Color::Muted),
                                                     )
                                                     .child(
                                                         div()
-                                                            .text_xs()
                                                             .text_color(colors.text_muted)
                                                             .child(path),
                                                     )
-                                                    .child(div().flex_grow())
-                                                    .when_some(diff_stats, |d, (added, deleted)| {
-                                                        d.child(
-                                                            h_flex()
-                                                                .flex_shrink_0()
-                                                                .gap_1()
-                                                                .text_xs()
-                                                                .when(added > 0, |d| {
-                                                                    d.child(
-                                                                        div()
-                                                                            .text_color(status_colors.created)
-                                                                            .child(format!("+{added}")),
-                                                                    )
-                                                                })
-                                                                .when(deleted > 0, |d| {
-                                                                    d.child(
-                                                                        div()
-                                                                            .text_color(status_colors.deleted)
-                                                                            .child(format!("-{deleted}")),
-                                                                    )
-                                                                }),
-                                                        )
-                                                    }),
-                                            )
-                                        })
-                                        .when_some(git_info, |d, (branch, _, _, _)| {
-                                            let branch_label = branch.unwrap_or_default();
-                                            if branch_label.is_empty() && pr_element.is_none() {
-                                                d
-                                            } else {
-                                                d.child(
-                                                    h_flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .when(!branch_label.is_empty(), |d| {
-                                                            d.child(
-                                                                div()
-                                                                    .min_w_0()
-                                                                    .flex_shrink()
-                                                                    .text_xs()
-                                                                    .text_color(colors.text_muted)
-                                                                    .truncate()
-                                                                    .child(branch_label),
-                                                            )
-                                                        })
-                                                        .when_some(pr_element, |d, el| {
-                                                            d.child(div().flex_grow()).child(el)
-                                                        }),
-                                                )
-                                            }
+                                                })
+                                                .when_some(pr_element, |d, el| {
+                                                    d.child(div().flex_grow()).child(el)
+                                                })
                                         })
                                         .on_click(cx.listener(
                                             move |this, _, window, cx| {
