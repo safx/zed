@@ -488,6 +488,7 @@ dependencies = [
  "http_client",
  "language",
  "languages",
+ "log",
  "markdown_preview",
  "menu",
  "node_runtime",
