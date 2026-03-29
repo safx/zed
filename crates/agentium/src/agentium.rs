@@ -1231,6 +1231,19 @@ fn repo_name_from_url(url: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+fn remote_url_to_browser_url(url: &str) -> Option<String> {
+    let url = url.strip_suffix(".git").unwrap_or(url).trim_end_matches('/');
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Some(url.to_string())
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        // git@github.com:owner/repo → https://github.com/owner/repo
+        let browser_url = rest.replacen(':', "/", 1);
+        Some(format!("https://{browser_url}"))
+    } else {
+        None
+    }
+}
+
 async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<PrInfo>> {
     let output = smol::process::Command::new("gh")
         .current_dir(working_dir)
@@ -1382,6 +1395,8 @@ impl Render for AgentiumApp {
                                                 let repo_path = &repo.work_directory_abs_path;
                                                 if working_dir.starts_with(repo_path.as_ref()) {
                                                     let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
+                                                    let browser_url = repo.remote_origin_url.as_deref()
+                                                        .and_then(remote_url_to_browser_url);
                                                     let (lines_added, lines_deleted) = repo.cached_status()
                                                         .fold((0u32, 0u32), |(added, deleted), entry| {
                                                             if let Some(stat) = &entry.diff_stat {
@@ -1390,13 +1405,13 @@ impl Render for AgentiumApp {
                                                                 (added, deleted)
                                                             }
                                                         });
-                                                    Some((repo_path.clone(), branch_name, lines_added, lines_deleted))
+                                                    Some((repo_path.clone(), branch_name, browser_url, lines_added, lines_deleted))
                                                 } else {
                                                     None
                                                 }
                                             })
-                                            .max_by_key(|(repo_path, _, _, _)| repo_path.clone())
-                                            .map(|(_, branch_name, lines_added, lines_deleted)| (branch_name, lines_added, lines_deleted))
+                                            .max_by_key(|(repo_path, _, _, _, _)| repo_path.clone())
+                                            .map(|(_, branch_name, browser_url, lines_added, lines_deleted)| (branch_name, browser_url, lines_added, lines_deleted))
                                     });
 
                                     let pr_element = self.pr_info.get(&arena_entity.entity_id()).map(|pr| {
@@ -1420,10 +1435,12 @@ impl Render for AgentiumApp {
                                             .id(("arena-pr", arena.id))
                                             .gap_1()
                                             .items_center()
-                                            .cursor_pointer()
                                             .px_1()
                                             .rounded_sm()
-                                            .hover(|d| d.bg(colors.element_hover))
+                                            .when(is_active, |d| {
+                                                d.cursor_pointer()
+                                                    .hover(|d| d.bg(colors.element_hover))
+                                            })
                                             .child(
                                                 Icon::new(pr_icon)
                                                     .size(IconSize::XSmall)
@@ -1435,12 +1452,14 @@ impl Render for AgentiumApp {
                                                     .text_color(colors.text_muted)
                                                     .child(format!("#{}", pr.number)),
                                             )
-                                            .on_click(cx.listener(
-                                                move |_this, _event: &ClickEvent, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    cx.open_url(&url);
-                                                },
-                                            ))
+                                            .when(is_active, |d| {
+                                                d.on_click(cx.listener(
+                                                    move |_this, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        cx.open_url(&url);
+                                                    },
+                                                ))
+                                            })
                                     });
 
                                     div()
@@ -1462,6 +1481,8 @@ impl Render for AgentiumApp {
                                             let running_count = self.count_running_claudes_in_arena(arena_entity, cx);
                                             let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
                                             let has_pills = permission_count > 0 || running_count > 0 || ready_count > 0;
+                                            let project_url = git_info.as_ref()
+                                                .and_then(|(_, browser_url, _, _)| browser_url.clone());
                                             div()
                                                 .flex()
                                                 .flex_row()
@@ -1470,7 +1491,28 @@ impl Render for AgentiumApp {
                                                 .text_size(rems(0.9375))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
-                                                .when(!is_renaming, |d| d.child(arena.name.clone()))
+                                                .when(!is_renaming, |d| {
+                                                    if is_active && project_url.is_some() {
+                                                        let url = project_url.clone().unwrap();
+                                                        d.child(
+                                                            div()
+                                                                .id(("arena-name", arena.id))
+                                                                .cursor_pointer()
+                                                                .px_1()
+                                                                .rounded_sm()
+                                                                .hover(|d| d.bg(colors.element_hover))
+                                                                .child(arena.name.clone())
+                                                                .on_click(cx.listener(
+                                                                    move |_this, _event: &ClickEvent, _window, cx| {
+                                                                        cx.stop_propagation();
+                                                                        cx.open_url(&url);
+                                                                    },
+                                                                ))
+                                                        )
+                                                    } else {
+                                                        d.child(arena.name.clone())
+                                                    }
+                                                })
                                                 .when(has_pills, |d| {
                                                     let arena_entity_for_badge = arena_entity.clone();
                                                     d.child(
@@ -1519,7 +1561,7 @@ impl Render for AgentiumApp {
                                                 })
                                         })
                                         .when_some(display_path, |d, path| {
-                                            let diff_stats = git_info.as_ref().map(|(_, added, deleted)| (*added, *deleted));
+                                            let diff_stats = git_info.as_ref().map(|(_, _, added, deleted)| (*added, *deleted));
                                             d.child(
                                                 h_flex()
                                                     .gap_1()
@@ -1560,7 +1602,7 @@ impl Render for AgentiumApp {
                                                     }),
                                             )
                                         })
-                                        .when_some(git_info, |d, (branch, _, _)| {
+                                        .when_some(git_info, |d, (branch, _, _, _)| {
                                             let branch_label = branch.unwrap_or_default();
                                             if branch_label.is_empty() && pr_element.is_none() {
                                                 d
