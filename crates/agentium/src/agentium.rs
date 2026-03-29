@@ -123,6 +123,7 @@ enum PrStatus {
 #[derive(Clone, Debug)]
 struct PrInfo {
     number: u32,
+    title: SharedString,
     status: PrStatus,
     html_url: SharedString,
 }
@@ -133,6 +134,18 @@ enum CiStatus {
     Failed,
     PendingWithFailure,
     PendingClean,
+}
+
+#[derive(Clone, Debug)]
+struct CiCheckEntry {
+    name: SharedString,
+    bucket: SharedString,
+}
+
+#[derive(Clone, Debug)]
+struct CiInfo {
+    status: CiStatus,
+    checks: Vec<CiCheckEntry>,
 }
 
 pub struct AgentiumApp {
@@ -158,7 +171,7 @@ pub struct AgentiumApp {
     pr_last_checked: HashMap<EntityId, Instant>,
     pr_polling_timed_out: bool,
     _pr_poll_task: Option<Task<()>>,
-    ci_status: HashMap<EntityId, CiStatus>,
+    ci_status: HashMap<EntityId, CiInfo>,
     ci_last_checked: HashMap<EntityId, Instant>,
     ci_polling_timed_out: bool,
     _ci_poll_task: Option<Task<()>>,
@@ -1457,6 +1470,117 @@ fn repo_name_from_url(url: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+fn render_pr_tooltip(
+    pr: Option<&PrInfo>,
+    ci: Option<&CiInfo>,
+    branch: Option<&str>,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let status_colors = cx.theme().status();
+
+    let mut content = v_flex().gap_1().max_w_96();
+
+    if let Some(pr) = pr {
+        let (status_label, pr_icon, pill_bg): (SharedString, IconName, Hsla) = match pr.status {
+            PrStatus::Draft => ("Draft".into(), IconName::GitPullRequest, colors.text_muted),
+            PrStatus::Open => ("Open".into(), IconName::GitPullRequest, status_colors.success),
+            PrStatus::Merged => (
+                "Merged".into(),
+                IconName::GitPullRequest,
+                hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
+            ),
+            PrStatus::Closed => (
+                "Closed".into(),
+                IconName::GitPullRequestClosed,
+                status_colors.error,
+            ),
+            PrStatus::Conflicted => (
+                "Conflicted".into(),
+                IconName::GitMergeConflict,
+                status_colors.warning,
+            ),
+        };
+
+        let pill_bg_dark = Hsla { l: (pill_bg.l * 0.65).min(0.4), ..pill_bg };
+        let pill_text = gpui::white();
+        let status_pill = h_flex()
+            .flex_shrink_0()
+            .gap_1()
+            .items_center()
+            .px_1p5()
+            .py_0p5()
+            .rounded_full()
+            .bg(pill_bg_dark)
+            .text_color(pill_text)
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(Icon::new(pr_icon).size(IconSize::XSmall).color(Color::Custom(pill_text)))
+            .child(status_label);
+
+        content = content
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child(format!("{} #{}", pr.title, pr.number)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(status_pill)
+                    .when_some(branch, |d, branch| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .flex_shrink()
+                                .truncate()
+                                .text_xs()
+                                .text_color(colors.text_muted)
+                                .child(branch.to_string()),
+                        )
+                    }),
+            );
+    }
+
+    if let Some(ci) = ci {
+        if !ci.checks.is_empty() {
+            let mut checks_list = v_flex().gap_0p5().pt_1();
+            for check in &ci.checks {
+                let (icon, color) = match check.bucket.as_ref() {
+                    "pass" => (IconName::Check, status_colors.success),
+                    "fail" => (IconName::XCircleFilled, status_colors.error),
+                    "pending" => (IconName::XCircleFilled, status_colors.warning),
+                    "skipping" => (IconName::Slash, colors.text_muted),
+                    _ => (IconName::XCircleFilled, colors.text_muted),
+                };
+                checks_list = checks_list.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(icon)
+                                .size(IconSize::XSmall)
+                                .color(Color::Custom(color)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(colors.text_muted)
+                                .child(check.name.clone()),
+                        ),
+                );
+            }
+            content = content.child(checks_list);
+        }
+    }
+
+    content.into_any_element()
+}
+
 fn remote_url_to_browser_url(url: &str) -> Option<String> {
     let url = url.strip_suffix(".git").unwrap_or(url).trim_end_matches('/');
     if url.starts_with("https://") || url.starts_with("http://") {
@@ -1477,7 +1601,7 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
             "pr",
             "view",
             "--json",
-            "number,state,mergeable,isDraft,url",
+            "number,title,state,mergeable,isDraft,url",
         ])
         .output()
         .await?;
@@ -1493,6 +1617,7 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
     #[derive(serde::Deserialize)]
     struct GhPrView {
         number: u32,
+        title: String,
         state: String,
         mergeable: String,
         #[serde(rename = "isDraft")]
@@ -1516,6 +1641,7 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
 
     Ok(Some(PrInfo {
         number: pr.number,
+        title: pr.title.into(),
         status,
         html_url: pr.url.into(),
     }))
@@ -1524,7 +1650,7 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
 async fn fetch_ci_status(
     working_dir: &std::path::Path,
     pr_number: u32,
-) -> anyhow::Result<Option<CiStatus>> {
+) -> anyhow::Result<Option<CiInfo>> {
     let output = smol::process::Command::new("gh")
         .current_dir(working_dir)
         .args(&[
@@ -1546,11 +1672,12 @@ async fn fetch_ci_status(
     }
 
     #[derive(serde::Deserialize)]
-    struct CheckEntry {
+    struct GhCheckEntry {
+        name: String,
         bucket: String,
     }
 
-    let checks: Vec<CheckEntry> = serde_json::from_slice(&output.stdout)?;
+    let checks: Vec<GhCheckEntry> = serde_json::from_slice(&output.stdout)?;
     if checks.is_empty() {
         return Ok(None);
     }
@@ -1573,7 +1700,18 @@ async fn fetch_ci_status(
         CiStatus::Failed
     };
 
-    Ok(Some(status))
+    let entries = checks
+        .into_iter()
+        .map(|c| CiCheckEntry {
+            name: c.name.into(),
+            bucket: c.bucket.into(),
+        })
+        .collect();
+
+    Ok(Some(CiInfo {
+        status,
+        checks: entries,
+    }))
 }
 
 impl Focusable for AgentiumApp {
@@ -1696,14 +1834,19 @@ impl Render for AgentiumApp {
                                     });
 
                                     let ci_icon_element = self.ci_status.get(&arena_entity.entity_id()).map(|ci| {
-                                        let (icon, color) = match ci {
+                                        let (icon, color) = match &ci.status {
                                             CiStatus::AllPassed => (IconName::TodoComplete, status_colors.success),
                                             CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
                                             CiStatus::PendingWithFailure => (IconName::ArrowCircle, status_colors.error),
                                             CiStatus::PendingClean => (IconName::ArrowCircle, status_colors.warning),
                                         };
-                                        Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(color))
+                                        Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
                                     });
+
+                                    let tooltip_pr = self.pr_info.get(&arena_entity.entity_id()).cloned();
+                                    let tooltip_ci = self.ci_status.get(&arena_entity.entity_id()).cloned();
+                                    let tooltip_branch = git_info.as_ref()
+                                        .and_then(|(branch, _, _, _)| branch.clone());
 
                                     let pr_element = self.pr_info.get(&arena_entity.entity_id()).map(|pr| {
                                         let pr_color = match pr.status {
@@ -1734,16 +1877,29 @@ impl Render for AgentiumApp {
                                             })
                                             .child(
                                                 Icon::new(pr_icon)
-                                                    .size(IconSize::XSmall)
+                                                    .size(IconSize::Small)
                                                     .color(Color::Custom(pr_color)),
                                             )
                                             .child(
                                                 div()
-                                                    .text_xs()
+                                                    .text_sm()
                                                     .text_color(colors.text_muted)
                                                     .child(format!("#{}", pr.number)),
                                             )
                                             .when_some(ci_icon_element, |d, icon| d.child(icon))
+                                            .tooltip(Tooltip::element({
+                                                let tooltip_pr = tooltip_pr.clone();
+                                                let tooltip_ci = tooltip_ci.clone();
+                                                let tooltip_branch = tooltip_branch.clone();
+                                                move |_window, cx| {
+                                                    render_pr_tooltip(
+                                                        tooltip_pr.as_ref(),
+                                                        tooltip_ci.as_ref(),
+                                                        tooltip_branch.as_deref(),
+                                                        cx,
+                                                    )
+                                                }
+                                            }))
                                             .when(is_active, |d| {
                                                 d.on_click(cx.listener(
                                                     move |_this, _event: &ClickEvent, _window, cx| {
