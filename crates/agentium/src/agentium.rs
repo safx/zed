@@ -1382,14 +1382,21 @@ impl Render for AgentiumApp {
                                                 let repo_path = &repo.work_directory_abs_path;
                                                 if working_dir.starts_with(repo_path.as_ref()) {
                                                     let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
-                                                    let summary = repo.status_summary();
-                                                    Some((repo_path.clone(), branch_name, summary))
+                                                    let (lines_added, lines_deleted) = repo.cached_status()
+                                                        .fold((0u32, 0u32), |(added, deleted), entry| {
+                                                            if let Some(stat) = &entry.diff_stat {
+                                                                (added + stat.added, deleted + stat.deleted)
+                                                            } else {
+                                                                (added, deleted)
+                                                            }
+                                                        });
+                                                    Some((repo_path.clone(), branch_name, lines_added, lines_deleted))
                                                 } else {
                                                     None
                                                 }
                                             })
-                                            .max_by_key(|(repo_path, _, _)| repo_path.clone())
-                                            .map(|(_, branch_name, summary)| (branch_name, summary))
+                                            .max_by_key(|(repo_path, _, _, _)| repo_path.clone())
+                                            .map(|(_, branch_name, lines_added, lines_deleted)| (branch_name, lines_added, lines_deleted))
                                     });
 
                                     let pr_element = self.pr_info.get(&arena_entity.entity_id()).map(|pr| {
@@ -1512,6 +1519,7 @@ impl Render for AgentiumApp {
                                                 })
                                         })
                                         .when_some(display_path, |d, path| {
+                                            let diff_stats = git_info.as_ref().map(|(_, added, deleted)| (*added, *deleted));
                                             d.child(
                                                 h_flex()
                                                     .gap_1()
@@ -1526,28 +1534,35 @@ impl Render for AgentiumApp {
                                                             .text_xs()
                                                             .text_color(colors.text_muted)
                                                             .child(path),
-                                                    ),
+                                                    )
+                                                    .child(div().flex_grow())
+                                                    .when_some(diff_stats, |d, (added, deleted)| {
+                                                        d.child(
+                                                            h_flex()
+                                                                .flex_shrink_0()
+                                                                .gap_1()
+                                                                .text_xs()
+                                                                .when(added > 0, |d| {
+                                                                    d.child(
+                                                                        div()
+                                                                            .text_color(status_colors.created)
+                                                                            .child(format!("+{added}")),
+                                                                    )
+                                                                })
+                                                                .when(deleted > 0, |d| {
+                                                                    d.child(
+                                                                        div()
+                                                                            .text_color(status_colors.deleted)
+                                                                            .child(format!("-{deleted}")),
+                                                                    )
+                                                                }),
+                                                        )
+                                                    }),
                                             )
                                         })
-                                        .when_some(git_info, |d, (branch, summary)| {
-                                            use std::fmt::Write;
+                                        .when_some(git_info, |d, (branch, _, _)| {
                                             let branch_label = branch.unwrap_or_default();
-                                            let mut diff_label = String::new();
-                                            let added = summary.index.added + summary.worktree.added + summary.untracked;
-                                            let modified = summary.index.modified + summary.worktree.modified;
-                                            let deleted = summary.index.deleted + summary.worktree.deleted;
-                                            if added > 0 {
-                                                write!(&mut diff_label, "+{added}").ok();
-                                            }
-                                            if modified > 0 {
-                                                if !diff_label.is_empty() { diff_label.push_str(" "); }
-                                                write!(&mut diff_label, "~{modified}").ok();
-                                            }
-                                            if deleted > 0 {
-                                                if !diff_label.is_empty() { diff_label.push_str(" "); }
-                                                write!(&mut diff_label, "-{deleted}").ok();
-                                            }
-                                            if branch_label.is_empty() && diff_label.is_empty() && pr_element.is_none() {
+                                            if branch_label.is_empty() && pr_element.is_none() {
                                                 d
                                             } else {
                                                 d.child(
@@ -1563,15 +1578,6 @@ impl Render for AgentiumApp {
                                                                     .text_color(colors.text_muted)
                                                                     .truncate()
                                                                     .child(branch_label),
-                                                            )
-                                                        })
-                                                        .when(!diff_label.is_empty(), |d| {
-                                                            d.child(
-                                                                div()
-                                                                    .flex_shrink_0()
-                                                                    .text_xs()
-                                                                    .text_color(colors.text_muted)
-                                                                    .child(diff_label),
                                                             )
                                                         })
                                                         .when_some(pr_element, |d, el| {
