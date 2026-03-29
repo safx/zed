@@ -263,14 +263,60 @@ impl Render for GitStatusView {
                                                     )),
                                                 )
                                                 .child(git_status_icon(status_entry.status))
-                                                .child(SharedString::from(
-                                                    status_entry
-                                                        .repo_path
-                                                        .display(
-                                                            util::paths::PathStyle::Posix,
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_shrink()
+                                                        .truncate()
+                                                        .child(SharedString::from(
+                                                            status_entry
+                                                                .repo_path
+                                                                .display(
+                                                                    util::paths::PathStyle::Posix,
+                                                                )
+                                                                .to_string(),
+                                                        )),
+                                                )
+                                                .child(div().flex_grow())
+                                                .when_some(
+                                                    status_entry.diff_stat,
+                                                    |d, stat| {
+                                                        let status_colors =
+                                                            cx.theme().status();
+                                                        d.child(
+                                                            h_flex()
+                                                                .flex_shrink_0()
+                                                                .gap_2()
+                                                                .text_xs()
+                                                                .when(stat.added > 0, |d| {
+                                                                    d.child(
+                                                                        div()
+                                                                            .text_color(
+                                                                                status_colors
+                                                                                    .created,
+                                                                            )
+                                                                            .child(format!(
+                                                                                "+{}",
+                                                                                stat.added
+                                                                            )),
+                                                                    )
+                                                                })
+                                                                .when(stat.deleted > 0, |d| {
+                                                                    d.child(
+                                                                        div()
+                                                                            .text_color(
+                                                                                status_colors
+                                                                                    .deleted,
+                                                                            )
+                                                                            .child(format!(
+                                                                                "-{}",
+                                                                                stat.deleted
+                                                                            )),
+                                                                    )
+                                                                }),
                                                         )
-                                                        .to_string(),
-                                                ))
+                                                    },
+                                                )
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
                                                         this.open_entry(ix, window, cx);
