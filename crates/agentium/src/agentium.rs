@@ -127,6 +127,14 @@ struct PrInfo {
     html_url: SharedString,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum CiStatus {
+    AllPassed,
+    Failed,
+    PendingWithFailure,
+    PendingClean,
+}
+
 pub struct AgentiumApp {
     arenas: Vec<Entity<Arena>>,
     active_arena_index: Option<usize>,
@@ -150,6 +158,10 @@ pub struct AgentiumApp {
     pr_last_checked: HashMap<EntityId, Instant>,
     pr_polling_timed_out: bool,
     _pr_poll_task: Option<Task<()>>,
+    ci_status: HashMap<EntityId, CiStatus>,
+    ci_last_checked: HashMap<EntityId, Instant>,
+    ci_polling_timed_out: bool,
+    _ci_poll_task: Option<Task<()>>,
     _window_activation_subscription: gpui::Subscription,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
@@ -184,8 +196,15 @@ impl AgentiumApp {
                     {
                         this.start_pr_polling(cx);
                     }
+                    if this.gh_available
+                        && this._ci_poll_task.is_none()
+                        && !this.ci_polling_timed_out
+                    {
+                        this.start_ci_polling(cx);
+                    }
                 } else {
                     this._pr_poll_task = None;
+                    this._ci_poll_task = None;
                 }
             });
 
@@ -205,6 +224,7 @@ impl AgentiumApp {
                 this.gh_available = available;
                 if available {
                     this.start_pr_polling(cx);
+                    this.start_ci_polling(cx);
                 }
             })
             .ok();
@@ -233,6 +253,10 @@ impl AgentiumApp {
             pr_last_checked: HashMap::new(),
             pr_polling_timed_out: false,
             _pr_poll_task: None,
+            ci_status: HashMap::new(),
+            ci_last_checked: HashMap::new(),
+            ci_polling_timed_out: false,
+            _ci_poll_task: None,
             _window_activation_subscription: window_activation_subscription,
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
@@ -317,14 +341,28 @@ impl AgentiumApp {
             self.arenas[index].update(cx, |arena, cx| {
                 arena.activate_context(cx);
             });
-            if self.gh_available && !self.pr_polling_timed_out {
+            if self.gh_available {
                 let entity_id = self.arenas[index].entity_id();
-                let stale = self
-                    .pr_last_checked
-                    .get(&entity_id)
-                    .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
-                if stale {
-                    self.fetch_pr_for_arena(entity_id, cx);
+                if !self.pr_polling_timed_out {
+                    let pr_stale = self
+                        .pr_last_checked
+                        .get(&entity_id)
+                        .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
+                    if pr_stale {
+                        self.fetch_pr_for_arena(entity_id, cx);
+                    }
+                }
+                if !self.ci_polling_timed_out {
+                    if let Some(pr) = self.pr_info.get(&entity_id) {
+                        let pr_number = pr.number;
+                        let ci_stale = self
+                            .ci_last_checked
+                            .get(&entity_id)
+                            .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
+                        if ci_stale {
+                            self.fetch_ci_for_arena(entity_id, pr_number, cx);
+                        }
+                    }
                 }
             }
             let focus = self.arenas[index].focus_handle(cx);
@@ -370,7 +408,12 @@ impl AgentiumApp {
                             this.pr_last_checked.insert(entity_id, Instant::now());
                             match result {
                                 Ok(Some(info)) => {
+                                    let pr_number = info.number;
+                                    let had_pr = this.pr_info.contains_key(&entity_id);
                                     this.pr_info.insert(entity_id, info);
+                                    if !had_pr && !this.ci_polling_timed_out {
+                                        this.fetch_ci_for_arena(entity_id, pr_number, cx);
+                                    }
                                 }
                                 Ok(None) | Err(_) => {
                                     this.pr_info.remove(&entity_id);
@@ -416,7 +459,12 @@ impl AgentiumApp {
                 this.pr_last_checked.insert(entity_id, Instant::now());
                 match result {
                     Ok(Some(info)) => {
+                        let pr_number = info.number;
+                        let had_pr = this.pr_info.contains_key(&entity_id);
                         this.pr_info.insert(entity_id, info);
+                        if !had_pr && !this.ci_polling_timed_out {
+                            this.fetch_ci_for_arena(entity_id, pr_number, cx);
+                        }
                     }
                     Ok(None) | Err(_) => {
                         this.pr_info.remove(&entity_id);
@@ -427,6 +475,182 @@ impl AgentiumApp {
             .ok();
         })
         .detach();
+    }
+
+    fn start_ci_polling(&mut self, cx: &mut Context<Self>) {
+        self._ci_poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let targets = this
+                    .update(cx, |this, cx| {
+                        let mut targets = Vec::new();
+                        for arena in &this.arenas {
+                            let entity_id = arena.entity_id();
+                            let Some(pr) = this.pr_info.get(&entity_id) else {
+                                continue;
+                            };
+                            let pr_number = pr.number;
+
+                            let interval = this.compute_ci_poll_interval(entity_id, cx);
+                            let last = this.ci_last_checked.get(&entity_id).copied();
+                            let due = last.map_or(true, |t| t.elapsed() >= interval);
+
+                            if due {
+                                if let Some(working_dir) =
+                                    arena.read(cx).working_directory.clone()
+                                {
+                                    targets.push((entity_id, working_dir, pr_number));
+                                }
+                            }
+                        }
+                        targets
+                    })
+                    .unwrap_or_default();
+
+                let mut should_stop = false;
+                for (entity_id, working_dir, pr_number) in targets {
+                    let start = Instant::now();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            fetch_ci_status(&working_dir, pr_number).await
+                        })
+                        .await;
+                    let elapsed = start.elapsed();
+
+                    should_stop = this
+                        .update(cx, |this, cx| {
+                            if elapsed > Duration::from_secs(5) {
+                                this.ci_polling_timed_out = true;
+                                this._ci_poll_task = None;
+                                return true;
+                            }
+                            this.ci_last_checked.insert(entity_id, Instant::now());
+                            match result {
+                                Ok(Some(status)) => {
+                                    this.ci_status.insert(entity_id, status);
+                                }
+                                Ok(None) | Err(_) => {
+                                    this.ci_status.remove(&entity_id);
+                                }
+                            }
+                            cx.notify();
+                            false
+                        })
+                        .unwrap_or(true);
+
+                    if should_stop {
+                        break;
+                    }
+                }
+
+                if should_stop {
+                    break;
+                }
+
+                let sleep_duration = this
+                    .update(cx, |this, cx| {
+                        let mut min_remaining = Duration::from_secs(60);
+                        for arena in &this.arenas {
+                            let entity_id = arena.entity_id();
+                            if this.pr_info.contains_key(&entity_id) {
+                                let interval =
+                                    this.compute_ci_poll_interval(entity_id, cx);
+                                let elapsed = this
+                                    .ci_last_checked
+                                    .get(&entity_id)
+                                    .map_or(Duration::ZERO, |t| t.elapsed());
+                                let remaining = interval.saturating_sub(elapsed);
+                                min_remaining = min_remaining.min(remaining);
+                            }
+                        }
+                        min_remaining.max(Duration::from_secs(10))
+                    })
+                    .unwrap_or(Duration::from_secs(60));
+
+                cx.background_executor().timer(sleep_duration).await;
+
+                if this.update(cx, |_, _| {}).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn fetch_ci_for_arena(
+        &mut self,
+        entity_id: EntityId,
+        pr_number: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let working_dir = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)
+            .and_then(|a| a.read(cx).working_directory.clone());
+        let Some(working_dir) = working_dir else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_ci_status(&working_dir, pr_number).await })
+                .await;
+            this.update(cx, |this, cx| {
+                this.ci_last_checked.insert(entity_id, Instant::now());
+                match result {
+                    Ok(Some(status)) => {
+                        this.ci_status.insert(entity_id, status);
+                    }
+                    Ok(None) | Err(_) => {
+                        this.ci_status.remove(&entity_id);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn compute_ci_poll_interval(&self, entity_id: EntityId, cx: &App) -> Duration {
+        let timestamp = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)
+            .and_then(|arena| {
+                let working_dir = arena.read(cx).working_directory.as_ref()?;
+                let git_store = self.project.read(cx).git_store().read(cx);
+                git_store
+                    .repositories()
+                    .values()
+                    .filter_map(|repo| {
+                        let repo = repo.read(cx);
+                        if working_dir.starts_with(repo.work_directory_abs_path.as_ref()) {
+                            repo.head_commit.as_ref().map(|c| {
+                                (repo.work_directory_abs_path.clone(), c.commit_timestamp)
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by_key(|(path, _)| path.clone())
+                    .map(|(_, ts)| ts)
+            });
+
+        let Some(timestamp) = timestamp else {
+            return Duration::from_secs(60);
+        };
+
+        let now = chrono::Utc::now().timestamp();
+        let age_secs = now - timestamp;
+        if age_secs <= 3600 {
+            Duration::from_secs(60)
+        } else if age_secs <= 86400 {
+            Duration::from_secs(180)
+        } else {
+            Duration::from_secs(300)
+        }
     }
 
     fn resolve_arena_name(
@@ -572,6 +796,8 @@ impl AgentiumApp {
         self._arena_subscriptions.remove(&entity_id);
         self.pr_info.remove(&entity_id);
         self.pr_last_checked.remove(&entity_id);
+        self.ci_status.remove(&entity_id);
+        self.ci_last_checked.remove(&entity_id);
         self.arenas.remove(index);
 
         if self.arenas.is_empty() {
@@ -1295,6 +1521,61 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
     }))
 }
 
+async fn fetch_ci_status(
+    working_dir: &std::path::Path,
+    pr_number: u32,
+) -> anyhow::Result<Option<CiStatus>> {
+    let output = smol::process::Command::new("gh")
+        .current_dir(working_dir)
+        .args(&[
+            "pr",
+            "checks",
+            &pr_number.to_string(),
+            "--json",
+            "name,bucket",
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            log::warn!("gh pr checks failed: {stderr}");
+        }
+        return Ok(None);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CheckEntry {
+        bucket: String,
+    }
+
+    let checks: Vec<CheckEntry> = serde_json::from_slice(&output.stdout)?;
+    if checks.is_empty() {
+        return Ok(None);
+    }
+
+    let has_pending = checks.iter().any(|c| c.bucket == "pending");
+    let has_fail = checks.iter().any(|c| c.bucket == "fail");
+    let all_passed = checks
+        .iter()
+        .all(|c| c.bucket == "pass" || c.bucket == "skipping");
+
+    let status = if has_pending {
+        if has_fail {
+            CiStatus::PendingWithFailure
+        } else {
+            CiStatus::PendingClean
+        }
+    } else if all_passed {
+        CiStatus::AllPassed
+    } else {
+        CiStatus::Failed
+    };
+
+    Ok(Some(status))
+}
+
 impl Focusable for AgentiumApp {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1414,6 +1695,16 @@ impl Render for AgentiumApp {
                                             .map(|(_, branch_name, browser_url, lines_added, lines_deleted)| (branch_name, browser_url, lines_added, lines_deleted))
                                     });
 
+                                    let ci_icon_element = self.ci_status.get(&arena_entity.entity_id()).map(|ci| {
+                                        let (icon, color) = match ci {
+                                            CiStatus::AllPassed => (IconName::TodoComplete, status_colors.success),
+                                            CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
+                                            CiStatus::PendingWithFailure => (IconName::ArrowCircle, status_colors.error),
+                                            CiStatus::PendingClean => (IconName::ArrowCircle, status_colors.warning),
+                                        };
+                                        Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(color))
+                                    });
+
                                     let pr_element = self.pr_info.get(&arena_entity.entity_id()).map(|pr| {
                                         let pr_color = match pr.status {
                                             PrStatus::Draft => colors.text_muted,
@@ -1452,6 +1743,7 @@ impl Render for AgentiumApp {
                                                     .text_color(colors.text_muted)
                                                     .child(format!("#{}", pr.number)),
                                             )
+                                            .when_some(ci_icon_element, |d, icon| d.child(icon))
                                             .when(is_active, |d| {
                                                 d.on_click(cx.listener(
                                                     move |_this, _event: &ClickEvent, _window, cx| {
