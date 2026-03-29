@@ -169,6 +169,8 @@ pub enum IconName {
     GitCommit,
     GitGraph,
     GitMergeConflict,
+    GitPullRequest,
+    GitPullRequestClosed,
     GitWorktree,
     Gitea,
     Github,

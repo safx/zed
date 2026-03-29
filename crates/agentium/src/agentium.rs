@@ -111,6 +111,22 @@ impl SharedSessionState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum PrStatus {
+    Draft,
+    Open,
+    Merged,
+    Closed,
+    Conflicted,
+}
+
+#[derive(Clone, Debug)]
+struct PrInfo {
+    number: u32,
+    status: PrStatus,
+    html_url: SharedString,
+}
+
 pub struct AgentiumApp {
     arenas: Vec<Entity<Arena>>,
     active_arena_index: Option<usize>,
@@ -129,6 +145,12 @@ pub struct AgentiumApp {
     should_move_window: bool,
     rate_limits: Option<RateLimits>,
     _rate_limits_refresh_task: Option<Task<()>>,
+    gh_available: bool,
+    pr_info: HashMap<EntityId, PrInfo>,
+    pr_last_checked: HashMap<EntityId, Instant>,
+    pr_polling_timed_out: bool,
+    _pr_poll_task: Option<Task<()>>,
+    _window_activation_subscription: gpui::Subscription,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
 }
@@ -153,6 +175,42 @@ impl AgentiumApp {
             }
         }).detach();
 
+        let window_activation_subscription =
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    if this.gh_available
+                        && this._pr_poll_task.is_none()
+                        && !this.pr_polling_timed_out
+                    {
+                        this.start_pr_polling(cx);
+                    }
+                } else {
+                    this._pr_poll_task = None;
+                }
+            });
+
+        cx.spawn(async move |this, cx| {
+            let available = cx
+                .background_executor()
+                .spawn(async {
+                    smol::process::Command::new("gh")
+                        .args(&["--version"])
+                        .output()
+                        .await
+                        .map(|output| output.status.success())
+                        .unwrap_or(false)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.gh_available = available;
+                if available {
+                    this.start_pr_polling(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+
         Self {
             arenas: Vec::new(),
             active_arena_index: None,
@@ -170,6 +228,12 @@ impl AgentiumApp {
             rate_limits: None,
             _rate_limits_refresh_task: None,
             session_state: SharedSessionState::new(),
+            gh_available: false,
+            pr_info: HashMap::new(),
+            pr_last_checked: HashMap::new(),
+            pr_polling_timed_out: false,
+            _pr_poll_task: None,
+            _window_activation_subscription: window_activation_subscription,
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
         }
@@ -239,6 +303,9 @@ impl AgentiumApp {
         arena_entity.update(cx, |arena, cx| {
             arena.activate_context(cx);
         });
+        if self.gh_available && !self.pr_polling_timed_out {
+            self.fetch_pr_for_arena(arena_entity.entity_id(), cx);
+        }
         let focus = arena_entity.focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
@@ -250,6 +317,16 @@ impl AgentiumApp {
             self.arenas[index].update(cx, |arena, cx| {
                 arena.activate_context(cx);
             });
+            if self.gh_available && !self.pr_polling_timed_out {
+                let entity_id = self.arenas[index].entity_id();
+                let stale = self
+                    .pr_last_checked
+                    .get(&entity_id)
+                    .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
+                if stale {
+                    self.fetch_pr_for_arena(entity_id, cx);
+                }
+            }
             let focus = self.arenas[index].focus_handle(cx);
             focus.focus(window, cx);
             cx.notify();
@@ -259,6 +336,97 @@ impl AgentiumApp {
     fn active_arena(&self) -> Option<&Entity<Arena>> {
         self.active_arena_index
             .and_then(|i| self.arenas.get(i))
+    }
+
+    fn start_pr_polling(&mut self, cx: &mut Context<Self>) {
+        self._pr_poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let fetch_info = this
+                    .update(cx, |this, cx| {
+                        this.active_arena().and_then(|arena| {
+                            let arena_ref = arena.read(cx);
+                            let working_dir = arena_ref.working_directory.clone()?;
+                            Some((arena.entity_id(), working_dir))
+                        })
+                    })
+                    .ok()
+                    .flatten();
+
+                if let Some((entity_id, working_dir)) = fetch_info {
+                    let start = Instant::now();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { fetch_pr_info(&working_dir).await })
+                        .await;
+                    let elapsed = start.elapsed();
+
+                    let should_stop = this
+                        .update(cx, |this, cx| {
+                            if elapsed > Duration::from_secs(5) {
+                                this.pr_polling_timed_out = true;
+                                this._pr_poll_task = None;
+                                return true;
+                            }
+                            this.pr_last_checked.insert(entity_id, Instant::now());
+                            match result {
+                                Ok(Some(info)) => {
+                                    this.pr_info.insert(entity_id, info);
+                                }
+                                Ok(None) | Err(_) => {
+                                    this.pr_info.remove(&entity_id);
+                                }
+                            }
+                            cx.notify();
+                            false
+                        })
+                        .unwrap_or(true);
+
+                    if should_stop {
+                        break;
+                    }
+                }
+
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+
+                if this.update(cx, |_, _| {}).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn fetch_pr_for_arena(&mut self, entity_id: EntityId, cx: &mut Context<Self>) {
+        let working_dir = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)
+            .and_then(|a| a.read(cx).working_directory.clone());
+        let Some(working_dir) = working_dir else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_pr_info(&working_dir).await })
+                .await;
+            this.update(cx, |this, cx| {
+                this.pr_last_checked.insert(entity_id, Instant::now());
+                match result {
+                    Ok(Some(info)) => {
+                        this.pr_info.insert(entity_id, info);
+                    }
+                    Ok(None) | Err(_) => {
+                        this.pr_info.remove(&entity_id);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn resolve_arena_name(
@@ -400,8 +568,10 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.arenas.iter().position(|ws| ws == workspace) else { return };
-        self._arena_subscriptions
-            .remove(&workspace.entity_id());
+        let entity_id = workspace.entity_id();
+        self._arena_subscriptions.remove(&entity_id);
+        self.pr_info.remove(&entity_id);
+        self.pr_last_checked.remove(&entity_id);
         self.arenas.remove(index);
 
         if self.arenas.is_empty() {
@@ -1061,6 +1231,57 @@ fn repo_name_from_url(url: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<PrInfo>> {
+    let output = smol::process::Command::new("gh")
+        .current_dir(working_dir)
+        .args(&[
+            "pr",
+            "view",
+            "--json",
+            "number,state,mergeable,isDraft,url",
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("no pull requests found") {
+            log::warn!("gh pr view failed: {stderr}");
+        }
+        return Ok(None);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GhPrView {
+        number: u32,
+        state: String,
+        mergeable: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+        url: String,
+    }
+
+    let pr: GhPrView = serde_json::from_slice(&output.stdout)?;
+
+    let status = if pr.mergeable == "CONFLICTING" {
+        PrStatus::Conflicted
+    } else if pr.is_draft {
+        PrStatus::Draft
+    } else {
+        match pr.state.as_str() {
+            "MERGED" => PrStatus::Merged,
+            "CLOSED" => PrStatus::Closed,
+            _ => PrStatus::Open,
+        }
+    };
+
+    Ok(Some(PrInfo {
+        number: pr.number,
+        status,
+        html_url: pr.url.into(),
+    }))
+}
+
 impl Focusable for AgentiumApp {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1096,10 +1317,7 @@ impl Render for AgentiumApp {
                             .id("agentium-title")
                             .pl(px(78.0))
                             .pr_2()
-                            .py_2()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(colors.text)
+                            .h(px(36.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, _| {
@@ -1125,8 +1343,7 @@ impl Render for AgentiumApp {
                                 if event.click_count() == 2 {
                                     window.titlebar_double_click();
                                 }
-                            })
-                            .child("Agentium"),
+                            }),
                     )
                     .child(
                         div()
@@ -1143,6 +1360,7 @@ impl Render for AgentiumApp {
                                 |(i, arena_entity)| {
                                     let arena = arena_entity.read(cx);
                                     let is_active = Some(i) == active_index;
+                                    let status_colors = cx.theme().status();
 
                                     let effective_path = arena.working_directory.clone().or_else(|| {
                                         self.project
@@ -1174,6 +1392,50 @@ impl Render for AgentiumApp {
                                             .map(|(_, branch_name, summary)| (branch_name, summary))
                                     });
 
+                                    let pr_element = self.pr_info.get(&arena_entity.entity_id()).map(|pr| {
+                                        let pr_color = match pr.status {
+                                            PrStatus::Draft => colors.text_muted,
+                                            PrStatus::Open => status_colors.success,
+                                            // No semantic purple in StatusColors; matches GitHub's merge color
+                                            PrStatus::Merged => hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
+                                            PrStatus::Closed => status_colors.error,
+                                            PrStatus::Conflicted => status_colors.warning,
+                                        };
+                                        let pr_icon = match pr.status {
+                                            PrStatus::Draft | PrStatus::Open | PrStatus::Merged => {
+                                                IconName::GitPullRequest
+                                            }
+                                            PrStatus::Closed => IconName::GitPullRequestClosed,
+                                            PrStatus::Conflicted => IconName::GitMergeConflict,
+                                        };
+                                        let url = pr.html_url.clone();
+                                        h_flex()
+                                            .id(("arena-pr", arena.id))
+                                            .gap_1()
+                                            .items_center()
+                                            .cursor_pointer()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .hover(|d| d.bg(colors.element_hover))
+                                            .child(
+                                                Icon::new(pr_icon)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Custom(pr_color)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(colors.text_muted)
+                                                    .child(format!("#{}", pr.number)),
+                                            )
+                                            .on_click(cx.listener(
+                                                move |_this, _event: &ClickEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.open_url(&url);
+                                                },
+                                            ))
+                                    });
+
                                     div()
                                         .id(("arena", arena.id))
                                         .px_2()
@@ -1198,13 +1460,12 @@ impl Render for AgentiumApp {
                                                 .flex_row()
                                                 .items_center()
                                                 .justify_between()
-                                                .text_sm()
+                                                .text_size(rems(0.9375))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
                                                 .when(!is_renaming, |d| d.child(arena.name.clone()))
                                                 .when(has_pills, |d| {
                                                     let arena_entity_for_badge = arena_entity.clone();
-                                                    let status_colors = cx.theme().status();
                                                     d.child(
                                                         h_flex()
                                                             .gap_0p5()
@@ -1252,41 +1513,70 @@ impl Render for AgentiumApp {
                                         })
                                         .when_some(display_path, |d, path| {
                                             d.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(colors.text_muted)
-                                                    .child(path),
+                                                h_flex()
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .child(
+                                                        Icon::new(IconName::Folder)
+                                                            .size(IconSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(colors.text_muted)
+                                                            .child(path),
+                                                    ),
                                             )
                                         })
                                         .when_some(git_info, |d, (branch, summary)| {
                                             use std::fmt::Write;
-                                            let mut label = String::new();
-                                            if let Some(branch_name) = branch {
-                                                write!(&mut label, "\u{2387} {branch_name}").ok();
-                                            }
+                                            let branch_label = branch.unwrap_or_default();
+                                            let mut diff_label = String::new();
                                             let added = summary.index.added + summary.worktree.added + summary.untracked;
                                             let modified = summary.index.modified + summary.worktree.modified;
                                             let deleted = summary.index.deleted + summary.worktree.deleted;
                                             if added > 0 {
-                                                if !label.is_empty() { label.push_str("  "); }
-                                                write!(&mut label, "+{added}").ok();
+                                                write!(&mut diff_label, "+{added}").ok();
                                             }
                                             if modified > 0 {
-                                                if !label.is_empty() { label.push_str("  "); }
-                                                write!(&mut label, "~{modified}").ok();
+                                                if !diff_label.is_empty() { diff_label.push_str(" "); }
+                                                write!(&mut diff_label, "~{modified}").ok();
                                             }
                                             if deleted > 0 {
-                                                if !label.is_empty() { label.push_str("  "); }
-                                                write!(&mut label, "-{deleted}").ok();
+                                                if !diff_label.is_empty() { diff_label.push_str(" "); }
+                                                write!(&mut diff_label, "-{deleted}").ok();
                                             }
-                                            if label.is_empty() {
+                                            if branch_label.is_empty() && diff_label.is_empty() && pr_element.is_none() {
                                                 d
                                             } else {
                                                 d.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(colors.text_muted)
-                                                        .child(label),
+                                                    h_flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .when(!branch_label.is_empty(), |d| {
+                                                            d.child(
+                                                                div()
+                                                                    .min_w_0()
+                                                                    .flex_shrink()
+                                                                    .text_xs()
+                                                                    .text_color(colors.text_muted)
+                                                                    .truncate()
+                                                                    .child(branch_label),
+                                                            )
+                                                        })
+                                                        .when(!diff_label.is_empty(), |d| {
+                                                            d.child(
+                                                                div()
+                                                                    .flex_shrink_0()
+                                                                    .text_xs()
+                                                                    .text_color(colors.text_muted)
+                                                                    .child(diff_label),
+                                                            )
+                                                        })
+                                                        .when_some(pr_element, |d, el| {
+                                                            d.child(div().flex_grow()).child(el)
+                                                        }),
                                                 )
                                             }
                                         })
