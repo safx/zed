@@ -102,6 +102,16 @@ Agentium creates its `Workspace` entity with `Workspace::new(None, ...)`, so `da
 
 Any feature that needs data in `WorkspaceDb` (e.g. recent projects list) must write to the DB explicitly using `WorkspaceDb::global(cx)` methods like `save_local_workspace_paths()`. Do not rely on Zed's event-driven serialization (`WorktreeAdded` → `serialize_workspace()`) — it is a no-op in Agentium.
 
+## GitHub PR and CI polling requires `gh` CLI and chains data dependencies
+
+PR and CI status polling uses the `gh` CLI. At startup, `gh --version` is checked; if unavailable, all PR/CI features are disabled (`gh_available = false`).
+
+Data flows in a chain: PR info must exist before CI polling can run. When `fetch_pr_for_arena` or the PR polling loop inserts a **new** PR entry (`!had_pr`), it immediately triggers `fetch_ci_for_arena` for that arena. Without this chain, CI data would be delayed until the next CI polling cycle (up to 60 seconds).
+
+Both PR and CI polling tasks are dropped on window deactivation and restarted on reactivation. A 5-second timeout guard on any `gh` subprocess permanently disables the respective polling loop for the session (`pr_polling_timed_out` / `ci_polling_timed_out`).
+
+CI polling interval is adaptive based on HEAD commit age: <=1 hour → 60s, <=1 day → 180s, >1 day → 300s. The interval is computed on-the-fly via `compute_ci_poll_interval()` using `repo.head_commit.commit_timestamp`, not cached in a HashMap.
+
 ## TERM_PROGRAM is derived from the binary name
 
 `terminal::insert_zed_terminal_env` uses `std::env::current_exe()` to determine the value of `TERM_PROGRAM`. When the running binary is `agentium` (including inside `Agentium.app/Contents/MacOS/agentium`), terminals get `TERM_PROGRAM=agentium`. When running as `zed`, they get `TERM_PROGRAM=zed`. This is important for tools like Claude Code that inspect `TERM_PROGRAM` to detect the host terminal.
