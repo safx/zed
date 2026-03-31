@@ -1217,13 +1217,14 @@ impl AgentiumApp {
             .sum()
     }
 
-    fn collect_ready_terminal_infos(
+    fn collect_terminal_infos_for_state(
         &self,
         arena_entity: &Entity<Arena>,
+        state: ClaudeSessionState,
+        pids: &HashSet<u32>,
         cx: &App,
     ) -> Vec<ReadyTerminalInfo> {
-        let ready_pids = self.session_state.ready_shell_pids.borrow();
-        if ready_pids.is_empty() {
+        if pids.is_empty() {
             return vec![];
         }
         let arena = arena_entity.read(cx);
@@ -1237,14 +1238,14 @@ impl AgentiumApp {
                     .pid_getter()
                     .map(|g| g.fallback_pid().as_u32());
                 let pid = match pid {
-                    Some(p) if ready_pids.contains(&p) => p,
+                    Some(p) if pids.contains(&p) => p,
                     _ => continue,
                 };
                 let (user_prompt, status_message) = self
                     .claude_sessions
                     .values()
                     .find(|s| {
-                        s.state == ClaudeSessionState::Completed
+                        s.state == state
                             && s.ancestor_pids.contains(&pid)
                     })
                     .map(|s| (s.user_prompt.clone(), s.status_message.clone()))
@@ -1258,6 +1259,34 @@ impl AgentiumApp {
             }
         }
         infos
+    }
+
+    fn collect_ready_terminal_infos(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> Vec<ReadyTerminalInfo> {
+        let pids = self.session_state.ready_shell_pids.borrow().clone();
+        self.collect_terminal_infos_for_state(
+            arena_entity,
+            ClaudeSessionState::Completed,
+            &pids,
+            cx,
+        )
+    }
+
+    fn collect_permission_terminal_infos(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> Vec<ReadyTerminalInfo> {
+        let pids = self.session_state.permission_shell_pids.borrow().clone();
+        self.collect_terminal_infos_for_state(
+            arena_entity,
+            ClaudeSessionState::WaitingPermission,
+            &pids,
+            cx,
+        )
     }
 
     fn deploy_badge_menu(
@@ -1846,10 +1875,10 @@ impl Render for AgentiumApp {
                                     } else {
                                         self.ci_status.get(&arena_entity.entity_id()).map(|ci| {
                                             let (icon, color) = match &ci.status {
-                                                CiStatus::AllPassed => (IconName::TodoComplete, status_colors.success),
+                                                CiStatus::AllPassed => (IconName::Check, status_colors.success),
                                                 CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
-                                                CiStatus::PendingWithFailure => (IconName::ArrowCircle, status_colors.error),
-                                                CiStatus::PendingClean => (IconName::ArrowCircle, status_colors.warning),
+                                                CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
+                                                CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
                                             };
                                             Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
                                         })
@@ -1977,12 +2006,28 @@ impl Render for AgentiumApp {
                                                         h_flex()
                                                             .gap_0p5()
                                                             .when(permission_count > 0, |d| {
-                                                                d.child(render_arena_pill(
-                                                                    ("arena-permission-badge", arena.id),
-                                                                    permission_count,
-                                                                    status_colors.warning,
-                                                                    colors.surface_background,
-                                                                ))
+                                                                let arena_entity_for_permission = arena_entity.clone();
+                                                                d.child(
+                                                                    render_arena_pill(
+                                                                        ("arena-permission-badge", arena.id),
+                                                                        permission_count,
+                                                                        status_colors.warning,
+                                                                        colors.surface_background,
+                                                                    )
+                                                                    .cursor_pointer()
+                                                                    .on_click(cx.listener(
+                                                                        move |this, event: &ClickEvent, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.switch_arena(i, window, cx);
+                                                                            let infos = this.collect_permission_terminal_infos(
+                                                                                &arena_entity_for_permission, cx,
+                                                                            );
+                                                                            this.deploy_badge_menu(
+                                                                                i, infos, event.position(), window, cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                )
                                                             })
                                                             .when(running_count > 0, |d| {
                                                                 d.child(render_arena_pill(
