@@ -501,6 +501,9 @@ impl AgentiumApp {
                             let Some(pr) = this.pr_info.get(&entity_id) else {
                                 continue;
                             };
+                            if matches!(pr.status, PrStatus::Merged) {
+                                continue;
+                            }
                             let pr_number = pr.number;
 
                             let interval = this.compute_ci_poll_interval(entity_id, cx);
@@ -565,7 +568,9 @@ impl AgentiumApp {
                         let mut min_remaining = Duration::from_secs(60);
                         for arena in &this.arenas {
                             let entity_id = arena.entity_id();
-                            if this.pr_info.contains_key(&entity_id) {
+                            let dominated_by_merged = this.pr_info.get(&entity_id)
+                                .map_or(true, |pr| matches!(pr.status, PrStatus::Merged));
+                            if !dominated_by_merged {
                                 let interval =
                                     this.compute_ci_poll_interval(entity_id, cx);
                                 let elapsed = this
@@ -1487,7 +1492,7 @@ fn render_pr_tooltip(
             PrStatus::Open => ("Open".into(), IconName::GitPullRequest, status_colors.success),
             PrStatus::Merged => (
                 "Merged".into(),
-                IconName::GitPullRequest,
+                IconName::GitGraph,
                 hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
             ),
             PrStatus::Closed => (
@@ -1552,10 +1557,10 @@ fn render_pr_tooltip(
             for check in &ci.checks {
                 let (icon, color) = match check.bucket.as_ref() {
                     "pass" => (IconName::Check, status_colors.success),
-                    "fail" => (IconName::XCircleFilled, status_colors.error),
-                    "pending" => (IconName::XCircleFilled, status_colors.warning),
+                    "fail" => (IconName::Circle, status_colors.error),
+                    "pending" => (IconName::Circle, status_colors.warning),
                     "skipping" => (IconName::Slash, colors.text_muted),
-                    _ => (IconName::XCircleFilled, colors.text_muted),
+                    _ => (IconName::Circle, colors.text_muted),
                 };
                 checks_list = checks_list.child(
                     h_flex()
@@ -1833,15 +1838,22 @@ impl Render for AgentiumApp {
                                             .map(|(_, branch_name, browser_url, lines_added, lines_deleted)| (branch_name, browser_url, lines_added, lines_deleted))
                                     });
 
-                                    let ci_icon_element = self.ci_status.get(&arena_entity.entity_id()).map(|ci| {
-                                        let (icon, color) = match &ci.status {
-                                            CiStatus::AllPassed => (IconName::TodoComplete, status_colors.success),
-                                            CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
-                                            CiStatus::PendingWithFailure => (IconName::ArrowCircle, status_colors.error),
-                                            CiStatus::PendingClean => (IconName::ArrowCircle, status_colors.warning),
-                                        };
-                                        Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
-                                    });
+                                    let is_merged = self.pr_info.get(&arena_entity.entity_id())
+                                        .map_or(false, |pr| matches!(pr.status, PrStatus::Merged));
+
+                                    let ci_icon_element = if is_merged {
+                                        None
+                                    } else {
+                                        self.ci_status.get(&arena_entity.entity_id()).map(|ci| {
+                                            let (icon, color) = match &ci.status {
+                                                CiStatus::AllPassed => (IconName::TodoComplete, status_colors.success),
+                                                CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
+                                                CiStatus::PendingWithFailure => (IconName::ArrowCircle, status_colors.error),
+                                                CiStatus::PendingClean => (IconName::ArrowCircle, status_colors.warning),
+                                            };
+                                            Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
+                                        })
+                                    };
 
                                     let tooltip_pr = self.pr_info.get(&arena_entity.entity_id()).cloned();
                                     let tooltip_ci = self.ci_status.get(&arena_entity.entity_id()).cloned();
@@ -1858,9 +1870,8 @@ impl Render for AgentiumApp {
                                             PrStatus::Conflicted => status_colors.warning,
                                         };
                                         let pr_icon = match pr.status {
-                                            PrStatus::Draft | PrStatus::Open | PrStatus::Merged => {
-                                                IconName::GitPullRequest
-                                            }
+                                            PrStatus::Draft | PrStatus::Open => IconName::GitPullRequest,
+                                            PrStatus::Merged => IconName::GitGraph,
                                             PrStatus::Closed => IconName::GitPullRequestClosed,
                                             PrStatus::Conflicted => IconName::GitMergeConflict,
                                         };
@@ -2013,8 +2024,12 @@ impl Render for AgentiumApp {
                                                 .and_then(|(branch, _, _, _)| branch.clone())
                                                 .unwrap_or_default()
                                                 .into();
-                                            let diff_stats = git_info.as_ref()
-                                                .map(|(_, _, added, deleted)| (*added, *deleted));
+                                            let diff_stats = if is_merged {
+                                                None
+                                            } else {
+                                                git_info.as_ref()
+                                                    .map(|(_, _, added, deleted)| (*added, *deleted))
+                                            };
                                             h_flex()
                                                 .items_center()
                                                 .gap_1()
