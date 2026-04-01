@@ -597,10 +597,11 @@ fn main() {
 
             let clock = Arc::new(clock::RealSystemClock);
             let http = Arc::new(http_client::HttpClientWithUrl::new(
-                Arc::new(http_client::BlockedHttpClient::new()),
+                Arc::new(reqwest_client::ReqwestClient::new()),
                 "https://localhost",
                 None,
             ));
+            cx.set_http_client(Arc::new(reqwest_client::ReqwestClient::new()));
             let client = client::Client::new(clock, http, cx);
             client::init(&client, cx);
             project::Project::init(&client, cx);
