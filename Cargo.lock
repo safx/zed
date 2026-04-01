@@ -477,6 +477,7 @@ dependencies = [
  "picker",
  "project",
  "release_channel",
+ "reqwest_client",
  "schemars 1.0.4",
  "search",
  "semver",

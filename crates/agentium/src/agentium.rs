@@ -120,12 +120,41 @@ enum PrStatus {
     Conflicted,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    Pending,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewEntry {
+    user: SharedString,
+    state: ReviewState,
+    commit_oid: SharedString,
+    avatar_url: SharedString,
+    submitted_at: SharedString,
+}
+
 #[derive(Clone, Debug)]
 struct PrInfo {
     number: u32,
     title: SharedString,
     status: PrStatus,
     html_url: SharedString,
+    review_decision: Option<ReviewDecision>,
+    review_count: usize,
+    head_sha: SharedString,
+    reviews: Vec<ReviewEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1582,8 +1611,16 @@ fn render_pr_tooltip(
 
     if let Some(ci) = ci {
         if !ci.checks.is_empty() {
+            // Sort: fail first, then pending, then pass, then skipping, then alphabetical.
+            let mut sorted_checks: Vec<&CiCheckEntry> = ci.checks.iter().collect();
+            sorted_checks.sort_by(|a, b| {
+                ci_bucket_order(a.bucket.as_ref())
+                    .cmp(&ci_bucket_order(b.bucket.as_ref()))
+                    .then_with(|| a.name.as_ref().cmp(b.name.as_ref()))
+            });
+
             let mut checks_list = v_flex().gap_0p5().pt_1();
-            for check in &ci.checks {
+            for check in sorted_checks {
                 let (icon, color) = match check.bucket.as_ref() {
                     "pass" => (IconName::Check, status_colors.success),
                     "fail" => (IconName::Circle, status_colors.error),
@@ -1591,6 +1628,8 @@ fn render_pr_tooltip(
                     "skipping" => (IconName::Slash, colors.text_muted),
                     _ => (IconName::Circle, colors.text_muted),
                 };
+                let is_notable = matches!(check.bucket.as_ref(), "pass" | "fail");
+                let text_color = if is_notable { colors.text } else { colors.text_muted };
                 checks_list = checks_list.child(
                     h_flex()
                         .gap_1()
@@ -1603,7 +1642,7 @@ fn render_pr_tooltip(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(colors.text_muted)
+                                .text_color(text_color)
                                 .child(check.name.clone()),
                         ),
                 );
@@ -1613,6 +1652,141 @@ fn render_pr_tooltip(
     }
 
     content.into_any_element()
+}
+
+fn render_review_tooltip(
+    reviews: &[ReviewEntry],
+    head_sha: &str,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let status_colors = cx.theme().status();
+
+    let mut content = v_flex().gap_0p5().max_w_96();
+
+    // Sort: current-commit reviews first, then by state priority, then alphabetical.
+    let mut sorted: Vec<&ReviewEntry> = reviews.iter().collect();
+    sorted.sort_by(|a, b| {
+        let a_current = a.commit_oid.as_ref() == head_sha;
+        let b_current = b.commit_oid.as_ref() == head_sha;
+        b_current
+            .cmp(&a_current)
+            .then_with(|| review_state_order(&a.state).cmp(&review_state_order(&b.state)))
+            .then_with(|| a.user.as_ref().cmp(b.user.as_ref()))
+    });
+
+    for review in sorted {
+        let is_current_commit = review.commit_oid.as_ref() == head_sha;
+
+        let name_color = if is_current_commit {
+            colors.text
+        } else {
+            colors.text_muted
+        };
+
+        let avatar_url = review.avatar_url.to_string();
+        let relative_time = format_relative_time(&review.submitted_at);
+
+        let mut row = h_flex().gap_1().items_center();
+
+        if is_current_commit {
+            let (icon, icon_color) = match review.state {
+                ReviewState::Approved => (IconName::Check, status_colors.success),
+                ReviewState::ChangesRequested => (IconName::XCircleFilled, status_colors.error),
+                ReviewState::Commented => (IconName::Circle, status_colors.info),
+                ReviewState::Dismissed => (IconName::Circle, colors.text_muted),
+                ReviewState::Pending => (IconName::Circle, status_colors.warning),
+            };
+            row = row.child(
+                Icon::new(icon)
+                    .size(IconSize::XSmall)
+                    .color(Color::Custom(icon_color)),
+            );
+        } else {
+            row = row.child(div().size(IconSize::XSmall.rems()));
+        }
+
+        row = row
+            .child(
+                img(avatar_url)
+                    .size(px(16.))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .with_fallback(|| {
+                        Icon::new(IconName::Person)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(name_color)
+                    .child(review.user.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .child(relative_time),
+            );
+
+        content = content.child(row);
+    }
+
+    content.into_any_element()
+}
+
+fn review_state_order(state: &ReviewState) -> u8 {
+    match state {
+        ReviewState::Pending => 0,
+        ReviewState::Commented => 1,
+        ReviewState::Approved => 2,
+        ReviewState::Dismissed => 3,
+        ReviewState::ChangesRequested => 4,
+    }
+}
+
+fn ci_bucket_order(bucket: &str) -> u8 {
+    match bucket {
+        "pending" => 0,
+        "pass" => 1,
+        "skipping" => 2,
+        "fail" => 3,
+        _ => 4,
+    }
+}
+
+fn format_relative_time(iso: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(iso) else {
+        return iso.to_string();
+    };
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(parsed);
+
+    let total_seconds = duration.num_seconds();
+    if total_seconds < 0 {
+        return iso.to_string();
+    }
+
+    let minutes = duration.num_minutes();
+    let hours = duration.num_hours();
+    let days = duration.num_days();
+
+    if minutes < 1 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        format!("{}m ago", minutes)
+    } else if hours < 24 {
+        format!("{}h ago", hours)
+    } else if days < 30 {
+        format!("{}d ago", days)
+    } else if days < 365 {
+        format!("{}mo ago", days / 30)
+    } else {
+        format!("{}y ago", days / 365)
+    }
 }
 
 fn remote_url_to_browser_url(url: &str) -> Option<String> {
@@ -1635,7 +1809,7 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
             "pr",
             "view",
             "--json",
-            "number,title,state,mergeable,isDraft,url",
+            "number,title,state,mergeable,isDraft,url,reviewDecision,headRefOid",
         ])
         .output()
         .await?;
@@ -1657,6 +1831,10 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
         #[serde(rename = "isDraft")]
         is_draft: bool,
         url: String,
+        #[serde(rename = "reviewDecision")]
+        review_decision: String,
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
     }
 
     let pr: GhPrView = serde_json::from_slice(&output.stdout)?;
@@ -1673,12 +1851,113 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
         }
     };
 
+    let review_decision = match pr.review_decision.as_str() {
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    };
+
+    // Fetch individual reviews via REST API to get avatar URLs.
+    // Parse owner/repo from the PR URL (e.g. "https://github.com/owner/repo/pull/123").
+    let reviews = fetch_reviews(working_dir, &pr.url, &pr.head_ref_oid).await;
+
+    let (reviews, review_count) = match reviews {
+        Ok(entries) => {
+            let count = entries
+                .iter()
+                .filter(|entry| entry.commit_oid.as_ref() == pr.head_ref_oid)
+                .count();
+            (entries, count)
+        }
+        Err(err) => {
+            log::warn!("failed to fetch reviews: {err}");
+            (Vec::new(), 0)
+        }
+    };
+
     Ok(Some(PrInfo {
         number: pr.number,
         title: pr.title.into(),
         status,
         html_url: pr.url.into(),
+        review_decision,
+        review_count,
+        head_sha: pr.head_ref_oid.into(),
+        reviews,
     }))
+}
+
+/// Fetch per-reviewer data via the REST API (`gh api repos/{owner}/{repo}/pulls/{number}/reviews`).
+/// Deduplicates by author, keeping only the latest review per user.
+async fn fetch_reviews(
+    working_dir: &std::path::Path,
+    pr_url: &str,
+    _head_ref_oid: &str,
+) -> anyhow::Result<Vec<ReviewEntry>> {
+    // Parse "https://github.com/{owner}/{repo}/pull/{number}" into an API path.
+    let url_path = pr_url
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| anyhow::anyhow!("unexpected PR URL format: {pr_url}"))?;
+    let parts: Vec<&str> = url_path.splitn(4, '/').collect();
+    if parts.len() < 4 {
+        anyhow::bail!("unexpected PR URL format: {pr_url}");
+    }
+    let (owner, repo, number) = (parts[0], parts[1], parts[3]);
+    let api_path = format!("repos/{owner}/{repo}/pulls/{number}/reviews");
+
+    let output = smol::process::Command::new("gh")
+        .current_dir(working_dir)
+        .args(&["api", &api_path])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api reviews failed: {stderr}");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RestReview {
+        user: RestUser,
+        state: String,
+        commit_id: String,
+        submitted_at: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RestUser {
+        login: String,
+        avatar_url: String,
+    }
+
+    let all_reviews: Vec<RestReview> = serde_json::from_slice(&output.stdout)?;
+
+    // Deduplicate per author, keeping the latest (reviews are chronologically ordered).
+    let mut latest_by_author: HashMap<String, RestReview> = HashMap::new();
+    for review in all_reviews {
+        latest_by_author.insert(review.user.login.clone(), review);
+    }
+
+    Ok(latest_by_author
+        .into_values()
+        .map(|review| {
+            let state = match review.state.as_str() {
+                "APPROVED" => ReviewState::Approved,
+                "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+                "COMMENTED" => ReviewState::Commented,
+                "DISMISSED" => ReviewState::Dismissed,
+                _ => ReviewState::Pending,
+            };
+            ReviewEntry {
+                user: SharedString::from(review.user.login),
+                state,
+                commit_oid: SharedString::from(review.commit_id),
+                avatar_url: SharedString::from(review.user.avatar_url),
+                submitted_at: SharedString::from(review.submitted_at),
+            }
+        })
+        .collect())
 }
 
 async fn fetch_ci_status(
@@ -1867,7 +2146,8 @@ impl Render for AgentiumApp {
                                             .map(|(_, branch_name, browser_url, lines_added, lines_deleted)| (branch_name, browser_url, lines_added, lines_deleted))
                                     });
 
-                                    let is_merged = self.pr_info.get(&arena_entity.entity_id())
+                                    let pr_info = self.pr_info.get(&arena_entity.entity_id());
+                                    let is_merged = pr_info
                                         .map_or(false, |pr| matches!(pr.status, PrStatus::Merged));
 
                                     let ci_icon_element = if is_merged {
@@ -1884,12 +2164,12 @@ impl Render for AgentiumApp {
                                         })
                                     };
 
-                                    let tooltip_pr = self.pr_info.get(&arena_entity.entity_id()).cloned();
+                                    let tooltip_pr = pr_info.cloned();
                                     let tooltip_ci = self.ci_status.get(&arena_entity.entity_id()).cloned();
                                     let tooltip_branch = git_info.as_ref()
                                         .and_then(|(branch, _, _, _)| branch.clone());
 
-                                    let pr_element = self.pr_info.get(&arena_entity.entity_id()).map(|pr| {
+                                    let (pr_element, review_element) = if let Some(pr) = pr_info {
                                         let pr_color = match pr.status {
                                             PrStatus::Draft => colors.text_muted,
                                             PrStatus::Open => status_colors.success,
@@ -1905,7 +2185,7 @@ impl Render for AgentiumApp {
                                             PrStatus::Conflicted => IconName::GitMergeConflict,
                                         };
                                         let url = pr.html_url.clone();
-                                        h_flex()
+                                        let pr_el = h_flex()
                                             .id(("arena-pr", arena.id))
                                             .gap_1()
                                             .items_center()
@@ -1941,14 +2221,81 @@ impl Render for AgentiumApp {
                                                 }
                                             }))
                                             .when(is_active, |d| {
-                                                d.on_click(cx.listener(
+                                                d.on_click(cx.listener({
+                                                    let url = url.clone();
                                                     move |_this, _event: &ClickEvent, _window, cx| {
                                                         cx.stop_propagation();
                                                         cx.open_url(&url);
-                                                    },
-                                                ))
+                                                    }
+                                                }))
+                                            });
+
+                                        let review_el = if is_merged {
+                                            None
+                                        } else {
+                                            match &pr.review_decision {
+                                                Some(ReviewDecision::Approved) => {
+                                                    Some((IconName::Check, status_colors.success, None))
+                                                }
+                                                Some(ReviewDecision::ChangesRequested) => {
+                                                    Some((IconName::Circle, status_colors.error, None))
+                                                }
+                                                Some(ReviewDecision::ReviewRequired) => {
+                                                    Some((IconName::Circle, status_colors.warning, None))
+                                                }
+                                                None if pr.review_count > 0 => {
+                                                    Some((IconName::Eye, colors.text_muted, Some(pr.review_count.to_string())))
+                                                }
+                                                None => None,
+                                            }
+                                            .map(|(review_icon, review_color, review_label)| {
+                                                let tooltip_reviews = pr.reviews.clone();
+                                                let tooltip_head_sha = pr.head_sha.clone();
+                                                h_flex()
+                                                    .id(("arena-review", arena.id))
+                                                    .gap_0p5()
+                                                    .items_center()
+                                                    .px_1()
+                                                    .rounded_sm()
+                                                    .when(is_active, |d| {
+                                                        d.cursor_pointer()
+                                                            .hover(|d| d.bg(colors.element_hover))
+                                                    })
+                                                    .child(
+                                                        Icon::new(review_icon)
+                                                            .size(IconSize::Small)
+                                                            .color(Color::Custom(review_color)),
+                                                    )
+                                                    .when_some(review_label, |d, label| {
+                                                        d.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(colors.text_muted)
+                                                                .child(label),
+                                                        )
+                                                    })
+                                                    .tooltip(Tooltip::element(move |_window, cx| {
+                                                        render_review_tooltip(
+                                                            &tooltip_reviews,
+                                                            &tooltip_head_sha,
+                                                            cx,
+                                                        )
+                                                    }))
+                                                    .when(is_active, |d| {
+                                                        d.on_click(cx.listener(
+                                                            move |_this, _event: &ClickEvent, _window, cx| {
+                                                                cx.stop_propagation();
+                                                                cx.open_url(&url);
+                                                            },
+                                                        ))
+                                                    })
                                             })
-                                    });
+                                        };
+
+                                        (Some(pr_el), review_el)
+                                    } else {
+                                        (None, None)
+                                    };
 
                                     div()
                                         .id(("arena", arena.id))
@@ -2135,9 +2482,11 @@ impl Render for AgentiumApp {
                                                             .child(path),
                                                     )
                                                 })
-                                                .when_some(pr_element, |d, el| {
-                                                    d.child(div().flex_grow()).child(el)
+                                                .when(pr_element.is_some() || review_element.is_some(), |d| {
+                                                    d.child(div().flex_grow())
                                                 })
+                                                .when_some(pr_element, |d, el| d.child(el))
+                                                .when_some(review_element, |d, el| d.child(el))
                                         })
                                         .on_click(cx.listener(
                                             move |this, _, window, cx| {
