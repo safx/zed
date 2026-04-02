@@ -18,7 +18,7 @@ use picker::{
     highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
 };
 use project::Project;
-use project::git_store::GitStoreEvent;
+use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::TerminalView;
 use ui::{
     ActiveTheme, ButtonStyle, ContextMenu, ListItem, ListItemSpacing, PopoverMenu, Tooltip,
@@ -218,7 +218,17 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let git_store = project.read(cx).git_store().clone();
-        let git_subscription = cx.subscribe(&git_store, |_this, _, _event: &GitStoreEvent, cx| {
+        let git_subscription = cx.subscribe(&git_store, |this, _, event: &GitStoreEvent, cx| {
+            if let GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::BranchChanged, _) = event {
+                if let Some(arena) = this.active_arena().cloned() {
+                    let entity_id = arena.entity_id();
+                    this.pr_info.remove(&entity_id);
+                    this.ci_status.remove(&entity_id);
+                    if this.gh_available && !this.pr_polling_timed_out {
+                        this.fetch_pr_for_arena(entity_id, cx);
+                    }
+                }
+            }
             cx.notify();
         });
 
