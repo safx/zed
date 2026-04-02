@@ -62,6 +62,12 @@ echo "Bundled ${app_path}"
 
 cp "target/${target_triple}/${target_dir}/agentium" "${app_path}/Contents/MacOS/agentium"
 
+echo "Signing application bundle"
+/usr/bin/codesign --force --deep \
+    --entitlements crates/agentium/resources/agentium.entitlements \
+    --sign - \
+    "${app_path}"
+
 if [ "$open_result" = true ]; then
     open "${app_path}"
 fi
