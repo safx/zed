@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::{CommandFactory, Parser};
 use futures::StreamExt as _;
 use gpui::*;
-use settings::{KeymapFile, DEFAULT_KEYMAP_PATH};
+use settings::{KeymapFile, ThemeName, ThemeSelection, DEFAULT_KEYMAP_PATH};
 use ui::ActiveTheme;
 use util::ResultExt as _;
 use workspace::SplitDirection;
@@ -53,6 +53,11 @@ enum Command {
     Claude {
         #[command(subcommand)]
         action: ClaudeAction,
+    },
+    /// Change the theme of the running instance
+    Theme {
+        /// Theme name (e.g. "One Dark", "Ayu Dark", "Gruvbox Dark")
+        name: String,
     },
 }
 
@@ -187,6 +192,9 @@ enum IpcMessage {
     TabNew {
         content_type: agentium::PaneContentType,
         command: Vec<String>,
+    },
+    ChangeTheme {
+        name: String,
     },
     ClaudeStatusline {
         five_hour_used_pct: f32,
@@ -370,6 +378,16 @@ fn start_ipc_listener(
                                     })
                                     .unwrap_or_default();
                                 IpcMessage::TabNew { content_type, command }
+                            }
+                            Some("change_theme") => {
+                                let name = json["name"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                IpcMessage::ChangeTheme { name }
                             }
                             _ => continue,
                         }
@@ -563,6 +581,19 @@ fn main() {
             }
             return;
         }
+        Some(Command::Theme { name }) => {
+            let msg = serde_json::json!({
+                "type": "change_theme",
+                "name": name,
+            });
+            let socket_path = agentium_socket_path();
+            if let Ok(socket) = UnixDatagram::unbound() {
+                if socket.connect(&socket_path).is_ok() {
+                    let _ = socket.send(msg.to_string().as_bytes());
+                }
+            }
+            return;
+        }
         Some(Command::Arena {
             action: ArenaAction::New { path },
         }) => match std::fs::canonicalize(&path) {
@@ -727,6 +758,13 @@ fn main() {
                     });
 
                     app_state.languages.set_theme(cx.theme().clone());
+                    cx.observe_global::<theme::GlobalTheme>({
+                        let languages = app_state.languages.clone();
+                        move |cx| {
+                            languages.set_theme(cx.theme().clone());
+                        }
+                    })
+                    .detach();
 
                     if let Some(bindings) =
                         KeymapFile::load_asset_allow_partial_failure(DEFAULT_KEYMAP_PATH, cx)
@@ -966,6 +1004,30 @@ fn main() {
                                                         command,
                                                         window,
                                                         cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ChangeTheme { name } => {
+                                            window_handle
+                                                .update(cx, |_app, _window, cx| {
+                                                    settings::SettingsStore::update_global(
+                                                        cx,
+                                                        |store, cx| {
+                                                            let mut settings = store
+                                                                .raw_user_settings()
+                                                                .cloned()
+                                                                .unwrap_or_default();
+                                                            settings.content.theme.theme =
+                                                                Some(ThemeSelection::Static(
+                                                                    ThemeName(name.into()),
+                                                                ));
+                                                            if let Ok(json) =
+                                                                serde_json::to_string(&settings)
+                                                            {
+                                                                _ = store.set_user_settings(&json, cx);
+                                                            }
+                                                        },
                                                     );
                                                 })
                                                 .log_err();
