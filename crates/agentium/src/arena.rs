@@ -330,10 +330,35 @@ impl Arena {
         });
     }
 
+    fn find_repository(
+        &self,
+        cx: &App,
+    ) -> Option<(project::git_store::RepositoryId, Arc<std::path::Path>)> {
+        let working_dir = self.working_directory.as_ref()?;
+        let git_store = self.project.read(cx).git_store().read(cx);
+        git_store
+            .repositories()
+            .iter()
+            .filter_map(|(id, repo)| {
+                let repo = repo.read(cx);
+                let repo_path = &repo.work_directory_abs_path;
+                if working_dir.starts_with(repo_path.as_ref()) {
+                    Some((*id, repo_path.clone()))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, path)| path.clone())
+    }
+
     fn add_git_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
+        let Some((repo_id, _)) = self.find_repository(cx) else {
+            return;
+        };
+        let git_store = self.project.read(cx).git_store().clone();
         let view = cx.new(|cx| {
-            git_graph::GitGraph::new(self.project.clone(), self.workspace.clone(), window, cx)
+            git_graph::GitGraph::new(repo_id, git_store, self.workspace.clone(), None, window, cx)
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
@@ -473,10 +498,16 @@ impl Arena {
             }
             PaneContentType::GitGraph => {
                 self.activate_context(cx);
+                let Some((repo_id, _)) = self.find_repository(cx) else {
+                    return;
+                };
+                let git_store = self.project.read(cx).git_store().clone();
                 let item = cx.new(|cx| {
                     git_graph::GitGraph::new(
-                        self.project.clone(),
+                        repo_id,
+                        git_store,
                         self.workspace.clone(),
+                        None,
                         window,
                         cx,
                     )

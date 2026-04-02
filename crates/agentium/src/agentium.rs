@@ -2947,7 +2947,7 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
                     if self.selected_index == ix {
                         el.end_slot(delete_button)
                     } else {
-                        el.end_hover_slot(delete_button)
+                        el.end_slot(delete_button)
                     }
                 })
                 .into_any_element(),
