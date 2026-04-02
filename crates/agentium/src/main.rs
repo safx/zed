@@ -709,8 +709,8 @@ fn main() {
                         KeyBinding::new("cmd-9", agentium::ActivateArena { index: 8 }, Some("Agentium")),
                         KeyBinding::new("ctrl-[", workspace::ActivatePreviousPane, Some("Workspace")),
                         KeyBinding::new("ctrl-]", workspace::ActivateNextPane, Some("Workspace")),
-                        KeyBinding::new("cmd-[", workspace::ActivatePreviousItem, Some("Pane")),
-                        KeyBinding::new("cmd-]", workspace::ActivateNextItem, Some("Pane")),
+                        KeyBinding::new("cmd-[", workspace::ActivatePreviousItem::default(), Some("Pane")),
+                        KeyBinding::new("cmd-]", workspace::ActivateNextItem::default(), Some("Pane")),
                     ]);
 
                     let worktree_path = initial_workspace_path;
@@ -771,6 +771,8 @@ fn main() {
                             },
                         )
                         .log_err();
+
+                    cx.activate(true);
 
                     if let Some(window_handle) = window_handle {
                         let (msg_sender, mut msg_receiver) =
@@ -927,8 +929,6 @@ fn main() {
                         })
                         .detach();
                     }
-
-                    cx.activate(true);
                 });
             })
             .detach();
