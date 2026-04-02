@@ -125,6 +125,36 @@ enum ClaudeHookEvent {
     PostToolUseFailure,
 }
 
+fn percent_decode(input: &str) -> String {
+    let mut output = Vec::with_capacity(input.len());
+    let mut bytes = input.as_bytes().iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'%' {
+            let hi = bytes.next().copied().unwrap_or(0);
+            let lo = bytes.next().copied().unwrap_or(0);
+            if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
+                output.push(h << 4 | l);
+                continue;
+            }
+            output.push(b'%');
+            output.push(hi);
+            output.push(lo);
+        } else {
+            output.push(byte);
+        }
+    }
+    String::from_utf8(output).unwrap_or_else(|_| input.to_string())
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn truncate_string(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
         Some((byte_index, _)) => s[..byte_index].to_string(),
@@ -554,9 +584,26 @@ fn main() {
 
     let socket_path = agentium_socket_path();
 
-    Application::with_platform(gpui_platform::current_platform(false))
-        .with_assets(assets::Assets)
-        .run(move |cx: &mut App| {
+    let app = Application::with_platform(gpui_platform::current_platform(false))
+        .with_assets(assets::Assets);
+
+    app.on_open_urls({
+        let socket_path = socket_path.clone();
+        move |urls| {
+            for url in urls {
+                let path = if let Some(path) = url.strip_prefix("file://") {
+                    PathBuf::from(percent_decode(path))
+                } else {
+                    continue;
+                };
+                if path.is_dir() {
+                    try_send_path_to_running_instance(&socket_path, &path).log_err();
+                }
+            }
+        }
+    });
+
+    app.run(move |cx: &mut App| {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
             settings::init(cx);
 
