@@ -730,6 +730,7 @@ fn main() {
 
                     workspace::init(app_state.clone(), cx);
                     editor::init(cx);
+                    image_viewer::init(cx);
                     git_ui::init(cx);
                     search::init(cx);
                     file_finder::init(cx);
