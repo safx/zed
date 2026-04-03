@@ -81,12 +81,6 @@ impl ImageView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Start loading the image to render in the background to prevent the view
-        // from flickering in most cases.
-        let _ = image_item.update(cx, |image, cx| {
-            image.image.clone().get_render_image(window, cx)
-        });
-
         cx.subscribe(&image_item, Self::on_image_event).detach();
         cx.on_release_in(window, |this, window, cx| {
             let image_data = this.image_item.read(cx).image.clone();
