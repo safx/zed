@@ -254,6 +254,11 @@ impl AgentiumApp {
                     {
                         this.start_ci_polling(cx);
                     }
+                    // Re-render so rate limit rows can detect expired reset times
+                    // and hide progress bars immediately on app reactivation.
+                    if this.rate_limits.is_some() {
+                        cx.notify();
+                    }
                 } else {
                     this._pr_poll_task = None;
                     this._ci_poll_task = None;
@@ -1471,7 +1476,7 @@ fn format_resets_in(resets_at: i64) -> String {
     let now = chrono::Local::now().timestamp();
     let remaining = resets_at - now;
     if remaining <= 0 {
-        return "Reset".to_string();
+        return "Session reset".to_string();
     }
     let hours = remaining / 3600;
     let minutes = (remaining % 3600) / 60;
@@ -1487,6 +1492,10 @@ fn format_resets_at_day(resets_at: i64) -> String {
     if resets_at <= 0 {
         return "Unknown".to_string();
     }
+    let now = chrono::Local::now().timestamp();
+    if resets_at <= now {
+        return "Weekly reset".to_string();
+    }
     let Some(dt) = Local.timestamp_opt(resets_at, 0).single() else {
         return "Unknown".to_string();
     };
@@ -1496,10 +1505,13 @@ fn format_resets_at_day(resets_at: i64) -> String {
 fn render_rate_limit_row(
     label: &str,
     used_pct: f32,
+    resets_at: i64,
     reset_text: &str,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
+    let now = chrono::Local::now().timestamp();
+    let expired = resets_at > 0 && resets_at <= now;
     v_flex()
         .id(SharedString::from(format!("rate-limit-row-{label}")))
         .px_1()
@@ -1521,16 +1533,18 @@ fn render_rate_limit_row(
                         .child(reset_text.to_string()),
                 ),
         )
-        .child(
-            ui::ProgressBar::new(
-                SharedString::from(format!("rate-limit-{label}")),
-                used_pct,
-                100.0,
-                cx,
+        .when(!expired, |row| {
+            row.child(
+                ui::ProgressBar::new(
+                    SharedString::from(format!("rate-limit-{label}")),
+                    used_pct,
+                    100.0,
+                    cx,
+                )
+                .bg_color(colors.border),
             )
-            .bg_color(colors.border),
-        )
-        .tooltip(Tooltip::text(format!("{:.0}%", used_pct)))
+            .tooltip(Tooltip::text(format!("{:.0}%", used_pct)))
+        })
 }
 
 fn repo_name_from_url(url: &str) -> Option<&str> {
@@ -2572,12 +2586,14 @@ impl Render for AgentiumApp {
                                 .child(render_rate_limit_row(
                                     "session",
                                     rate_limits.five_hour.used_pct,
+                                    rate_limits.five_hour.resets_at,
                                     &format_resets_in(rate_limits.five_hour.resets_at),
                                     cx,
                                 ))
                                 .child(render_rate_limit_row(
                                     "week",
                                     rate_limits.seven_day.used_pct,
+                                    rate_limits.seven_day.resets_at,
                                     &format_resets_at_day(rate_limits.seven_day.resets_at),
                                     cx,
                                 )),
