@@ -5,7 +5,9 @@ use std::sync::Arc;
 use clap::{CommandFactory, Parser};
 use futures::StreamExt as _;
 use gpui::*;
-use settings::{KeymapFile, ThemeName, ThemeSelection, DEFAULT_KEYMAP_PATH};
+use settings::{
+    KeymapFile, SettingsStore, ThemeName, ThemeSelection, watch_config_file, DEFAULT_KEYMAP_PATH,
+};
 use ui::ActiveTheme;
 use util::ResultExt as _;
 use workspace::SplitDirection;
@@ -58,6 +60,12 @@ enum Command {
     Theme {
         /// Theme name (e.g. "One Dark", "Ayu Dark", "Gruvbox Dark")
         name: String,
+    },
+    /// Wait until the running Agentium instance is ready to accept IPC commands
+    Ready {
+        /// Timeout in seconds (default: 30)
+        #[arg(long, short, default_value = "30")]
+        timeout: u64,
     },
 }
 
@@ -149,6 +157,24 @@ fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8(output).unwrap_or_else(|_| input.to_string())
+}
+
+/// Merges user settings JSON with agentium-specific defaults.
+/// User file values take precedence; defaults fill in missing keys.
+fn merge_settings_with_defaults(
+    user_content: &str,
+    defaults: &serde_json::Value,
+) -> String {
+    let mut merged = defaults.clone();
+    if let Ok(user_value) = serde_json::from_str::<serde_json::Value>(user_content) {
+        if let (Some(merged_obj), Some(user_obj)) = (merged.as_object_mut(), user_value.as_object())
+        {
+            for (key, value) in user_obj {
+                merged_obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    merged.to_string()
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -581,6 +607,22 @@ fn main() {
             }
             return;
         }
+        Some(Command::Ready { timeout }) => {
+            let socket_path = agentium_socket_path();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            loop {
+                if let Ok(socket) = UnixDatagram::unbound() {
+                    if socket.connect(&socket_path).is_ok() {
+                        return;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("error: timed out waiting for Agentium ({}s)", timeout);
+                    std::process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
         Some(Command::Theme { name }) => {
             let msg = serde_json::json!({
                 "type": "change_theme",
@@ -736,15 +778,49 @@ fn main() {
                     file_finder::init(cx);
                     markdown_preview::init(cx);
 
-                    settings::SettingsStore::update_global(cx, |store, cx| {
-                        let mut settings = serde_json::json!({
+                    let (mut settings_file_rx, _settings_watcher) = watch_config_file(
+                        cx.background_executor(),
+                        fs.clone(),
+                        paths::settings_file().clone(),
+                    );
+
+                    let agentium_defaults = {
+                        let mut defaults = serde_json::json!({
                             "active_pane_modifiers": {"inactive_opacity": 0.65},
                         });
                         if let Some(ref name) = theme_name {
-                            settings["theme"] = serde_json::json!(name);
+                            defaults["theme"] = serde_json::json!(name);
                         }
-                        _ = store.set_user_settings(&settings.to_string(), cx);
+                        defaults
+                    };
+
+                    // Initial load: merge user settings file with agentium defaults.
+                    // User file values take precedence; agentium defaults fill in gaps.
+                    let initial_content = cx
+                        .foreground_executor()
+                        .block_on(settings_file_rx.next())
+                        .unwrap_or_default();
+                    let merged =
+                        merge_settings_with_defaults(&initial_content, &agentium_defaults);
+                    SettingsStore::update_global(cx, |store, cx| {
+                        _ = store.set_user_settings(&merged, cx);
                     });
+
+                    // Watch for changes and re-merge.
+                    cx.spawn({
+                        let agentium_defaults = agentium_defaults.clone();
+                        async move |cx| {
+                            let _settings_watcher = _settings_watcher;
+                            while let Some(content) = settings_file_rx.next().await {
+                                let merged =
+                                    merge_settings_with_defaults(&content, &agentium_defaults);
+                                cx.update_global(|store: &mut SettingsStore, cx| {
+                                    _ = store.set_user_settings(&merged, cx);
+                                });
+                            }
+                        }
+                    })
+                    .detach();
 
                     cx.set_global(workspace::PaneSearchBarCallbacks {
                         setup_search_bar: |languages, toolbar, window, cx| {
