@@ -561,7 +561,12 @@ impl DiffMultibuffer {
                 if is_excerpt_newly_added
                     && (file_status.is_deleted()
                         || (file_status.is_untracked()
-                            && GitPanelSettings::get_global(cx).collapse_untracked_diff))
+                            && GitPanelSettings::get_global(cx).collapse_untracked_diff)
+                        || is_generated_file(&path_key.path)
+                        || {
+                            let (added, removed) = diff_snapshot.changed_row_counts();
+                            added + removed >= 2000
+                        })
                 {
                     needs_fold = true;
                 }
@@ -1035,4 +1040,26 @@ fn tree_sort_path(repo_path: &RelPath) -> Arc<RelPath> {
     RelPath::from_unix_str(&synthetic)
         .map(|path| path.into_arc())
         .unwrap_or_else(|_| repo_path.into_arc())
+}
+
+fn is_generated_file(path: &RelPath) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    matches!(
+        file_name,
+        "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "Cargo.lock"
+            | "Gemfile.lock"
+            | "composer.lock"
+            | "poetry.lock"
+            | "Pipfile.lock"
+            | "pdm.lock"
+            | "uv.lock"
+            | "go.sum"
+            | "flake.lock"
+    )
 }
