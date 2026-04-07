@@ -219,7 +219,7 @@ impl AgentiumApp {
     ) -> Self {
         let git_store = project.read(cx).git_store().clone();
         let git_subscription = cx.subscribe(&git_store, |this, _, event: &GitStoreEvent, cx| {
-            if let GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::BranchChanged, _) = event {
+            if let GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, _) = event {
                 if let Some(arena) = this.active_arena().cloned() {
                     let entity_id = arena.entity_id();
                     this.pr_info.remove(&entity_id);
