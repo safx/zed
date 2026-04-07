@@ -1182,6 +1182,8 @@ impl AgentiumApp {
         if ready_pids.is_empty() {
             return 0;
         }
+        let running_pids = self.session_state.running_shell_pids.borrow();
+        let permission_pids = self.session_state.permission_shell_pids.borrow();
         let ws = workspace.read(cx);
         ws.center
             .panes()
@@ -1194,7 +1196,12 @@ impl AgentiumApp {
                             .terminal()
                             .read(cx)
                             .pid_getter()
-                            .is_some_and(|g| ready_pids.contains(&g.fallback_pid().as_u32()))
+                            .is_some_and(|g| {
+                                let pid = g.fallback_pid().as_u32();
+                                ready_pids.contains(&pid)
+                                    && !running_pids.contains(&pid)
+                                    && !permission_pids.contains(&pid)
+                            })
                     })
                     .count()
             })
@@ -1210,6 +1217,7 @@ impl AgentiumApp {
         if running_pids.is_empty() {
             return 0;
         }
+        let permission_pids = self.session_state.permission_shell_pids.borrow();
         let arena = arena_entity.read(cx);
         arena
             .center
@@ -1223,7 +1231,11 @@ impl AgentiumApp {
                             .terminal()
                             .read(cx)
                             .pid_getter()
-                            .is_some_and(|g| running_pids.contains(&g.fallback_pid().as_u32()))
+                            .is_some_and(|g| {
+                                let pid = g.fallback_pid().as_u32();
+                                running_pids.contains(&pid)
+                                    && !permission_pids.contains(&pid)
+                            })
                     })
                     .count()
             })
