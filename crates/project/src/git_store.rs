@@ -441,6 +441,7 @@ pub struct RepositorySnapshot {
     pub branch_list: Arc<[Branch]>,
     pub branch_list_error: Option<SharedString>,
     pub head_commit: Option<CommitDetails>,
+    pub has_head: bool,
     pub scan_id: u64,
     pub merge: MergeDetails,
     pub remote_origin_url: Option<String>,
@@ -5170,6 +5171,7 @@ impl RepositorySnapshot {
             branch_list: Arc::from([]),
             branch_list_error: None,
             head_commit: None,
+            has_head: false,
             scan_id: 0,
             merge: Default::default(),
             remote_origin_url: None,
@@ -9319,7 +9321,7 @@ impl Repository {
                     return Ok(());
                 }
 
-                let has_head = prev_snapshot.head_commit.is_some();
+                let has_head = prev_snapshot.has_head;
 
                 let changed_path_statuses = cx
                     .background_spawn(async move {
@@ -10689,13 +10691,24 @@ async fn compute_snapshot(
     };
     let head_commit_future = {
         let backend = backend.clone();
-        async move { backend.show("HEAD".to_string()).await.ok() }
+        async move {
+            // `has_head` is derived from the HEAD sha rather than from `head_commit`, because
+            // `show` can fail (leaving `head_commit` as None) while HEAD does exist. Diff
+            // stats are still computable in that case.
+            let head_sha = backend.head_sha().await;
+            let has_head = head_sha.is_some();
+            let head_commit = match head_sha {
+                Some(sha) => backend.show(sha).await.ok(),
+                None => None,
+            };
+            (head_commit, has_head)
+        }
     };
     let worktrees_future = {
         let backend = backend.clone();
         async move { backend.worktrees().await.log_err().unwrap_or_default() }
     };
-    let (branches, head_commit, all_worktrees) =
+    let (branches, (head_commit, has_head), all_worktrees) =
         futures::future::join3(branches_future, head_commit_future, worktrees_future).await;
     log::debug!("fetched branches, head commit, worktrees");
 
@@ -10731,6 +10744,7 @@ async fn compute_snapshot(
             branch_list: branch_list.clone(),
             branch_list_error,
             head_commit,
+            has_head,
             remote_origin_url,
             remote_upstream_url,
             linked_worktrees,
@@ -10769,7 +10783,7 @@ async fn compute_snapshot(
         let snapshot = snapshot.clone();
         let backend = backend.clone();
         async move {
-            if snapshot.head_commit.is_some() {
+            if snapshot.has_head {
                 futures::future::join3(
                     backend.diff_stat(DiffStatType::HeadToWorktree, &[]),
                     backend.diff_stat(DiffStatType::HeadToIndex, &[]),
