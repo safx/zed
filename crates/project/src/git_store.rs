@@ -41,7 +41,7 @@ use git::{
     },
     stash::{GitStash, StashEntry},
     status::{
-        self, DiffStat, DiffTreeType, FileStatus, GitSummary, StatusCode, TrackedStatus, TreeDiff,
+        DiffStat, DiffTreeType, FileStatus, GitSummary, StatusCode, TrackedStatus, TreeDiff,
         TreeDiffStatus, UnmergedStatus, UnmergedStatusCode,
     },
 };
@@ -317,6 +317,7 @@ pub struct RepositorySnapshot {
     pub branch: Option<Branch>,
     pub branch_list: Arc<[Branch]>,
     pub head_commit: Option<CommitDetails>,
+    pub has_head: bool,
     pub scan_id: u64,
     pub merge: MergeDetails,
     pub remote_origin_url: Option<String>,
@@ -4121,6 +4122,7 @@ impl RepositorySnapshot {
             branch: None,
             branch_list: Arc::from([]),
             head_commit: None,
+            has_head: false,
             scan_id: 0,
             merge: Default::default(),
             remote_origin_url: None,
@@ -7935,7 +7937,7 @@ impl Repository {
                     return Ok(());
                 }
 
-                let has_head = prev_snapshot.head_commit.is_some();
+                let has_head = prev_snapshot.has_head;
 
                 let stash_entries = backend.stash_entries().await?;
                 let changed_path_statuses = cx
@@ -7945,14 +7947,8 @@ impl Repository {
                         let changed_paths_vec = changed_paths.iter().cloned().collect::<Vec<_>>();
 
                         let status_task = backend.status(&changed_paths_vec);
-                        let diff_stat_future = if has_head {
-                            backend.diff_stat(&changed_paths_vec)
-                        } else {
-                            future::ready(Ok(status::GitDiffStat {
-                                entries: Arc::default(),
-                            }))
-                            .boxed()
-                        };
+                        let diff_stat_future =
+                            backend.diff_stat(&changed_paths_vec, has_head);
 
                         let (statuses, diff_stats) =
                             futures::future::try_join(status_task, diff_stat_future).await?;
@@ -9040,13 +9036,16 @@ async fn compute_snapshot(
     let head_commit_future = {
         let backend = backend.clone();
         async move {
-            Ok(match backend.head_sha().await {
-                Some(head_sha) => backend.show(head_sha).await.log_err(),
+            let head_sha = backend.head_sha().await;
+            let has_head = head_sha.is_some();
+            let head_commit = match head_sha {
+                Some(sha) => backend.show(sha).await.log_err(),
                 None => None,
-            })
+            };
+            Ok((head_commit, has_head))
         }
     };
-    let (branches, head_commit, all_worktrees) = cx
+    let (branches, (head_commit, has_head), all_worktrees) = cx
         .background_spawn({
             let backend = backend.clone();
             async move {
@@ -9094,6 +9093,7 @@ async fn compute_snapshot(
             branch,
             branch_list: branch_list.clone(),
             head_commit,
+            has_head,
             remote_origin_url,
             remote_upstream_url,
             linked_worktrees,
@@ -9121,15 +9121,8 @@ async fn compute_snapshot(
             let backend = backend.clone();
             let snapshot = snapshot.clone();
             async move {
-                let diff_stat_future: BoxFuture<'_, Result<status::GitDiffStat>> =
-                    if snapshot.head_commit.is_some() {
-                        backend.diff_stat(&[])
-                    } else {
-                        future::ready(Ok(status::GitDiffStat {
-                            entries: Arc::default(),
-                        }))
-                        .boxed()
-                    };
+                let diff_stat_future =
+                    backend.diff_stat(&[], snapshot.has_head);
                 futures::future::try_join3(
                     backend.status(&[RepoPath::from_rel_path(
                         &RelPath::new(".".as_ref(), PathStyle::local()).unwrap(),

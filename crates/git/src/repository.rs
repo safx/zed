@@ -936,6 +936,7 @@ pub trait GitRepository: Send + Sync {
     fn diff_stat(
         &self,
         path_prefixes: &[RepoPath],
+        has_head: bool,
     ) -> BoxFuture<'_, Result<crate::status::GitDiffStat>>;
 
     /// Creates a checkpoint for the repository.
@@ -2091,6 +2092,7 @@ impl GitRepository for RealGitRepository {
     fn diff_stat(
         &self,
         path_prefixes: &[RepoPath],
+        has_head: bool,
     ) -> BoxFuture<'_, Result<crate::status::GitDiffStat>> {
         let path_prefixes = path_prefixes.to_vec();
         let git_binary = self.git_binary_in_worktree();
@@ -2102,8 +2104,10 @@ impl GitRepository for RealGitRepository {
                     "diff".into(),
                     "--numstat".into(),
                     "--no-renames".into(),
-                    "HEAD".into(),
                 ];
+                if has_head {
+                    args.push("HEAD".into());
+                }
                 if !path_prefixes.is_empty() {
                     args.push("--".into());
                     args.extend(
