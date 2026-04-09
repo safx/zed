@@ -2452,12 +2452,8 @@ impl Render for AgentiumApp {
                                                 .and_then(|(branch, _, _, _)| branch.clone())
                                                 .unwrap_or_default()
                                                 .into();
-                                            let diff_stats = if is_merged {
-                                                None
-                                            } else {
-                                                git_info.as_ref()
-                                                    .map(|(_, _, added, deleted)| (*added, *deleted))
-                                            };
+                                            let diff_stats = git_info.as_ref()
+                                                .map(|(_, _, added, deleted)| (*added, *deleted));
                                             h_flex()
                                                 .items_center()
                                                 .gap_1()
