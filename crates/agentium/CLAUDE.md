@@ -108,9 +108,26 @@ PR and CI status polling uses the `gh` CLI. At startup, `gh --version` is checke
 
 Data flows in a chain: PR info must exist before CI polling can run. When `fetch_pr_for_arena` or the PR polling loop inserts a **new** PR entry (`!had_pr`), it immediately triggers `fetch_ci_for_arena` for that arena. Without this chain, CI data would be delayed until the next CI polling cycle (up to 60 seconds).
 
-Both PR and CI polling tasks are dropped on window deactivation and restarted on reactivation. A 5-second timeout guard on any `gh` subprocess permanently disables the respective polling loop for the session (`pr_polling_timed_out` / `ci_polling_timed_out`).
+Both PR and CI polling tasks are dropped on window deactivation and restarted on reactivation. A 5-second timeout guard on any `gh` subprocess permanently disables the polling **loop** for the session (`pr_polling_timed_out` / `ci_polling_timed_out`), but one-shot fetches triggered by explicit events (HeadChanged, arena creation/switch, Claude session completion) are not gated by this flag and still work even after a timeout.
 
 CI polling interval is adaptive based on HEAD commit age: <=1 hour → 60s, <=1 day → 180s, >1 day → 300s. The interval is computed on-the-fly via `compute_ci_poll_interval()` using `repo.head_commit.commit_timestamp`, not cached in a HashMap.
+
+## PR fetch triggers on Claude session completion
+
+`mark_claude_session_ready` (Stop hook handler) triggers `fetch_pr_for_arena` for the arena that owns the completed session's terminal. It uses `find_arena_entity_id_for_pids` to map the session's `ancestor_pids` to the correct arena by scanning each arena's pane items for a matching terminal PID. This ensures PRs created by Claude Code (e.g. via `gh pr create`) appear in the sidebar immediately rather than waiting for the next 60-second polling cycle.
+
+## Caffeinate-based session state cleanup (macOS only)
+
+Claude Code has no hook for turn cancellation (Ctrl+C). When a user cancels mid-turn, no Stop hook fires, leaving the session stuck in `Running`/`WaitingPermission` with a green/orange badge that never clears.
+
+On macOS, Claude Code spawns `caffeinate -i -t 300` as a direct child process only while busy (executing a turn). It is killed with SIGKILL when Claude returns to idle. The absence of a caffeinate child process reliably indicates idle state.
+
+A background monitor task (`_caffeinate_monitor_task`) polls every 3 seconds and checks each `Running`/`WaitingPermission` session:
+- `ancestor_pids[0]` is the Claude Code node process PID (the hook process's parent)
+- `libc::kill(pid, 0)` checks if the Claude process is alive — if dead, transition to `Idle` immediately
+- `pgrep -P <pid> caffeinate` checks for a caffeinate child — if absent for >5 seconds (`caffeinate_absent_since` HashMap), transition to `Idle`
+
+The 5-second grace period avoids false positives at turn boundaries, where caffeinate is briefly absent between the `UserPromptSubmit` hook and the moment Claude spawns a new caffeinate for the next turn (typically <1 second).
 
 ## TERM_PROGRAM is derived from the binary name
 
