@@ -489,6 +489,7 @@ dependencies = [
  "image_viewer",
  "language",
  "languages",
+ "libc",
  "log",
  "markdown_preview",
  "menu",
