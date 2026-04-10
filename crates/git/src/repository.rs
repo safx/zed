@@ -770,6 +770,8 @@ pub trait GitRepository: Send + Sync {
 
     fn branches(&self) -> BoxFuture<'_, Result<Vec<Branch>>>;
 
+    fn tags_at(&self, sha: String) -> BoxFuture<'_, Result<Vec<String>>>;
+
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
@@ -1816,6 +1818,28 @@ impl GitRepository for RealGitRepository {
                 }
 
                 Ok(branches)
+            })
+            .boxed()
+    }
+
+    fn tags_at(&self, sha: String) -> BoxFuture<'_, Result<Vec<String>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&["tag", "--points-at", &sha])
+                    .output()
+                    .await?;
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Ok(stdout
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(|line| line.to_string())
+                        .collect())
+                } else {
+                    Ok(Vec::new())
+                }
             })
             .boxed()
     }
