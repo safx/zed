@@ -253,6 +253,7 @@ pub enum IconName {
     Stop,
     Tab,
     Table,
+    Tag,
     Terminal,
     TerminalAlt,
     TextSnippet,
