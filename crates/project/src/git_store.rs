@@ -292,6 +292,7 @@ pub struct RepositorySnapshot {
     pub branch: Option<Branch>,
     pub branch_list: Arc<[Branch]>,
     pub head_commit: Option<CommitDetails>,
+    pub head_tags: Arc<[String]>,
     pub has_head: bool,
     pub scan_id: u64,
     pub merge: MergeDetails,
@@ -3916,6 +3917,7 @@ impl RepositorySnapshot {
             branch: None,
             branch_list: Arc::from([]),
             head_commit: None,
+            head_tags: Arc::from([]),
             has_head: false,
             scan_id: 0,
             merge: Default::default(),
@@ -8542,6 +8544,21 @@ async fn compute_snapshot(
         })
         .await?;
 
+    let head_tags: Arc<[String]> = if branch.is_none() {
+        if let Some(sha) = head_commit.as_ref().map(|c| c.sha.to_string()) {
+            cx.background_spawn({
+                let backend = backend.clone();
+                async move { backend.tags_at(sha).await.unwrap_or_default() }
+            })
+            .await
+            .into()
+        } else {
+            Arc::from([])
+        }
+    } else {
+        Arc::from([])
+    };
+
     let snapshot = this.update(cx, |this, cx| {
         let head_changed =
             branch != this.snapshot.branch || head_commit != this.snapshot.head_commit;
@@ -8554,6 +8571,7 @@ async fn compute_snapshot(
             branch,
             branch_list: branch_list.clone(),
             head_commit,
+            head_tags,
             has_head,
             remote_origin_url,
             remote_upstream_url,
