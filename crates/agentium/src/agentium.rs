@@ -207,6 +207,10 @@ pub struct AgentiumApp {
     _window_activation_subscription: gpui::Subscription,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
+    #[cfg(target_os = "macos")]
+    caffeinate_absent_since: HashMap<String, Instant>,
+    #[cfg(target_os = "macos")]
+    _caffeinate_monitor_task: Task<()>,
 }
 
 impl AgentiumApp {
@@ -288,6 +292,128 @@ impl AgentiumApp {
         })
         .detach();
 
+        #[cfg(target_os = "macos")]
+        let caffeinate_monitor_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(3))
+                    .await;
+
+                let sessions_to_check: Vec<(String, u32)> = this
+                    .update(cx, |this, _cx| {
+                        this.claude_sessions
+                            .iter()
+                            .filter_map(|(session_id, session)| {
+                                if !matches!(
+                                    session.state,
+                                    ClaudeSessionState::Running
+                                        | ClaudeSessionState::WaitingPermission
+                                ) {
+                                    return None;
+                                }
+                                session
+                                    .ancestor_pids
+                                    .first()
+                                    .map(|&pid| (session_id.clone(), pid))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if sessions_to_check.is_empty() {
+                    if this.update(cx, |_, _| {}).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                let mut results: Vec<(String, bool, bool)> = Vec::new();
+                for (session_id, claude_pid) in sessions_to_check {
+                    let (alive, has_caffeinate) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let alive =
+                                unsafe { libc::kill(claude_pid as i32, 0) == 0 };
+                            if !alive {
+                                return (false, false);
+                            }
+                            let has_caff = smol::process::Command::new("pgrep")
+                                .args(&[
+                                    "-P",
+                                    &claude_pid.to_string(),
+                                    "caffeinate",
+                                ])
+                                .output()
+                                .await
+                                .map_or(false, |o| o.status.success());
+                            (alive, has_caff)
+                        })
+                        .await;
+                    results.push((session_id, alive, has_caffeinate));
+                }
+
+                let should_stop = this
+                    .update(cx, |this, cx| {
+                        let mut changed = false;
+                        for (session_id, alive, has_caffeinate) in &results {
+                            let is_active = this
+                                .claude_sessions
+                                .get(session_id)
+                                .map_or(false, |s| {
+                                    matches!(
+                                        s.state,
+                                        ClaudeSessionState::Running
+                                            | ClaudeSessionState::WaitingPermission
+                                    )
+                                });
+                            if !is_active {
+                                this.caffeinate_absent_since.remove(session_id);
+                                continue;
+                            }
+
+                            if !alive {
+                                if let Some(session) =
+                                    this.claude_sessions.get_mut(session_id)
+                                {
+                                    session.state = ClaudeSessionState::Idle;
+                                    changed = true;
+                                }
+                                this.caffeinate_absent_since.remove(session_id);
+                            } else if *has_caffeinate {
+                                this.caffeinate_absent_since.remove(session_id);
+                            } else {
+                                let absent_since = this
+                                    .caffeinate_absent_since
+                                    .entry(session_id.clone())
+                                    .or_insert_with(Instant::now);
+                                if absent_since.elapsed() > Duration::from_secs(5)
+                                {
+                                    if let Some(session) =
+                                        this.claude_sessions.get_mut(session_id)
+                                    {
+                                        session.state = ClaudeSessionState::Idle;
+                                        changed = true;
+                                    }
+                                    this.caffeinate_absent_since
+                                        .remove(session_id);
+                                }
+                            }
+                        }
+
+                        if changed {
+                            this.sync_session_derived_state();
+                            this.notify_all_panes(cx);
+                            cx.notify();
+                        }
+                    })
+                    .is_err();
+
+                if should_stop {
+                    break;
+                }
+            }
+        });
+
         Self {
             arenas: Vec::new(),
             active_arena_index: None,
@@ -317,6 +443,10 @@ impl AgentiumApp {
             _window_activation_subscription: window_activation_subscription,
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            caffeinate_absent_since: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            _caffeinate_monitor_task: caffeinate_monitor_task,
         }
     }
 
