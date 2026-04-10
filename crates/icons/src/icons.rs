@@ -250,6 +250,7 @@ pub enum IconName {
     StarFilled,
     Stop,
     Tab,
+    Tag,
     Terminal,
     TerminalAlt,
     TextSnippet,
