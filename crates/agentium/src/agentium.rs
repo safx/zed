@@ -224,7 +224,7 @@ impl AgentiumApp {
                     let entity_id = arena.entity_id();
                     this.pr_info.remove(&entity_id);
                     this.ci_status.remove(&entity_id);
-                    if this.gh_available && !this.pr_polling_timed_out {
+                    if this.gh_available {
                         this.fetch_pr_for_arena(entity_id, cx);
                     }
                 }
@@ -384,7 +384,7 @@ impl AgentiumApp {
         arena_entity.update(cx, |arena, cx| {
             arena.activate_context(cx);
         });
-        if self.gh_available && !self.pr_polling_timed_out {
+        if self.gh_available {
             self.fetch_pr_for_arena(arena_entity.entity_id(), cx);
         }
         let focus = arena_entity.focus_handle(cx);
@@ -400,25 +400,21 @@ impl AgentiumApp {
             });
             if self.gh_available {
                 let entity_id = self.arenas[index].entity_id();
-                if !self.pr_polling_timed_out {
-                    let pr_stale = self
-                        .pr_last_checked
+                let pr_stale = self
+                    .pr_last_checked
+                    .get(&entity_id)
+                    .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
+                if pr_stale {
+                    self.fetch_pr_for_arena(entity_id, cx);
+                }
+                if let Some(pr) = self.pr_info.get(&entity_id) {
+                    let pr_number = pr.number;
+                    let ci_stale = self
+                        .ci_last_checked
                         .get(&entity_id)
                         .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
-                    if pr_stale {
-                        self.fetch_pr_for_arena(entity_id, cx);
-                    }
-                }
-                if !self.ci_polling_timed_out {
-                    if let Some(pr) = self.pr_info.get(&entity_id) {
-                        let pr_number = pr.number;
-                        let ci_stale = self
-                            .ci_last_checked
-                            .get(&entity_id)
-                            .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
-                        if ci_stale {
-                            self.fetch_ci_for_arena(entity_id, pr_number, cx);
-                        }
+                    if ci_stale {
+                        self.fetch_ci_for_arena(entity_id, pr_number, cx);
                     }
                 }
             }
@@ -969,8 +965,18 @@ impl AgentiumApp {
                 },
             );
         }
+        let pids: Vec<u32> = self.claude_sessions.get(session_id)
+            .map(|s| s.ancestor_pids.clone())
+            .unwrap_or_default();
         self.sync_session_derived_state();
         self.notify_all_panes(cx);
+
+        if self.gh_available {
+            if let Some(entity_id) = self.find_arena_entity_id_for_pids(&pids, cx) {
+                self.fetch_pr_for_arena(entity_id, cx);
+            }
+        }
+
         cx.notify();
     }
 
@@ -1109,6 +1115,23 @@ impl AgentiumApp {
         arena.update(cx, |arena, cx| {
             arena.add_tab(content_type, command, window, cx);
         });
+    }
+
+    fn find_arena_entity_id_for_pids(&self, pids: &[u32], cx: &App) -> Option<EntityId> {
+        for arena_entity in &self.arenas {
+            let arena = arena_entity.read(cx);
+            for pane in arena.center.panes() {
+                for terminal_view in pane.read(cx).items_of_type::<TerminalView>() {
+                    if let Some(getter) = terminal_view.read(cx).terminal().read(cx).pid_getter() {
+                        let pid = getter.fallback_pid().as_u32();
+                        if pids.contains(&pid) {
+                            return Some(arena_entity.entity_id());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn clear_session_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
@@ -2163,6 +2186,8 @@ impl Render for AgentiumApp {
                                                 let repo_path = &repo.work_directory_abs_path;
                                                 if working_dir.starts_with(repo_path.as_ref()) {
                                                     let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
+                                                    let head_sha = repo.head_commit.as_ref().map(|c| c.sha.clone());
+                                                    let head_tags = repo.head_tags.clone();
                                                     let browser_url = repo.remote_origin_url.as_deref()
                                                         .and_then(remote_url_to_browser_url);
                                                     let (lines_added, lines_deleted) = repo.cached_status()
@@ -2173,13 +2198,13 @@ impl Render for AgentiumApp {
                                                                 (added, deleted)
                                                             }
                                                         });
-                                                    Some((repo_path.clone(), branch_name, browser_url, lines_added, lines_deleted))
+                                                    Some((repo_path.clone(), branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
                                                 } else {
                                                     None
                                                 }
                                             })
-                                            .max_by_key(|(repo_path, _, _, _, _)| repo_path.clone())
-                                            .map(|(_, branch_name, browser_url, lines_added, lines_deleted)| (branch_name, browser_url, lines_added, lines_deleted))
+                                            .max_by_key(|(repo_path, _, _, _, _, _, _)| repo_path.clone())
+                                            .map(|(_, branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted)| (branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
                                     });
 
                                     let pr_info = self.pr_info.get(&arena_entity.entity_id());
@@ -2203,7 +2228,7 @@ impl Render for AgentiumApp {
                                     let tooltip_pr = pr_info.cloned();
                                     let tooltip_ci = self.ci_status.get(&arena_entity.entity_id()).cloned();
                                     let tooltip_branch = git_info.as_ref()
-                                        .and_then(|(branch, _, _, _)| branch.clone());
+                                        .and_then(|(branch, _, _, _, _, _)| branch.clone());
 
                                     let (pr_element, review_element) = if let Some(pr) = pr_info {
                                         let pr_color = match pr.status {
@@ -2353,7 +2378,7 @@ impl Render for AgentiumApp {
                                             let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
                                             let has_pills = permission_count > 0 || running_count > 0 || ready_count > 0;
                                             let project_url = git_info.as_ref()
-                                                .and_then(|(_, browser_url, _, _)| browser_url.clone());
+                                                .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
                                             div()
                                                 .flex()
                                                 .flex_row()
@@ -2446,27 +2471,47 @@ impl Render for AgentiumApp {
                                                     )
                                                 })
                                         })
-                                        // Row 2: branch name (left) + diff stats (right)
+                                        // Row 2: branch/tag/sha (left) + diff stats (right)
                                         .child({
-                                            let branch_label: SharedString = git_info.as_ref()
-                                                .and_then(|(branch, _, _, _)| branch.clone())
-                                                .unwrap_or_default()
-                                                .into();
+                                            let (ref_icon, ref_label): (Option<IconName>, SharedString) =
+                                                if let Some((Some(branch), _, _, _, _, _)) = git_info.as_ref() {
+                                                    (Some(IconName::GitBranchAlt), branch.clone().into())
+                                                } else if let Some((None, _, head_tags, _, _, _)) = git_info.as_ref() {
+                                                    if let Some(tag) = head_tags.first() {
+                                                        (Some(IconName::Tag), tag.clone().into())
+                                                    } else if let Some((_, Some(sha), _, _, _, _)) = git_info.as_ref() {
+                                                        (None, sha.chars().take(8).collect::<String>().into())
+                                                    } else {
+                                                        (None, SharedString::default())
+                                                    }
+                                                } else {
+                                                    (None, SharedString::default())
+                                                };
                                             let diff_stats = git_info.as_ref()
-                                                .map(|(_, _, added, deleted)| (*added, *deleted));
+                                                .map(|(_, _, _, _, added, deleted)| (*added, *deleted));
                                             h_flex()
                                                 .items_center()
                                                 .gap_1()
                                                 .text_xs()
                                                 .min_h(px(16.0))
-                                                .when(!branch_label.is_empty(), |d| {
+                                                .when(!ref_label.is_empty(), |d| {
                                                     d.child(
-                                                        div()
+                                                        h_flex()
                                                             .min_w_0()
                                                             .flex_shrink()
+                                                            .items_center()
+                                                            .gap_0p5()
                                                             .text_color(colors.text_muted)
-                                                            .truncate()
-                                                            .child(branch_label),
+                                                            .when_some(ref_icon, |d, icon| {
+                                                                d.child(
+                                                                    Icon::new(icon)
+                                                                        .size(IconSize::XSmall)
+                                                                        .color(Color::Muted),
+                                                                )
+                                                            })
+                                                            .child(
+                                                                div().min_w_0().truncate().child(ref_label),
+                                                            ),
                                                     )
                                                 })
                                                 .child(div().flex_grow())
