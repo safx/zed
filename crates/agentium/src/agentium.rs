@@ -1008,10 +1008,6 @@ impl AgentiumApp {
             });
             let focus = ws.focus_handle(cx);
             focus.focus(window, cx);
-        } else {
-            self.workspace_entity.update(cx, |ws, cx| {
-                ws.clear_active_worktree_override(cx);
-            });
         }
         cx.notify();
     }
@@ -3128,6 +3124,7 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
             prefix: None,
             match_label,
             paths: Vec::new(),
+            active: false,
         };
 
         let delete_button = IconButton::new(("delete", ix), IconName::Close)

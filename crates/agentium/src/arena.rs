@@ -121,12 +121,6 @@ impl Arena {
     pub(crate) fn activate_context(&self, cx: &mut App) {
         let worktree_id = self.worktree_id(cx);
 
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |ws, cx| {
-                ws.set_active_worktree_override(worktree_id, cx);
-            });
-        }
-
         let git_store = self.project.read(cx).git_store().clone();
         if let Some(worktree_id) = worktree_id {
             let project_path = ProjectPath {
