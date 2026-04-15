@@ -16,7 +16,7 @@ use terminal::{
     IndexedCell, Terminal, TerminalBounds, TerminalContent,
     alacritty_terminal::{
         grid::Dimensions,
-        index::Point as AlacPoint,
+        index::{Line, Point as AlacPoint},
         term::{TermMode, cell::Flags},
         vte::ansi::{
             Color::{self as AnsiColor, Named},
@@ -53,6 +53,7 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
+    flash_line: Option<(Line, f32)>,
 }
 
 /// Helper struct for converting data between Alacritty's cursor points, and displayed cursor points.
@@ -1278,6 +1279,7 @@ impl Element for TerminalElement {
                     block_below_cursor_element,
                     base_text_style: text_style,
                     content_mode,
+                    flash_line: self.terminal.read(cx).last_content.flash_line,
                 }
             },
         )
@@ -1359,6 +1361,19 @@ impl Element for TerminalElement {
 
                     for rect in &layout.rects {
                         rect.paint(origin, &layout.dimensions, window);
+                    }
+
+                    if let Some((flash_line, opacity)) = layout.flash_line {
+                        let display_offset = self.terminal.read(cx).last_content.display_offset;
+                        let row = (flash_line.0 + display_offset as i32) as f32;
+                        let y = origin.y + row * layout.dimensions.line_height;
+                        let flash_bounds = Bounds::new(
+                            point(origin.x, y),
+                            size(bounds.size.width, layout.dimensions.line_height),
+                        );
+                        let mut flash_color = cx.theme().colors().search_match_background;
+                        flash_color.a = opacity;
+                        window.paint_quad(fill(flash_bounds, flash_color));
                     }
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
