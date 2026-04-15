@@ -3,7 +3,7 @@ mod file_browser_view;
 mod git_status_view;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,6 +90,12 @@ struct ReadyTerminalInfo {
     status_message: String,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalPidInfo {
+    pub pid: u32,
+    pub is_task_terminal: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct SharedSessionState {
     pub ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
@@ -97,6 +103,7 @@ pub(crate) struct SharedSessionState {
     pub permission_shell_pids: Rc<RefCell<HashSet<u32>>>,
     pub acknowledged_task_pids: Rc<RefCell<HashSet<u32>>>,
     pub pid_to_session_id: Rc<RefCell<HashMap<u32, String>>>,
+    pub terminal_pid_cache: Rc<RefCell<HashMap<EntityId, TerminalPidInfo>>>,
 }
 
 impl SharedSessionState {
@@ -107,8 +114,14 @@ impl SharedSessionState {
             permission_shell_pids: Rc::new(RefCell::new(HashSet::new())),
             acknowledged_task_pids: Rc::new(RefCell::new(HashSet::new())),
             pid_to_session_id: Rc::new(RefCell::new(HashMap::new())),
+            terminal_pid_cache: Rc::new(RefCell::new(HashMap::new())),
         }
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+pub struct PrSessionData {
+    pub pr: BTreeSet<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -207,6 +220,10 @@ pub struct AgentiumApp {
     _window_activation_subscription: gpui::Subscription,
     _git_subscription: gpui::Subscription,
     _arena_subscriptions: HashMap<EntityId, gpui::Subscription>,
+    pr_dirty: HashSet<EntityId>,
+    last_branch_names: HashMap<EntityId, Option<String>>,
+    pr_session_db: HashMap<String, HashMap<String, PrSessionData>>,
+    _pr_session_db_write_task: Option<Task<()>>,
     #[cfg(target_os = "macos")]
     caffeinate_absent_since: HashMap<String, Instant>,
     #[cfg(target_os = "macos")]
@@ -226,6 +243,18 @@ impl AgentiumApp {
             if let GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, _) = event {
                 if let Some(arena) = this.active_arena().cloned() {
                     let entity_id = arena.entity_id();
+
+                    let current_branch = this.branch_name_for_arena(entity_id, cx);
+                    // Only reset the dirty flag when the branch name actually
+                    // changed (a real branch switch), not on commits/rebases
+                    // that merely advance HEAD on the same branch.
+                    if let Some(previous) = this.last_branch_names.get(&entity_id) {
+                        if *previous != current_branch {
+                            this.pr_dirty.remove(&entity_id);
+                        }
+                    }
+                    this.last_branch_names.insert(entity_id, current_branch);
+
                     this.pr_info.remove(&entity_id);
                     this.ci_status.remove(&entity_id);
                     if this.gh_available {
@@ -443,6 +472,10 @@ impl AgentiumApp {
             _window_activation_subscription: window_activation_subscription,
             _git_subscription: git_subscription,
             _arena_subscriptions: HashMap::new(),
+            pr_dirty: HashSet::new(),
+            last_branch_names: HashMap::new(),
+            pr_session_db: load_pr_session_db(),
+            _pr_session_db_write_task: None,
             #[cfg(target_os = "macos")]
             caffeinate_absent_since: HashMap::new(),
             #[cfg(target_os = "macos")]
@@ -597,6 +630,9 @@ impl AgentiumApp {
                                     if !had_pr && !this.ci_polling_timed_out {
                                         this.fetch_ci_for_arena(entity_id, pr_number, cx);
                                     }
+                                    if this.pr_dirty.contains(&entity_id) {
+                                        this.save_pr_session_mapping(entity_id, cx);
+                                    }
                                 }
                                 Ok(None) | Err(_) => {
                                     this.pr_info.remove(&entity_id);
@@ -647,6 +683,9 @@ impl AgentiumApp {
                         this.pr_info.insert(entity_id, info);
                         if !had_pr && !this.ci_polling_timed_out {
                             this.fetch_ci_for_arena(entity_id, pr_number, cx);
+                        }
+                        if this.pr_dirty.contains(&entity_id) {
+                            this.save_pr_session_mapping(entity_id, cx);
                         }
                     }
                     Ok(None) | Err(_) => {
@@ -986,6 +1025,8 @@ impl AgentiumApp {
         self.pr_last_checked.remove(&entity_id);
         self.ci_status.remove(&entity_id);
         self.ci_last_checked.remove(&entity_id);
+        self.pr_dirty.remove(&entity_id);
+        self.last_branch_names.remove(&entity_id);
         self.arenas.remove(index);
 
         if self.arenas.is_empty() {
@@ -1163,6 +1204,18 @@ impl AgentiumApp {
         self.sync_session_derived_state();
         self.notify_all_panes(cx);
         cx.notify();
+
+        let pids: Vec<u32> = self
+            .claude_sessions
+            .get(session_id)
+            .map(|s| s.ancestor_pids.clone())
+            .unwrap_or_default();
+        if let Some(entity_id) = self.find_arena_entity_id_for_pids(&pids, cx) {
+            self.pr_dirty.insert(entity_id);
+            if self.pr_info.contains_key(&entity_id) {
+                self.save_pr_session_mapping(entity_id, cx);
+            }
+        }
     }
 
     pub fn handle_claude_permission_request(
@@ -1258,6 +1311,94 @@ impl AgentiumApp {
             }
         }
         None
+    }
+
+    fn branch_name_for_arena(&self, entity_id: EntityId, cx: &App) -> Option<String> {
+        let working_dir = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)?
+            .read(cx)
+            .working_directory
+            .as_ref()?;
+        let git_store = self.project.read(cx).git_store().read(cx);
+        git_store
+            .repositories()
+            .values()
+            .filter_map(|repo| {
+                let repo = repo.read(cx);
+                if working_dir.starts_with(repo.work_directory_abs_path.as_ref()) {
+                    Some((
+                        repo.work_directory_abs_path.clone(),
+                        repo.branch.as_ref().map(|b| b.name().to_string()),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(path, _)| path.clone())
+            .and_then(|(_, name)| name)
+    }
+
+    fn session_ids_for_arena(&self, entity_id: EntityId, cx: &App) -> Vec<String> {
+        let Some(arena_entity) = self.arenas.iter().find(|a| a.entity_id() == entity_id) else {
+            return Vec::new();
+        };
+
+        let arena = arena_entity.read(cx);
+        let mut terminal_entity_ids = Vec::new();
+        for pane in arena.center.panes() {
+            for tv in pane.read(cx).items_of_type::<TerminalView>() {
+                terminal_entity_ids.push(tv.entity_id());
+            }
+        }
+
+        let pid_cache = self.session_state.terminal_pid_cache.borrow();
+        let sid_map = self.session_state.pid_to_session_id.borrow();
+        let mut session_ids = HashSet::new();
+        for tv_entity_id in &terminal_entity_ids {
+            if let Some(pid_info) = pid_cache.get(tv_entity_id) {
+                if let Some(session_id) = sid_map.get(&pid_info.pid) {
+                    session_ids.insert(session_id.clone());
+                }
+            }
+        }
+        session_ids.into_iter().collect()
+    }
+
+    fn save_pr_session_mapping(&mut self, entity_id: EntityId, cx: &mut Context<Self>) {
+        let Some(pr_info) = self.pr_info.get(&entity_id) else {
+            return;
+        };
+        let pr_number = pr_info.number;
+
+        let working_dir = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)
+            .and_then(|a| a.read(cx).working_directory.clone());
+        let Some(working_dir) = working_dir else {
+            return;
+        };
+        let project_path = std::fs::canonicalize(&working_dir)
+            .unwrap_or(working_dir)
+            .to_string_lossy()
+            .to_string();
+
+        let session_ids = self.session_ids_for_arena(entity_id, cx);
+        if session_ids.is_empty() {
+            return;
+        }
+
+        let project_entry = self.pr_session_db.entry(project_path).or_default();
+        for sid in &session_ids {
+            project_entry.entry(sid.clone()).or_default().pr.insert(pr_number);
+        }
+
+        let db_snapshot = self.pr_session_db.clone();
+        self._pr_session_db_write_task = Some(cx.background_spawn(async move {
+            write_pr_session_db(&db_snapshot).log_err();
+        }));
     }
 
     fn clear_session_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
@@ -1985,6 +2126,30 @@ fn remote_url_to_browser_url(url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn load_pr_session_db() -> HashMap<String, HashMap<String, PrSessionData>> {
+    let db_path = paths::data_dir().join("pr.json");
+    match std::fs::read_to_string(&db_path) {
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|error| anyhow::anyhow!("Failed to parse {}: {error}", db_path.display()))
+            .log_err()
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn write_pr_session_db(
+    db: &HashMap<String, HashMap<String, PrSessionData>>,
+) -> anyhow::Result<()> {
+    let db_path = paths::data_dir().join("pr.json");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = db_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_string_pretty(db)?)?;
+    std::fs::rename(&tmp_path, &db_path)?;
+    Ok(())
 }
 
 async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<PrInfo>> {
