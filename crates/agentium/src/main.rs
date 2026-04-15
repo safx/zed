@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -125,6 +126,12 @@ enum ClaudeAction {
     },
     /// Claude Code statusline pass-through (extracts rate limits)
     Statusline,
+    /// List Claude Code sessions (optionally filtered by PR number)
+    Sessions {
+        /// Filter by PR number
+        #[arg(long)]
+        pr: Option<u32>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -536,6 +543,58 @@ fn main() {
                     Err(err) => {
                         eprintln!("agentium statusline: failed to send IPC: {err}");
                     }
+                }
+            }
+            return;
+        }
+        Some(Command::Claude {
+            action: ClaudeAction::Sessions { pr },
+        }) => {
+            let project_path = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        String::from_utf8(output.stdout)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|p| std::fs::canonicalize(&p).ok())
+                .map(|p| p.to_string_lossy().to_string());
+            let Some(project_path) = project_path else {
+                eprintln!("Error: not inside a git repository");
+                std::process::exit(1);
+            };
+
+            let db_path = paths::data_dir().join("pr.json");
+            let db: HashMap<String, HashMap<String, agentium::PrSessionData>> =
+                match std::fs::read_to_string(&db_path) {
+                    Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
+                        eprintln!(
+                            "Warning: failed to parse {}: {error}",
+                            db_path.display()
+                        );
+                        HashMap::new()
+                    }),
+                    Err(_) => HashMap::new(),
+                };
+
+            if let Some(project_sessions) = db.get(&project_path) {
+                let mut rows: Vec<(u32, &str)> = Vec::new();
+                for (sid, data) in project_sessions {
+                    for &pr_number in &data.pr {
+                        if pr.is_none() || pr == Some(pr_number) {
+                            rows.push((pr_number, sid));
+                        }
+                    }
+                }
+                rows.sort_by_key(|(pr_number, _)| *pr_number);
+                for (pr_number, sid) in &rows {
+                    println!("{}\t{}", pr_number, sid);
                 }
             }
             return;
