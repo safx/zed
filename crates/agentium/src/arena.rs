@@ -772,6 +772,26 @@ impl Arena {
                         item.added_to_pane(workspace, pane.clone(), window, cx)
                     });
                 }
+                if let Some(tv) = item.downcast::<TerminalView>() {
+                    let terminal = tv.read(cx).terminal().read(cx);
+                    if let Some(getter) = terminal.pid_getter() {
+                        self.session_state.terminal_pid_cache.borrow_mut().insert(
+                            tv.entity_id(),
+                            crate::TerminalPidInfo {
+                                pid: getter.fallback_pid().as_u32(),
+                                is_task_terminal: terminal.task().is_some(),
+                            },
+                        );
+                    }
+                }
+            }
+            pane::Event::RemovedItem { item } => {
+                if let Some(tv) = item.downcast::<TerminalView>() {
+                    self.session_state
+                        .terminal_pid_cache
+                        .borrow_mut()
+                        .remove(&tv.entity_id());
+                }
             }
             &pane::Event::Split { direction, mode } => match mode {
                 SplitMode::ClonePane | SplitMode::EmptyPane => {
@@ -1266,6 +1286,40 @@ fn add_terminal_view_to_pane(
     });
 }
 
+fn indicator_for_terminal(
+    pid: u32,
+    task_status: Option<&TaskStatus>,
+    permission_pids: &RefCell<HashSet<u32>>,
+    running_pids: &RefCell<HashSet<u32>>,
+    ready_pids: &RefCell<HashSet<u32>>,
+    acknowledged_pids: &RefCell<HashSet<u32>>,
+) -> Option<Indicator> {
+    if permission_pids.borrow().contains(&pid) {
+        return Some(Indicator::dot().color(Color::Warning));
+    }
+    if running_pids.borrow().contains(&pid) {
+        return Some(Indicator::dot().color(Color::Success));
+    }
+    if ready_pids.borrow().contains(&pid) {
+        return Some(Indicator::dot().color(Color::Accent));
+    }
+    if let Some(status) = task_status {
+        match status {
+            TaskStatus::Running => {
+                return Some(Indicator::dot().color(Color::Success));
+            }
+            TaskStatus::Completed { success } => {
+                if !acknowledged_pids.borrow().contains(&pid) {
+                    let color = if *success { Color::Accent } else { Color::Error };
+                    return Some(Indicator::dot().color(color));
+                }
+            }
+            TaskStatus::Unknown => {}
+        }
+    }
+    None
+}
+
 pub(crate) fn new_agentium_pane(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -1464,40 +1518,44 @@ pub(crate) fn new_agentium_pane(
         let running_pids = session_state.running_shell_pids.clone();
         let ready_pids = session_state.ready_shell_pids.clone();
         let acknowledged_pids = session_state.acknowledged_task_pids.clone();
+        let terminal_pid_cache = session_state.terminal_pid_cache.clone();
         pane.set_render_item_indicator(move |item, cx| {
-            if let Some(terminal_view) = item.downcast::<TerminalView>() {
-                let terminal = terminal_view.read(cx).terminal().read(cx);
-                if let Some(pid_getter) = terminal.pid_getter() {
-                    let pid = pid_getter.fallback_pid().as_u32();
-
-                    // Claude sessions: permission (orange) > running (green) > completed (blue)
-                    if permission_pids.borrow().contains(&pid) {
-                        return Some(Indicator::dot().color(Color::Warning));
+            if let Some(tv) = item.downcast::<TerminalView>() {
+                let cached = terminal_pid_cache.borrow().get(&tv.entity_id()).copied();
+                if let Some(info) = cached {
+                    let task_status = if info.is_task_terminal {
+                        tv.read(cx)
+                            .terminal()
+                            .read(cx)
+                            .task()
+                            .map(|t| t.status)
+                    } else {
+                        None
+                    };
+                    if let Some(ind) = indicator_for_terminal(
+                        info.pid,
+                        task_status.as_ref(),
+                        &permission_pids,
+                        &running_pids,
+                        &ready_pids,
+                        &acknowledged_pids,
+                    ) {
+                        return Some(ind);
                     }
-                    if running_pids.borrow().contains(&pid) {
-                        return Some(Indicator::dot().color(Color::Success));
-                    }
-                    if ready_pids.borrow().contains(&pid) {
-                        return Some(Indicator::dot().color(Color::Accent));
-                    }
-
-                    // Non-Claude task terminals
-                    if let Some(task) = terminal.task() {
-                        match task.status {
-                            TaskStatus::Running => {
-                                return Some(Indicator::dot().color(Color::Success));
-                            }
-                            TaskStatus::Completed { success } => {
-                                if !acknowledged_pids.borrow().contains(&pid) {
-                                    let color = if success {
-                                        Color::Accent
-                                    } else {
-                                        Color::Error
-                                    };
-                                    return Some(Indicator::dot().color(color));
-                                }
-                            }
-                            TaskStatus::Unknown => {}
+                } else {
+                    let terminal = tv.read(cx).terminal().read(cx);
+                    if let Some(pid_getter) = terminal.pid_getter() {
+                        let pid = pid_getter.fallback_pid().as_u32();
+                        let task_status = terminal.task().map(|t| t.status);
+                        if let Some(ind) = indicator_for_terminal(
+                            pid,
+                            task_status.as_ref(),
+                            &permission_pids,
+                            &running_pids,
+                            &ready_pids,
+                            &acknowledged_pids,
+                        ) {
+                            return Some(ind);
                         }
                     }
                 }
