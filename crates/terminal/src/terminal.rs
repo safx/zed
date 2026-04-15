@@ -103,6 +103,10 @@ actions!(
         ScrollToTop,
         /// Scrolls to the bottom of the terminal buffer.
         ScrollToBottom,
+        /// Scrolls to the previous shell prompt (OSC 133).
+        ScrollToPreviousPrompt,
+        /// Scrolls to the next shell prompt (OSC 133).
+        ScrollToNextPrompt,
         /// Toggles vi mode in the terminal.
         ToggleViMode,
         /// Selects all text in the terminal.
@@ -172,6 +176,7 @@ enum InternalEvent {
     // FocusNextMatch,
     Scroll(AlacScroll),
     ScrollToAlacPoint(AlacPoint),
+    ScrollToPrompt(AlacDirection),
     SetSelection(Option<(Selection, AlacPoint)>),
     UpdateSelection(Point<Pixels>),
     FindHyperlink(Point<Pixels>, bool),
@@ -422,6 +427,7 @@ impl TerminalBuilder {
             },
             child_exited: None,
             keyboard_input_sent: false,
+            flash_line: None,
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
@@ -656,6 +662,7 @@ impl TerminalBuilder {
                 },
                 child_exited: None,
                 keyboard_input_sent: false,
+                flash_line: None,
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
@@ -809,6 +816,7 @@ pub struct TerminalContent {
     pub last_hovered_word: Option<HoveredWord>,
     pub scrolled_to_top: bool,
     pub scrolled_to_bottom: bool,
+    pub flash_line: Option<(Line, f32)>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -835,6 +843,7 @@ impl Default for TerminalContent {
             last_hovered_word: None,
             scrolled_to_top: false,
             scrolled_to_bottom: false,
+            flash_line: None,
         }
     }
 }
@@ -883,6 +892,7 @@ pub struct Terminal {
     activation_script: Vec<String>,
     child_exited: Option<ExitStatus>,
     keyboard_input_sent: bool,
+    flash_line: Option<(Line, Instant)>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
@@ -1013,6 +1023,7 @@ impl Terminal {
             AlacTermEvent::ChildExit(raw_status) => {
                 self.register_task_finished(Some(raw_status), cx);
             }
+            AlacTermEvent::Osc133(_) => {}
         }
     }
 
@@ -1122,6 +1133,12 @@ impl Terminal {
                         cx.emit(Event::SelectionsChanged)
                     }
                 }
+            }
+            InternalEvent::ScrollToPrompt(direction) => {
+                if let Some(line) = term.scroll_to_prompt(*direction) {
+                    self.flash_line = Some((line, Instant::now()));
+                }
+                self.refresh_hovered_word(window);
             }
             InternalEvent::SetSelection(selection) => {
                 trace!("Setting selection: selection={selection:?}");
@@ -1433,6 +1450,16 @@ impl Terminal {
             .push_back(InternalEvent::Scroll(AlacScroll::Bottom));
     }
 
+    pub fn scroll_to_previous_prompt(&mut self) {
+        self.events
+            .push_back(InternalEvent::ScrollToPrompt(AlacDirection::Left));
+    }
+
+    pub fn scroll_to_next_prompt(&mut self) {
+        self.events
+            .push_back(InternalEvent::ScrollToPrompt(AlacDirection::Right));
+    }
+
     pub fn scrolled_to_top(&self) -> bool {
         self.last_content.scrolled_to_top
     }
@@ -1631,6 +1658,7 @@ impl Terminal {
         }
 
         self.last_content = Self::make_content(&terminal, &self.last_content);
+        self.last_content.flash_line = self.flash_line_opacity();
     }
 
     fn make_content(term: &Term<ZedListener>, last_content: &TerminalContent) -> TerminalContent {
@@ -1663,7 +1691,22 @@ impl Terminal {
             last_hovered_word: last_content.last_hovered_word.clone(),
             scrolled_to_top: content.display_offset == term.history_size(),
             scrolled_to_bottom: content.display_offset == 0,
+            flash_line: None,
         }
+    }
+
+    fn flash_line_opacity(&mut self) -> Option<(Line, f32)> {
+        const FLASH_DURATION: Duration = Duration::from_millis(350);
+
+        let (line, start) = self.flash_line?;
+        let elapsed = start.elapsed();
+        if elapsed >= FLASH_DURATION {
+            self.flash_line = None;
+            return None;
+        }
+        let progress = elapsed.as_secs_f32() / FLASH_DURATION.as_secs_f32();
+        let opacity = 0.25 * (1.0 - progress);
+        Some((line, opacity))
     }
 
     pub fn get_content(&self) -> String {
