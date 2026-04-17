@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use editor::{Editor, EditorEvent};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{prelude::*, *};
@@ -208,6 +209,12 @@ pub struct AgentiumApp {
     should_move_window: bool,
     rate_limits: Option<RateLimits>,
     _rate_limits_refresh_task: Option<Task<()>>,
+    _busy_badge_refresh_task: Task<()>,
+    // Reused across `count_busy_non_claude_terminals_in_arena` calls to avoid
+    // reconstructing the System on every sidebar render. `RefCell` is safe only
+    // so long as the `borrow_mut()` inside that method is dropped before the
+    // next arena iteration — do not hold the borrow across the arena loop.
+    sysinfo_system: RefCell<System>,
     gh_available: bool,
     pr_info: HashMap<EntityId, PrInfo>,
     pr_last_checked: HashMap<EntityId, Instant>,
@@ -443,6 +450,20 @@ impl AgentiumApp {
             }
         });
 
+        // Periodically re-render so the "busy non-Claude" sidebar badge updates.
+        // No GPUI event fires when `tcgetpgrp` state changes (e.g. user runs
+        // `sleep 30` at a shell prompt), so we poll at a modest cadence.
+        let busy_badge_refresh_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(2))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             arenas: Vec::new(),
             active_arena_index: None,
@@ -459,6 +480,11 @@ impl AgentiumApp {
             should_move_window: false,
             rate_limits: None,
             _rate_limits_refresh_task: None,
+            _busy_badge_refresh_task: busy_badge_refresh_task,
+            // The RefreshKind here is irrelevant — no processes are loaded at
+            // construction time. The actual refresh spec is passed to
+            // `refresh_processes_specifics` per call.
+            sysinfo_system: RefCell::new(System::new()),
             session_state: SharedSessionState::new(),
             gh_available: false,
             pr_info: HashMap::new(),
@@ -1563,6 +1589,62 @@ impl AgentiumApp {
             .sum()
     }
 
+    fn count_busy_non_claude_terminals_in_arena(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> usize {
+        // `pid_to_session_id` contains every Claude session regardless of state
+        // (Idle / Running / WaitingPermission / Completed), so it's the right
+        // set to use for "is this terminal hosting a Claude session at all".
+        let claude_pids = self.session_state.pid_to_session_id.borrow();
+
+        // Collect live foreground PIDs so we can refresh sysinfo in one batch.
+        let arena = arena_entity.read(cx);
+        let mut candidates: Vec<u32> = Vec::new();
+        for pane in arena.center.panes().iter() {
+            for tv in pane.read(cx).items_of_type::<TerminalView>() {
+                let terminal = tv.read(cx).terminal().read(cx);
+                let Some(getter) = terminal.pid_getter() else { continue };
+                let shell_pid = getter.fallback_pid().as_u32();
+                if claude_pids.contains_key(&shell_pid) {
+                    continue;
+                }
+                if let Some(live_pid) = terminal.pid() {
+                    candidates.push(live_pid.as_u32());
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Refresh process info for just these PIDs — cheap, targeted lookup.
+        let pids: Vec<sysinfo::Pid> = candidates.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
+        let mut system = self.sysinfo_system.borrow_mut();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+
+        candidates
+            .into_iter()
+            .filter(|pid| {
+                let Some(process) = system.process(sysinfo::Pid::from_u32(*pid)) else {
+                    return false;
+                };
+                let Some(name) = process.name().to_str() else {
+                    return false;
+                };
+                if name == "claude" {
+                    return false;
+                }
+                !is_shell_process_name(name)
+            })
+            .count()
+    }
+
     fn collect_terminal_infos_for_state(
         &self,
         arena_entity: &Entity<Arena>,
@@ -2128,6 +2210,15 @@ fn remote_url_to_browser_url(url: &str) -> Option<String> {
     }
 }
 
+fn is_shell_process_name(name: &str) -> bool {
+    // Login shells are sometimes reported with a leading '-' (e.g. "-zsh").
+    let stripped = name.strip_prefix('-').unwrap_or(name);
+    matches!(
+        stripped,
+        "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh" | "nu" | "pwsh" | "xonsh" | "elvish"
+    )
+}
+
 fn load_pr_session_db() -> HashMap<String, HashMap<String, PrSessionData>> {
     let db_path = paths::data_dir().join("pr.json");
     match std::fs::read_to_string(&db_path) {
@@ -2667,7 +2758,8 @@ impl Render for AgentiumApp {
                                             let permission_count = self.count_waiting_claudes_in_arena(arena_entity, cx);
                                             let running_count = self.count_running_claudes_in_arena(arena_entity, cx);
                                             let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
-                                            let has_pills = permission_count > 0 || running_count > 0 || ready_count > 0;
+                                            let busy_count = self.count_busy_non_claude_terminals_in_arena(arena_entity, cx);
+                                            let has_pills = permission_count > 0 || running_count > 0 || ready_count > 0 || busy_count > 0;
                                             let project_url = git_info.as_ref()
                                                 .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
                                             div()
@@ -2758,6 +2850,14 @@ impl Render for AgentiumApp {
                                                                         },
                                                                     ))
                                                                 )
+                                                            })
+                                                            .when(busy_count > 0, |d| {
+                                                                d.child(render_arena_pill(
+                                                                    ("arena-busy-badge", arena.id),
+                                                                    busy_count,
+                                                                    colors.text,
+                                                                    colors.surface_background,
+                                                                ))
                                                             })
                                                     )
                                                 })
