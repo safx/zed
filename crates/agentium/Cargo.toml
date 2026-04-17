@@ -57,6 +57,7 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
+sysinfo.workspace = true
 session.workspace = true
 settings.workspace = true
 task.workspace = true
