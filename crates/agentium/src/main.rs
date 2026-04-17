@@ -131,6 +131,9 @@ enum ClaudeAction {
         /// Filter by PR number
         #[arg(long)]
         pr: Option<u32>,
+        /// Show sessions from all worktrees in this repository
+        #[arg(long, short = 'a')]
+        all_worktrees: bool,
     },
 }
 
@@ -548,26 +551,50 @@ fn main() {
             return;
         }
         Some(Command::Claude {
-            action: ClaudeAction::Sessions { pr },
+            action: ClaudeAction::Sessions { pr, all_worktrees },
         }) => {
-            let project_path = std::process::Command::new("git")
-                .args(["rev-parse", "--show-toplevel"])
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if output.status.success() {
-                        String::from_utf8(output.stdout)
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .and_then(|p| std::fs::canonicalize(&p).ok())
-                .map(|p| p.to_string_lossy().to_string());
-            let Some(project_path) = project_path else {
-                eprintln!("Error: not inside a git repository");
-                std::process::exit(1);
+            let project_paths = if all_worktrees {
+                let output = std::process::Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .output()
+                    .ok();
+                let paths: Vec<String> = output
+                    .iter()
+                    .flat_map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .filter_map(|line| line.strip_prefix("worktree "))
+                            .filter_map(|p| std::fs::canonicalize(p).ok())
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                if paths.is_empty() {
+                    eprintln!("Error: not inside a git repository or no worktrees found");
+                    std::process::exit(1);
+                }
+                paths
+            } else {
+                let project_path = std::process::Command::new("git")
+                    .args(["rev-parse", "--show-toplevel"])
+                    .output()
+                    .ok()
+                    .and_then(|output| {
+                        if output.status.success() {
+                            String::from_utf8(output.stdout)
+                                .ok()
+                                .map(|s| s.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|p| std::fs::canonicalize(&p).ok())
+                    .map(|p| p.to_string_lossy().to_string());
+                let Some(project_path) = project_path else {
+                    eprintln!("Error: not inside a git repository");
+                    std::process::exit(1);
+                };
+                vec![project_path]
             };
 
             let db_path = paths::data_dir().join("pr.json");
@@ -583,18 +610,31 @@ fn main() {
                     Err(_) => HashMap::new(),
                 };
 
-            if let Some(project_sessions) = db.get(&project_path) {
-                let mut rows: Vec<(u32, &str)> = Vec::new();
-                for (sid, data) in project_sessions {
-                    for &pr_number in &data.pr {
-                        if pr.is_none() || pr == Some(pr_number) {
-                            rows.push((pr_number, sid));
+            let mut first = true;
+            for project_path in &project_paths {
+                if let Some(project_sessions) = db.get(project_path) {
+                    let mut rows: Vec<(u32, &str)> = Vec::new();
+                    for (sid, data) in project_sessions {
+                        for &pr_number in &data.pr {
+                            if pr.is_none() || pr == Some(pr_number) {
+                                rows.push((pr_number, sid));
+                            }
                         }
                     }
-                }
-                rows.sort_by_key(|(pr_number, _)| *pr_number);
-                for (pr_number, sid) in &rows {
-                    println!("{}\t{}", pr_number, sid);
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    rows.sort_by_key(|(pr_number, _)| *pr_number);
+                    if all_worktrees {
+                        if !first {
+                            println!();
+                        }
+                        println!("worktree {}", project_path);
+                    }
+                    for (pr_number, sid) in &rows {
+                        println!("{}\t{}", pr_number, sid);
+                    }
+                    first = false;
                 }
             }
             return;
