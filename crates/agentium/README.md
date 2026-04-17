@@ -17,6 +17,8 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **GitHub PR tracking** — display PR status (draft/open/merged/closed/conflicted) with colored icons per arena, clickable to open in browser. Requires `gh` CLI.
 - **CI status** — poll GitHub Actions check status for PRs with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
+- **Claude Code session ↔ PR tracking** — persist a many-to-many mapping between Claude Code session IDs and GitHub PR numbers per project (`~/Library/Application Support/Agentium/pr.json`), queryable via CLI
+- **Running-command badge** — sidebar pill (theme-inverted white/black) shows the count of terminals in each arena currently running a non-Claude command (e.g. `cargo build`, `sleep 30`)
 
 ## Keyboard Shortcuts
 
@@ -54,7 +56,11 @@ Terminal tabs show dot indicators based on execution state:
 
 Pressing any key while focused on a terminal clears its dot (and border). Selecting a terminal from the arena badge menu also clears it.
 
-The arena sidebar shows pill-shaped badges: a green pill for the count of running Claude sessions and a blue pill for completed ones. Clicking the blue pill opens a menu to jump to specific completed terminals.
+The arena sidebar shows pill-shaped badges:
+- Orange pill — Claude sessions awaiting a permission decision (clickable: opens a menu to jump to the specific terminal)
+- Green pill — running Claude sessions
+- Blue pill — completed Claude sessions (clickable: opens a menu to jump to the specific terminal)
+- White/black pill (theme-inverted) — terminals running a non-Claude foreground command, refreshed every 2 seconds
 
 The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info for display. A "!" indicator appears if no update has been received for over 1 hour.
 
@@ -95,6 +101,20 @@ Claude Code hook integration. Events: `session-start`, `stop`, `notification`, `
 ### `agentium claude statusline`
 
 Claude Code statusline pass-through. Reads JSON from stdin, writes it back to stdout unchanged, and sends rate limit data to the running Agentium instance via IPC.
+
+### `agentium claude sessions`
+
+List Claude Code sessions linked to GitHub PRs for the current project. The project is detected via `git rev-parse --show-toplevel` (canonicalized).
+
+```
+agentium claude sessions [--pr <NUMBER>] [--all-worktrees|-a]
+```
+
+- No flags: list all `<pr>\t<session_id>` rows for the current project, sorted by PR number
+- `--pr <NUMBER>` — filter to sessions linked to that PR only
+- `--all-worktrees` / `-a` — walk all worktrees of this repo (`git worktree list --porcelain`) and print a `worktree <path>` header before each group
+
+The mapping is populated automatically: when a Claude Code session submits a user prompt (`user-prompt-submit` hook), the arena is marked dirty; when a PR is subsequently fetched for that arena, all sessions in the arena are linked to that PR. Branch switches reset the dirty flag so stale associations aren't written after checkout. Data is stored at `~/Library/Application Support/Agentium/pr.json`.
 
 ## Building
 

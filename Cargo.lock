@@ -488,6 +488,7 @@ dependencies = [
  "session",
  "settings",
  "smol",
+ "sysinfo 0.37.2",
  "task",
  "terminal",
  "terminal_view",
