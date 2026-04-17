@@ -129,6 +129,30 @@ A background monitor task (`_caffeinate_monitor_task`) polls every 3 seconds and
 
 The 5-second grace period avoids false positives at turn boundaries, where caffeinate is briefly absent between the `UserPromptSubmit` hook and the moment Claude spawns a new caffeinate for the next turn (typically <1 second).
 
+## `fallback_pid` is not the shell's live PID
+
+`ProcessIdGetter::fallback_pid` is captured from `pty.child().id()` at PTY spawn time. In practice this is a **wrapper process** PID, not the interactive shell's PID. Empirically on macOS/zsh, `tcgetpgrp(pty_fd)` returns a different PID (the actual shell) even when the shell is idle at a prompt.
+
+Implication: **do not use `terminal.pid() != getter.fallback_pid()` to detect "something is running"**. This was tried for a busy-terminal indicator and always evaluated `true` — every zsh terminal looked busy. Use process-name comparison instead (see next rule). The `fallback_pid` is still useful as a stable identifier for the terminal (Claude session hooks are keyed to it), just not for foreground-state detection.
+
+## `Terminal::foreground_process_name()` is a stale cache
+
+`foreground_process_name()` reads `PtyProcessInfo.current`, a `RwLock<Option<ProcessInfo>>` that is only written by `emit_title_changed_if_changed()`. That function is only invoked from terminal event handlers — which do not fire for silent commands like `sleep 30` or `wait`. Verified empirically via eprintln: `foreground_process_name()` stays at `"zsh"` for the full 30 seconds of a `sleep 30`.
+
+For features that need a live foreground process name, own a `sysinfo::System` directly and call `refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::nothing().with_exe(UpdateKind::Always))` with the target PIDs. Batching by known PIDs keeps the cost proportional to the number of terminals, not the number of processes on the machine. See `count_busy_non_claude_terminals_in_arena` in `agentium.rs` for the pattern.
+
+## "Is this a Claude terminal?" uses `pid_to_session_id`, not state-specific sets
+
+For checks of the form "does this shell host a Claude Code session?", use `session_state.pid_to_session_id` — it contains every session regardless of state (Idle / Running / WaitingPermission / Completed). The state-specific sets (`running_shell_pids`, `permission_shell_pids`, `ready_shell_pids`) each miss at least one legitimate Claude state; using them to "exclude Claude terminals" would wrongly count idle Claude terminals as non-Claude.
+
+## `HeadChanged` fires on commits, not just branch switches
+
+`GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, _)` fires on **every** HEAD movement — `git commit`, `git rebase`, `git reset`, etc., not only branch switches. If a feature needs "branch switched" semantics (e.g. invalidating a flag), compare the current branch name against a stored previous name and act only on change. See the `last_branch_names` tracking used by the PR-session dirty flag in `AgentiumApp::new`.
+
+## Sidebar needs periodic `cx.notify()` for non-event-driven state
+
+AgentiumApp's sidebar re-renders only when `cx.notify()` fires on the AgentiumApp entity. There is no GPUI event for changes in `tcgetpgrp`, `sysinfo`, or similar polled OS state — so any sidebar indicator derived from such state needs a background task calling `cx.notify()` on a timer. See `_busy_badge_refresh_task` (2s cadence) and `_rate_limits_refresh_task` (30s cadence) for the pattern. Emit-title-changed → UpdateTab chains from the terminal crate will NOT fire for silent commands; don't rely on them.
+
 ## TERM_PROGRAM is derived from the binary name
 
 `terminal::insert_zed_terminal_env` uses `std::env::current_exe()` to determine the value of `TERM_PROGRAM`. When the running binary is `agentium` (including inside `Agentium.app/Contents/MacOS/agentium`), terminals get `TERM_PROGRAM=agentium`. When running as `zed`, they get `TERM_PROGRAM=zed`. This is important for tools like Claude Code that inspect `TERM_PROGRAM` to detect the host terminal.
