@@ -13,7 +13,7 @@ use crate::parser::{CodeBlockKind, MarkdownEvent, MarkdownTag};
 
 use super::{Markdown, MarkdownStyle, ParsedMarkdown};
 
-type MermaidDiagramCache = HashMap<ParsedMarkdownMermaidDiagramContents, Arc<CachedMermaidDiagram>>;
+type MermaidDiagramCache = HashMap<MermaidCacheKey, Arc<CachedMermaidDiagram>>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedMarkdownMermaidDiagram {
@@ -27,10 +27,21 @@ pub(crate) struct ParsedMarkdownMermaidDiagramContents {
     pub(crate) scale: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MermaidCacheKey {
+    pub(crate) contents: ParsedMarkdownMermaidDiagramContents,
+    pub(crate) is_light: bool,
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct MermaidState {
     cache: MermaidDiagramCache,
-    order: Vec<ParsedMarkdownMermaidDiagramContents>,
+    order: Vec<MermaidCacheKey>,
+    // Mirrors the appearance used by the most recent `update()` call. The
+    // default value is meaningless on its own — it is unused until `update()`
+    // has stamped it, which happens before any mermaid block can be rendered
+    // (parse → update → render).
+    pub(crate) is_light: bool,
 }
 
 struct CachedMermaidDiagram {
@@ -47,7 +58,7 @@ impl MermaidState {
 
     fn get_fallback_image(
         idx: usize,
-        old_order: &[ParsedMarkdownMermaidDiagramContents],
+        old_order: &[MermaidCacheKey],
         new_order_len: usize,
         cache: &MermaidDiagramCache,
     ) -> Option<Arc<RenderImage>> {
@@ -55,8 +66,8 @@ impl MermaidState {
             return None;
         }
 
-        old_order.get(idx).and_then(|old_content| {
-            cache.get(old_content).and_then(|old_cached| {
+        old_order.get(idx).and_then(|old_key| {
+            cache.get(old_key).and_then(|old_cached| {
                 old_cached
                     .render_image
                     .get()
@@ -67,32 +78,38 @@ impl MermaidState {
     }
 
     pub(crate) fn update(&mut self, parsed: &ParsedMarkdown, cx: &mut Context<Markdown>) {
+        let is_light = cx.theme().appearance().is_light();
+        self.is_light = is_light;
+
         let mut new_order = Vec::new();
         for mermaid_diagram in parsed.mermaid_diagrams.values() {
-            new_order.push(mermaid_diagram.contents.clone());
+            new_order.push(MermaidCacheKey {
+                contents: mermaid_diagram.contents.clone(),
+                is_light,
+            });
         }
 
-        for (idx, new_content) in new_order.iter().enumerate() {
-            if !self.cache.contains_key(new_content) {
+        for (idx, new_key) in new_order.iter().enumerate() {
+            if !self.cache.contains_key(new_key) {
                 let fallback =
                     Self::get_fallback_image(idx, &self.order, new_order.len(), &self.cache);
                 self.cache.insert(
-                    new_content.clone(),
-                    Arc::new(CachedMermaidDiagram::new(new_content.clone(), fallback, cx)),
+                    new_key.clone(),
+                    Arc::new(CachedMermaidDiagram::new(new_key.clone(), fallback, cx)),
                 );
             }
         }
 
         let new_order_set: std::collections::HashSet<_> = new_order.iter().cloned().collect();
         self.cache
-            .retain(|content, _| new_order_set.contains(content));
+            .retain(|key, _| new_order_set.contains(key));
         self.order = new_order;
     }
 }
 
 impl CachedMermaidDiagram {
     fn new(
-        contents: ParsedMarkdownMermaidDiagramContents,
+        key: MermaidCacheKey,
         fallback_image: Option<Arc<RenderImage>>,
         cx: &mut Context<Markdown>,
     ) -> Self {
@@ -103,8 +120,20 @@ impl CachedMermaidDiagram {
         let task = cx.spawn(async move |this, cx| {
             let value = cx
                 .background_spawn(async move {
-                    let svg_string = mermaid_rs_renderer::render(&contents.contents)?;
-                    let scale = contents.scale as f32 / 100.0;
+                    let theme = if key.is_light {
+                        mermaid_rs_renderer::Theme::modern()
+                    } else {
+                        mermaid_dark_theme()
+                    };
+                    let options = mermaid_rs_renderer::RenderOptions {
+                        theme,
+                        layout: mermaid_rs_renderer::LayoutConfig::default(),
+                    };
+                    let svg_string = mermaid_rs_renderer::render_with_options(
+                        &key.contents.contents,
+                        options,
+                    )?;
+                    let scale = key.contents.scale as f32 / 100.0;
                     svg_renderer
                         .render_single_frame(svg_string.as_bytes(), scale)
                         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -139,6 +168,37 @@ impl CachedMermaidDiagram {
             _task: Task::ready(()),
         }
     }
+}
+
+// Derived from Zed's "One Dark" palette. Keeps the same field structure as
+// `Theme::modern()` and only overrides color-valued fields.
+fn mermaid_dark_theme() -> mermaid_rs_renderer::Theme {
+    let hex = |value: &str| value.to_string();
+    let mut theme = mermaid_rs_renderer::Theme::modern();
+    theme.background = hex("#2f343e");
+    theme.primary_color = hex("#3b414d");
+    theme.secondary_color = hex("#464b57");
+    theme.tertiary_color = hex("#2e343e");
+    theme.primary_text_color = hex("#dce0e5");
+    theme.text_color = hex("#dce0e5");
+    theme.primary_border_color = hex("#7d8494");
+    theme.line_color = hex("#9ca3af");
+    theme.edge_label_background = hex("#2f343e");
+    theme.cluster_background = hex("#353b47");
+    theme.cluster_border = hex("#545a67");
+    theme.sequence_actor_fill = hex("#3b414d");
+    theme.sequence_actor_border = hex("#7d8494");
+    theme.sequence_actor_line = hex("#6b7280");
+    theme.sequence_note_fill = hex("#4b3f2c");
+    theme.sequence_note_border = hex("#dec184");
+    theme.sequence_activation_fill = hex("#3b414d");
+    theme.sequence_activation_border = hex("#7d8494");
+    theme.pie_title_text_color = hex("#dce0e5");
+    theme.pie_section_text_color = hex("#dce0e5");
+    theme.pie_legend_text_color = hex("#dce0e5");
+    theme.pie_stroke_color = hex("#94a3b8");
+    theme.pie_outer_stroke_color = hex("#464b57");
+    theme
 }
 
 fn parse_mermaid_info(info: &str) -> Option<u32> {
@@ -197,7 +257,11 @@ pub(crate) fn render_mermaid_diagram(
     mermaid_state: &MermaidState,
     style: &MarkdownStyle,
 ) -> AnyElement {
-    let cached = mermaid_state.cache.get(&parsed.contents);
+    let lookup_key = MermaidCacheKey {
+        contents: parsed.contents.clone(),
+        is_light: mermaid_state.is_light,
+    };
+    let cached = mermaid_state.cache.get(&lookup_key);
     let mut container = div().w_full();
     container.style().refine(&style.code_block);
 
@@ -263,7 +327,7 @@ pub(crate) fn render_mermaid_diagram(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedMermaidDiagram, MermaidDiagramCache, MermaidState,
+        CachedMermaidDiagram, MermaidCacheKey, MermaidDiagramCache, MermaidState,
         ParsedMarkdownMermaidDiagramContents, extract_mermaid_diagrams, parse_mermaid_info,
     };
     use crate::{
@@ -339,23 +403,25 @@ mod tests {
         }
     }
 
-    fn mermaid_sequence(diagrams: &[&str]) -> Vec<ParsedMarkdownMermaidDiagramContents> {
-        diagrams
-            .iter()
-            .map(|diagram| mermaid_contents(diagram))
-            .collect()
+    fn light_key(contents: &str) -> MermaidCacheKey {
+        MermaidCacheKey {
+            contents: mermaid_contents(contents),
+            is_light: true,
+        }
+    }
+
+    fn mermaid_sequence(diagrams: &[&str]) -> Vec<MermaidCacheKey> {
+        diagrams.iter().map(|diagram| light_key(diagram)).collect()
     }
 
     fn mermaid_fallback(
         new_diagram: &str,
-        new_full_order: &[ParsedMarkdownMermaidDiagramContents],
-        old_full_order: &[ParsedMarkdownMermaidDiagramContents],
+        new_full_order: &[MermaidCacheKey],
+        old_full_order: &[MermaidCacheKey],
         cache: &MermaidDiagramCache,
     ) -> Option<Arc<RenderImage>> {
-        let new_content = mermaid_contents(new_diagram);
-        let idx = new_full_order
-            .iter()
-            .position(|diagram| diagram == &new_content)?;
+        let new_key = light_key(new_diagram);
+        let idx = new_full_order.iter().position(|key| key == &new_key)?;
         MermaidState::get_fallback_image(idx, old_full_order, new_full_order.len(), cache)
     }
 
@@ -389,21 +455,21 @@ mod tests {
 
         let mut cache: MermaidDiagramCache = HashMap::default();
         cache.insert(
-            mermaid_contents("graph A"),
+            light_key("graph A"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
             )),
         );
         cache.insert(
-            mermaid_contents("graph B"),
+            light_key("graph B"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(svg_b.clone()),
                 None,
             )),
         );
         cache.insert(
-            mermaid_contents("graph C"),
+            light_key("graph C"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
@@ -423,14 +489,14 @@ mod tests {
 
         let mut cache: MermaidDiagramCache = HashMap::default();
         cache.insert(
-            mermaid_contents("graph A"),
+            light_key("graph A"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
             )),
         );
         cache.insert(
-            mermaid_contents("graph C"),
+            light_key("graph C"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
@@ -451,21 +517,21 @@ mod tests {
 
         let mut cache: MermaidDiagramCache = HashMap::default();
         cache.insert(
-            mermaid_contents("graph A"),
+            light_key("graph A"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
             )),
         );
         cache.insert(
-            mermaid_contents("graph B modified"),
+            light_key("graph B modified"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 None,
                 Some(original_svg.clone()),
             )),
         );
         cache.insert(
-            mermaid_contents("graph C"),
+            light_key("graph C"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
@@ -494,14 +560,14 @@ mod tests {
 
         let mut cache: MermaidDiagramCache = HashMap::default();
         cache.insert(
-            mermaid_contents("graph A"),
+            light_key("graph A"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(svg_a.clone()),
                 None,
             )),
         );
         cache.insert(
-            mermaid_contents("graph B"),
+            light_key("graph B"),
             Arc::new(CachedMermaidDiagram::new_for_test(
                 Some(mock_render_image(cx)),
                 None,
@@ -511,6 +577,86 @@ mod tests {
         let fallback = mermaid_fallback("graph A edited", &new_full_order, &old_full_order, &cache);
 
         assert_eq!(fallback.as_ref().map(|image| image.id), Some(svg_a.id));
+    }
+
+    fn set_theme_appearance(cx: &mut TestAppContext, appearance: theme::Appearance) {
+        cx.update(|cx| {
+            let current = cx.theme().clone();
+            if current.appearance == appearance {
+                return;
+            }
+            let mut next = (*current).clone();
+            next.appearance = appearance;
+            theme::GlobalTheme::update_theme(cx, Arc::new(next));
+        });
+    }
+
+    // Exercises the full observe-global → update() path: populates the cache
+    // under a light appearance, flips the global theme to dark, and asserts
+    // that update() stamped new dark-appearance keys and evicted the light
+    // ones. Covers the behavior that the Markdown entity's GlobalTheme
+    // subscription drives in production.
+    #[gpui::test]
+    fn test_mermaid_update_rekeys_on_appearance_change(cx: &mut TestAppContext) {
+        struct TestWindow;
+        impl Render for TestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        set_theme_appearance(cx, theme::Appearance::Light);
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                "```mermaid\ngraph TD;\n```".into(),
+                None,
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        markdown.read_with(cx, |markdown, _| {
+            assert!(markdown.mermaid_state.is_light);
+            assert_eq!(markdown.mermaid_state.order.len(), 1);
+            assert!(
+                markdown.mermaid_state.order.iter().all(|key| key.is_light),
+                "cache should be populated with light-appearance keys",
+            );
+        });
+
+        set_theme_appearance(cx, theme::Appearance::Dark);
+        cx.run_until_parked();
+
+        markdown.read_with(cx, |markdown, _| {
+            assert!(!markdown.mermaid_state.is_light);
+            assert_eq!(markdown.mermaid_state.order.len(), 1);
+            assert!(
+                markdown.mermaid_state.order.iter().all(|key| !key.is_light),
+                "observer should have re-keyed the cache to dark-appearance",
+            );
+            for key in &markdown.mermaid_state.order {
+                assert!(
+                    markdown.mermaid_state.cache.contains_key(key),
+                    "dark-appearance keys must be present in the cache",
+                );
+                let light_twin = MermaidCacheKey {
+                    contents: key.contents.clone(),
+                    is_light: true,
+                };
+                assert!(
+                    !markdown.mermaid_state.cache.contains_key(&light_twin),
+                    "stale light-appearance entries must have been evicted",
+                );
+            }
+        });
     }
 
     #[gpui::test]
@@ -570,11 +716,15 @@ mod tests {
                 .unwrap()
                 .contents
                 .clone();
+            let key = MermaidCacheKey {
+                contents,
+                is_light: markdown.mermaid_state.is_light,
+            };
             markdown.mermaid_state.cache.insert(
-                contents.clone(),
+                key.clone(),
                 Arc::new(CachedMermaidDiagram::new_for_test(Some(render_image), None)),
             );
-            markdown.mermaid_state.order = vec![contents];
+            markdown.mermaid_state.order = vec![key];
         });
 
         let (rendered, _) = cx.draw(

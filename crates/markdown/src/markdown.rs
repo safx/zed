@@ -36,7 +36,7 @@ use gpui::{
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
-    StyleRefinement, StyledText, Task, TextAlign, TextLayout, TextRun, TextStyle,
+    StyleRefinement, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun, TextStyle,
     TextStyleRefinement, actions, img, point, quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
@@ -46,7 +46,7 @@ use parser::{
 };
 use pulldown_cmark::Alignment;
 use sum_tree::TreeMap;
-use theme::SyntaxTheme;
+use theme::{GlobalTheme, SyntaxTheme};
 use ui::{ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
 use util::ResultExt;
 
@@ -241,6 +241,7 @@ pub struct Markdown {
     context_menu_selected_text: Option<String>,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
+    _theme_subscription: Option<Subscription>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -391,6 +392,20 @@ impl Markdown {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let theme_subscription = options.render_mermaid_diagrams.then(|| {
+            cx.observe_global::<GlobalTheme>(|this, cx| {
+                // GlobalTheme is replaced on every theme-settings reload, not
+                // just on appearance flips. Skip the re-render traversal when
+                // the light/dark axis is unchanged — the cache keys would be
+                // identical so nothing would move.
+                if cx.theme().appearance().is_light() == this.mermaid_state.is_light {
+                    return;
+                }
+                let parsed = this.parsed_markdown.clone();
+                this.mermaid_state.update(&parsed, cx);
+                cx.notify();
+            })
+        });
         let mut this = Self {
             source,
             selection: Selection::default(),
@@ -413,6 +428,7 @@ impl Markdown {
             context_menu_selected_text: None,
             search_highlights: Vec::new(),
             active_search_highlight: None,
+            _theme_subscription: theme_subscription,
         };
         this.parse(cx);
         this
