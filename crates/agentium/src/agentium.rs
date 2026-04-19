@@ -84,11 +84,12 @@ struct RateLimits {
     received_at: Instant,
 }
 
-struct ReadyTerminalInfo {
+#[derive(Clone)]
+struct BadgeEntryInfo {
     pane: Entity<Pane>,
     terminal_view: Entity<TerminalView>,
-    user_prompt: String,
-    status_message: String,
+    primary: String,
+    secondary: String,
 }
 
 #[derive(Clone, Copy)]
@@ -210,10 +211,10 @@ pub struct AgentiumApp {
     rate_limits: Option<RateLimits>,
     _rate_limits_refresh_task: Option<Task<()>>,
     _busy_badge_refresh_task: Task<()>,
-    // Reused across `count_busy_non_claude_terminals_in_arena` calls to avoid
-    // reconstructing the System on every sidebar render. `RefCell` is safe only
-    // so long as the `borrow_mut()` inside that method is dropped before the
-    // next arena iteration — do not hold the borrow across the arena loop.
+    // Reused across `collect_busy_terminal_infos` calls to avoid reconstructing
+    // the System on every sidebar render. `RefCell` is safe only so long as the
+    // `borrow_mut()` inside that method is taken after the arena walk completes
+    // — do not hold the borrow across the arena loop.
     sysinfo_system: RefCell<System>,
     gh_available: bool,
     pr_info: HashMap<EntityId, PrInfo>,
@@ -1489,161 +1490,6 @@ impl AgentiumApp {
         }
     }
 
-    fn count_ready_terminals_in_arena(
-        &self,
-        workspace: &Entity<Arena>,
-        cx: &App,
-    ) -> usize {
-        let ready_pids = self.session_state.ready_shell_pids.borrow();
-        if ready_pids.is_empty() {
-            return 0;
-        }
-        let running_pids = self.session_state.running_shell_pids.borrow();
-        let permission_pids = self.session_state.permission_shell_pids.borrow();
-        let ws = workspace.read(cx);
-        ws.center
-            .panes()
-            .iter()
-            .map(|pane| {
-                pane.read(cx)
-                    .items_of_type::<TerminalView>()
-                    .filter(|tv| {
-                        tv.read(cx)
-                            .terminal()
-                            .read(cx)
-                            .pid_getter()
-                            .is_some_and(|g| {
-                                let pid = g.fallback_pid().as_u32();
-                                ready_pids.contains(&pid)
-                                    && !running_pids.contains(&pid)
-                                    && !permission_pids.contains(&pid)
-                            })
-                    })
-                    .count()
-            })
-            .sum()
-    }
-
-    fn count_running_claudes_in_arena(
-        &self,
-        arena_entity: &Entity<Arena>,
-        cx: &App,
-    ) -> usize {
-        let running_pids = self.session_state.running_shell_pids.borrow();
-        if running_pids.is_empty() {
-            return 0;
-        }
-        let permission_pids = self.session_state.permission_shell_pids.borrow();
-        let arena = arena_entity.read(cx);
-        arena
-            .center
-            .panes()
-            .iter()
-            .map(|pane| {
-                pane.read(cx)
-                    .items_of_type::<TerminalView>()
-                    .filter(|tv| {
-                        tv.read(cx)
-                            .terminal()
-                            .read(cx)
-                            .pid_getter()
-                            .is_some_and(|g| {
-                                let pid = g.fallback_pid().as_u32();
-                                running_pids.contains(&pid)
-                                    && !permission_pids.contains(&pid)
-                            })
-                    })
-                    .count()
-            })
-            .sum()
-    }
-
-    fn count_waiting_claudes_in_arena(
-        &self,
-        arena_entity: &Entity<Arena>,
-        cx: &App,
-    ) -> usize {
-        let permission_pids = self.session_state.permission_shell_pids.borrow();
-        if permission_pids.is_empty() {
-            return 0;
-        }
-        let arena = arena_entity.read(cx);
-        arena
-            .center
-            .panes()
-            .iter()
-            .map(|pane| {
-                pane.read(cx)
-                    .items_of_type::<TerminalView>()
-                    .filter(|tv| {
-                        tv.read(cx)
-                            .terminal()
-                            .read(cx)
-                            .pid_getter()
-                            .is_some_and(|g| {
-                                permission_pids.contains(&g.fallback_pid().as_u32())
-                            })
-                    })
-                    .count()
-            })
-            .sum()
-    }
-
-    fn count_busy_non_claude_terminals_in_arena(
-        &self,
-        arena_entity: &Entity<Arena>,
-        cx: &App,
-    ) -> usize {
-        // `pid_to_session_id` contains every Claude session regardless of state
-        // (Idle / Running / WaitingPermission / Completed), so it's the right
-        // set to use for "is this terminal hosting a Claude session at all".
-        let claude_pids = self.session_state.pid_to_session_id.borrow();
-
-        // Collect live foreground PIDs so we can refresh sysinfo in one batch.
-        let arena = arena_entity.read(cx);
-        let mut candidates: Vec<u32> = Vec::new();
-        for pane in arena.center.panes().iter() {
-            for tv in pane.read(cx).items_of_type::<TerminalView>() {
-                let terminal = tv.read(cx).terminal().read(cx);
-                let Some(getter) = terminal.pid_getter() else { continue };
-                let shell_pid = getter.fallback_pid().as_u32();
-                if claude_pids.contains_key(&shell_pid) {
-                    continue;
-                }
-                if let Some(live_pid) = terminal.pid() {
-                    candidates.push(live_pid.as_u32());
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return 0;
-        }
-
-        // Refresh process info for just these PIDs — cheap, targeted lookup.
-        let pids: Vec<sysinfo::Pid> = candidates.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
-        let mut system = self.sysinfo_system.borrow_mut();
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&pids),
-            true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
-        );
-
-        candidates
-            .into_iter()
-            .filter(|pid| {
-                let Some(process) = system.process(sysinfo::Pid::from_u32(*pid)) else {
-                    return false;
-                };
-                let Some(name) = process.name().to_str() else {
-                    return false;
-                };
-                if name == "claude" {
-                    return false;
-                }
-                !is_shell_process_name(name)
-            })
-            .count()
-    }
 
     fn collect_terminal_infos_for_state(
         &self,
@@ -1651,7 +1497,7 @@ impl AgentiumApp {
         state: ClaudeSessionState,
         pids: &HashSet<u32>,
         cx: &App,
-    ) -> Vec<ReadyTerminalInfo> {
+    ) -> Vec<BadgeEntryInfo> {
         if pids.is_empty() {
             return vec![];
         }
@@ -1669,7 +1515,7 @@ impl AgentiumApp {
                     Some(p) if pids.contains(&p) => p,
                     _ => continue,
                 };
-                let (user_prompt, status_message) = self
+                let (primary, secondary) = self
                     .claude_sessions
                     .values()
                     .find(|s| {
@@ -1678,11 +1524,11 @@ impl AgentiumApp {
                     })
                     .map(|s| (s.user_prompt.clone(), s.status_message.clone()))
                     .unwrap_or_default();
-                infos.push(ReadyTerminalInfo {
+                infos.push(BadgeEntryInfo {
                     pane: pane.clone(),
                     terminal_view: tv,
-                    user_prompt,
-                    status_message,
+                    primary,
+                    secondary,
                 });
             }
         }
@@ -1693,7 +1539,7 @@ impl AgentiumApp {
         &self,
         arena_entity: &Entity<Arena>,
         cx: &App,
-    ) -> Vec<ReadyTerminalInfo> {
+    ) -> Vec<BadgeEntryInfo> {
         let pids = self.session_state.ready_shell_pids.borrow().clone();
         self.collect_terminal_infos_for_state(
             arena_entity,
@@ -1707,7 +1553,7 @@ impl AgentiumApp {
         &self,
         arena_entity: &Entity<Arena>,
         cx: &App,
-    ) -> Vec<ReadyTerminalInfo> {
+    ) -> Vec<BadgeEntryInfo> {
         let pids = self.session_state.permission_shell_pids.borrow().clone();
         self.collect_terminal_infos_for_state(
             arena_entity,
@@ -1717,10 +1563,95 @@ impl AgentiumApp {
         )
     }
 
+    fn collect_running_terminal_infos(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> Vec<BadgeEntryInfo> {
+        let running = self.session_state.running_shell_pids.borrow();
+        let permission = self.session_state.permission_shell_pids.borrow();
+        let pids: HashSet<u32> = running.difference(&permission).copied().collect();
+        self.collect_terminal_infos_for_state(
+            arena_entity,
+            ClaudeSessionState::Running,
+            &pids,
+            cx,
+        )
+    }
+
+    fn collect_busy_terminal_infos(
+        &self,
+        arena_entity: &Entity<Arena>,
+        cx: &App,
+    ) -> Vec<BadgeEntryInfo> {
+        struct Candidate {
+            live_pid: u32,
+            pane: Entity<Pane>,
+            terminal_view: Entity<TerminalView>,
+        }
+        let claude_pids = self.session_state.pid_to_session_id.borrow();
+        let arena = arena_entity.read(cx);
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for pane in arena.center.panes() {
+            for tv in pane.read(cx).items_of_type::<TerminalView>() {
+                let terminal = tv.read(cx).terminal().read(cx);
+                let Some(getter) = terminal.pid_getter() else {
+                    continue;
+                };
+                let shell_pid = getter.fallback_pid().as_u32();
+                if claude_pids.contains_key(&shell_pid) {
+                    continue;
+                }
+                if let Some(live_pid) = terminal.pid() {
+                    candidates.push(Candidate {
+                        live_pid: live_pid.as_u32(),
+                        pane: pane.clone(),
+                        terminal_view: tv.clone(),
+                    });
+                }
+            }
+        }
+        drop(claude_pids);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let pids: Vec<sysinfo::Pid> = candidates
+            .iter()
+            .map(|c| sysinfo::Pid::from_u32(c.live_pid))
+            .collect();
+        let mut system = self.sysinfo_system.borrow_mut();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+
+        let mut infos = Vec::new();
+        for c in candidates {
+            let Some(process) = system.process(sysinfo::Pid::from_u32(c.live_pid)) else {
+                continue;
+            };
+            let Some(name) = process.name().to_str() else {
+                continue;
+            };
+            if name == "claude" || is_shell_process_name(name) {
+                continue;
+            }
+            infos.push(BadgeEntryInfo {
+                pane: c.pane,
+                terminal_view: c.terminal_view,
+                primary: name.to_owned(),
+                secondary: format!("PID {}", c.live_pid),
+            });
+        }
+        infos
+    }
+
     fn deploy_badge_menu(
         &mut self,
         arena_index: usize,
-        terminal_infos: Vec<ReadyTerminalInfo>,
+        terminal_infos: Vec<BadgeEntryInfo>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1731,12 +1662,12 @@ impl AgentiumApp {
             for info in terminal_infos {
                 let pane = info.pane.clone();
                 let terminal_view = info.terminal_view.clone();
-                let prompt_label = if info.user_prompt.is_empty() {
+                let primary_label = if info.primary.is_empty() {
                     "(no prompt)".to_string()
                 } else {
-                    truncate_for_menu(&info.user_prompt)
+                    truncate_for_menu(&info.primary)
                 };
-                let status_label = truncate_for_menu(&info.status_message);
+                let secondary_label = truncate_for_menu(&info.secondary);
 
                 menu = menu.custom_entry(
                     move |_window, cx| {
@@ -1749,14 +1680,14 @@ impl AgentiumApp {
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
                                     .truncate()
-                                    .child(prompt_label.clone()),
+                                    .child(primary_label.clone()),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(colors.text_muted)
                                     .truncate()
-                                    .child(status_label.clone()),
+                                    .child(secondary_label.clone()),
                             )
                             .into_any_element()
                     },
@@ -1851,6 +1782,47 @@ fn render_arena_pill(
         .text_xs()
         .line_height(relative(1.4))
         .child(format!("{count}"))
+}
+
+const BADGE_TOOLTIP_MAX_ENTRIES: usize = 10;
+
+fn render_badge_tooltip(entries: &[BadgeEntryInfo], cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    let shown = entries.len().min(BADGE_TOOLTIP_MAX_ENTRIES);
+    let hidden = entries.len() - shown;
+    let mut column = v_flex().gap_1();
+    for entry in &entries[..shown] {
+        let primary = if entry.primary.is_empty() {
+            "(no prompt)".to_string()
+        } else {
+            truncate_for_menu(&entry.primary)
+        };
+        let secondary = truncate_for_menu(&entry.secondary);
+        column = column.child(
+            v_flex()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .child(primary),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child(secondary),
+                ),
+        );
+    }
+    if hidden > 0 {
+        column = column.child(
+            div()
+                .text_xs()
+                .text_color(colors.text_muted)
+                .child(format!("+{hidden} more")),
+        );
+    }
+    column.into_any_element()
 }
 
 fn format_resets_in(resets_at: i64) -> String {
@@ -2755,11 +2727,14 @@ impl Render for AgentiumApp {
                                         })
                                         .child({
                                             let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
-                                            let permission_count = self.count_waiting_claudes_in_arena(arena_entity, cx);
-                                            let running_count = self.count_running_claudes_in_arena(arena_entity, cx);
-                                            let ready_count = self.count_ready_terminals_in_arena(arena_entity, cx);
-                                            let busy_count = self.count_busy_non_claude_terminals_in_arena(arena_entity, cx);
-                                            let has_pills = permission_count > 0 || running_count > 0 || ready_count > 0 || busy_count > 0;
+                                            let permission_infos = self.collect_permission_terminal_infos(arena_entity, cx);
+                                            let running_infos = self.collect_running_terminal_infos(arena_entity, cx);
+                                            let ready_infos = self.collect_ready_terminal_infos(arena_entity, cx);
+                                            let busy_infos = self.collect_busy_terminal_infos(arena_entity, cx);
+                                            let has_pills = !permission_infos.is_empty()
+                                                || !running_infos.is_empty()
+                                                || !ready_infos.is_empty()
+                                                || !busy_infos.is_empty();
                                             let project_url = git_info.as_ref()
                                                 .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
                                             div()
@@ -2792,72 +2767,108 @@ impl Render for AgentiumApp {
                                                     }
                                                 })
                                                 .when(has_pills, |d| {
-                                                    let arena_entity_for_badge = arena_entity.clone();
                                                     d.child(
                                                         h_flex()
                                                             .gap_0p5()
-                                                            .when(permission_count > 0, |d| {
-                                                                let arena_entity_for_permission = arena_entity.clone();
+                                                            .when(!permission_infos.is_empty(), |d| {
+                                                                let entries = permission_infos.clone();
+                                                                let tooltip_entries = entries.clone();
                                                                 d.child(
                                                                     render_arena_pill(
                                                                         ("arena-permission-badge", arena.id),
-                                                                        permission_count,
+                                                                        entries.len(),
                                                                         status_colors.warning,
                                                                         colors.surface_background,
                                                                     )
                                                                     .cursor_pointer()
+                                                                    .tooltip(Tooltip::element(move |_window, cx| {
+                                                                        render_badge_tooltip(&tooltip_entries, cx)
+                                                                    }))
                                                                     .on_click(cx.listener(
                                                                         move |this, event: &ClickEvent, window, cx| {
                                                                             cx.stop_propagation();
                                                                             this.switch_arena(i, window, cx);
-                                                                            let infos = this.collect_permission_terminal_infos(
-                                                                                &arena_entity_for_permission, cx,
-                                                                            );
                                                                             this.deploy_badge_menu(
-                                                                                i, infos, event.position(), window, cx,
+                                                                                i, entries.clone(), event.position(), window, cx,
                                                                             );
                                                                         },
                                                                     ))
                                                                 )
                                                             })
-                                                            .when(running_count > 0, |d| {
-                                                                d.child(render_arena_pill(
-                                                                    ("arena-running-badge", arena.id),
-                                                                    running_count,
-                                                                    status_colors.success,
-                                                                    colors.surface_background,
-                                                                ))
+                                                            .when(!running_infos.is_empty(), |d| {
+                                                                let entries = running_infos.clone();
+                                                                let tooltip_entries = entries.clone();
+                                                                d.child(
+                                                                    render_arena_pill(
+                                                                        ("arena-running-badge", arena.id),
+                                                                        entries.len(),
+                                                                        status_colors.success,
+                                                                        colors.surface_background,
+                                                                    )
+                                                                    .cursor_pointer()
+                                                                    .tooltip(Tooltip::element(move |_window, cx| {
+                                                                        render_badge_tooltip(&tooltip_entries, cx)
+                                                                    }))
+                                                                    .on_click(cx.listener(
+                                                                        move |this, event: &ClickEvent, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.switch_arena(i, window, cx);
+                                                                            this.deploy_badge_menu(
+                                                                                i, entries.clone(), event.position(), window, cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                )
                                                             })
-                                                            .when(ready_count > 0, |d| {
+                                                            .when(!ready_infos.is_empty(), |d| {
+                                                                let entries = ready_infos.clone();
+                                                                let tooltip_entries = entries.clone();
                                                                 d.child(
                                                                     render_arena_pill(
                                                                         ("arena-ready-badge", arena.id),
-                                                                        ready_count,
+                                                                        entries.len(),
                                                                         colors.text_accent,
                                                                         colors.surface_background,
                                                                     )
                                                                     .cursor_pointer()
+                                                                    .tooltip(Tooltip::element(move |_window, cx| {
+                                                                        render_badge_tooltip(&tooltip_entries, cx)
+                                                                    }))
                                                                     .on_click(cx.listener(
                                                                         move |this, event: &ClickEvent, window, cx| {
                                                                             cx.stop_propagation();
                                                                             this.switch_arena(i, window, cx);
-                                                                            let infos = this.collect_ready_terminal_infos(
-                                                                                &arena_entity_for_badge, cx,
-                                                                            );
                                                                             this.deploy_badge_menu(
-                                                                                i, infos, event.position(), window, cx,
+                                                                                i, entries.clone(), event.position(), window, cx,
                                                                             );
                                                                         },
                                                                     ))
                                                                 )
                                                             })
-                                                            .when(busy_count > 0, |d| {
-                                                                d.child(render_arena_pill(
-                                                                    ("arena-busy-badge", arena.id),
-                                                                    busy_count,
-                                                                    colors.text,
-                                                                    colors.surface_background,
-                                                                ))
+                                                            .when(!busy_infos.is_empty(), |d| {
+                                                                let entries = busy_infos.clone();
+                                                                let tooltip_entries = entries.clone();
+                                                                d.child(
+                                                                    render_arena_pill(
+                                                                        ("arena-busy-badge", arena.id),
+                                                                        entries.len(),
+                                                                        colors.text,
+                                                                        colors.surface_background,
+                                                                    )
+                                                                    .cursor_pointer()
+                                                                    .tooltip(Tooltip::element(move |_window, cx| {
+                                                                        render_badge_tooltip(&tooltip_entries, cx)
+                                                                    }))
+                                                                    .on_click(cx.listener(
+                                                                        move |this, event: &ClickEvent, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.switch_arena(i, window, cx);
+                                                                            this.deploy_badge_menu(
+                                                                                i, entries.clone(), event.position(), window, cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                )
                                                             })
                                                     )
                                                 })
