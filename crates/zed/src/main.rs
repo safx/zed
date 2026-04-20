@@ -360,6 +360,9 @@ fn main() {
         },
     );
 
+    #[cfg(unix)]
+    crashes::set_panic_cleanup(terminal::active_terminals::broadcast_sigterm_and_wait);
+
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
