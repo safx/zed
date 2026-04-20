@@ -24,6 +24,28 @@ use std::{
 
 pub use minidumper::Client;
 
+// Optional cleanup hook invoked just before we abort/exit on panic. Wired by
+// `crates/zed/src/main.rs` to broadcast SIGTERM to active PTY process groups
+// so Claude Code (and similar) can persist state before the process dies.
+static PANIC_CLEANUP: std::sync::OnceLock<fn(Duration)> = std::sync::OnceLock::new();
+
+pub fn set_panic_cleanup(f: fn(Duration)) {
+    if PANIC_CLEANUP.set(f).is_err() {
+        debug_assert!(false, "set_panic_cleanup called twice");
+    }
+}
+
+fn run_panic_cleanup() {
+    let Some(cb) = PANIC_CLEANUP.get() else {
+        return;
+    };
+    let timeout = env::var("ZED_PANIC_SIGTERM_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(8));
+    cb(timeout);
+}
 const CRASH_HANDLER_PING_TIMEOUT: Duration = Duration::from_secs(60);
 const CRASH_HANDLER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,6 +57,7 @@ pub fn force_backtrace() {
         old_hook(info);
         // prevent the macOS crash dialog from popping up
         if cfg!(target_os = "macos") {
+            run_panic_cleanup();
             std::process::exit(1);
         }
     }));
@@ -595,6 +618,7 @@ pub fn panic_hook(crash_client: Arc<Client>, message: &str, location: Option<&Lo
         // https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
         CrashHandler.simulate_exception(Some(234)); // (MORE_DATA_AVAILABLE)
     }
+    run_panic_cleanup();
     std::process::abort();
 }
 

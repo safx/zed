@@ -359,6 +359,9 @@ fn main() {
         .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
     let background_executor = app.background_executor();
 
+    #[cfg(unix)]
+    crashes::set_panic_cleanup(terminal::active_terminals::broadcast_sigterm_and_wait);
+
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
