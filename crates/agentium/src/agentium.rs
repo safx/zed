@@ -2456,6 +2456,8 @@ impl Render for AgentiumApp {
             .on_action(cx.listener(|this, action: &ActivateArena, window, cx| {
                 this.switch_arena(action.index, window, cx);
             }))
+            .on_action(|_: &workspace::Open, _, _| {})
+            .on_action(|_: &workspace::OpenFiles, _, _| {})
             .flex()
             .flex_row()
             .size_full()
