@@ -1820,9 +1820,13 @@ impl Terminal {
             {
                 self.write_to_pty(bytes);
             }
-        } else {
-            self.schedule_find_hyperlink(e.modifiers, e.position);
         }
+        // Always search for hyperlinks on mouse move, even under MOUSE_MODE. Cmd+click
+        // bypasses mouse_mode (see mouse_down), and without this the hover underline
+        // wouldn't update as the cursor moves — leaving it aligned with a stale
+        // position or blank until the next modifier/scroll refresh.
+        // schedule_find_hyperlink is a no-op unless Cmd is pressed and self-throttled.
+        self.schedule_find_hyperlink(e.modifiers, e.position);
         cx.notify();
     }
 
@@ -1937,10 +1941,7 @@ impl Terminal {
             self.last_content.display_offset,
         );
 
-        if e.button == MouseButton::Left
-            && e.modifiers.secondary()
-            && !self.mouse_mode(e.modifiers.shift)
-        {
+        if e.button == MouseButton::Left && e.modifiers.secondary() {
             let term_lock = self.term.lock();
             self.mouse_down_hyperlink = terminal_hyperlinks::find_from_grid_point(
                 &term_lock,
@@ -2008,6 +2009,37 @@ impl Terminal {
         let setting = TerminalSettings::get_global(cx);
 
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
+
+        // Cmd+click hyperlink open. Checked before the mouse_mode branch so that
+        // Cmd+click still opens hyperlinks when the inner TUI has enabled mouse
+        // reporting (e.g. Claude Code). Without this, the click below would be
+        // forwarded to the PTY and the hyperlink would never open, which is
+        // inconsistent with the hover underline (hover is not gated on mouse_mode).
+        if let Some(mouse_down_hyperlink) = self.mouse_down_hyperlink.take() {
+            let point = grid_point(
+                position,
+                self.last_content.terminal_bounds,
+                self.last_content.display_offset,
+            );
+
+            if let Some(mouse_up_hyperlink) = {
+                let term_lock = self.term.lock();
+                terminal_hyperlinks::find_from_grid_point(
+                    &term_lock,
+                    point,
+                    &mut self.hyperlink_regex_searches,
+                    self.path_style,
+                )
+            } && mouse_down_hyperlink == mouse_up_hyperlink
+            {
+                self.events
+                    .push_back(InternalEvent::ProcessHyperlink(mouse_up_hyperlink, true));
+                self.selection_phase = SelectionPhase::Ended;
+                self.last_mouse = None;
+                return;
+            }
+        }
+
         if self.mouse_mode(e.modifiers.shift) {
             let point = grid_point(
                 position,
@@ -2023,32 +2055,6 @@ impl Terminal {
         } else {
             if e.button == MouseButton::Left && setting.copy_on_select {
                 self.copy(Some(true));
-            }
-
-            if let Some(mouse_down_hyperlink) = self.mouse_down_hyperlink.take() {
-                let point = grid_point(
-                    position,
-                    self.last_content.terminal_bounds,
-                    self.last_content.display_offset,
-                );
-
-                if let Some(mouse_up_hyperlink) = {
-                    let term_lock = self.term.lock();
-                    terminal_hyperlinks::find_from_grid_point(
-                        &term_lock,
-                        point,
-                        &mut self.hyperlink_regex_searches,
-                        self.path_style,
-                    )
-                } {
-                    if mouse_down_hyperlink == mouse_up_hyperlink {
-                        self.events
-                            .push_back(InternalEvent::ProcessHyperlink(mouse_up_hyperlink, true));
-                        self.selection_phase = SelectionPhase::Ended;
-                        self.last_mouse = None;
-                        return;
-                    }
-                }
             }
 
             //Hyperlinks
