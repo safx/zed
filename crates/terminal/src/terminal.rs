@@ -1,3 +1,4 @@
+pub mod active_terminals;
 pub mod mappings;
 
 pub use alacritty_terminal;
@@ -434,6 +435,7 @@ impl TerminalBuilder {
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
+            _active_terminal_registration: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
         };
@@ -607,6 +609,14 @@ impl TerminalBuilder {
 
             let pty_info = PtyProcessInfo::new(&pty);
 
+            #[cfg(unix)]
+            let active_terminal_registration = Some(active_terminals::register(
+                pty_info.pid_getter().pty_fd(),
+                pty_info.pid_getter().fallback_pid().as_u32(),
+            ));
+            #[cfg(not(unix))]
+            let active_terminal_registration: Option<active_terminals::Registration> = None;
+
             //And connect them together
             let event_loop = EventLoop::new(
                 term.clone(),
@@ -669,6 +679,7 @@ impl TerminalBuilder {
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
+                _active_terminal_registration: active_terminal_registration,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
             };
@@ -899,6 +910,7 @@ pub struct Terminal {
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
+    _active_terminal_registration: Option<active_terminals::Registration>,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
 }
