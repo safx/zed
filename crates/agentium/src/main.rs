@@ -868,6 +868,7 @@ fn main() {
                         node_runtime: node_runtime.clone(),
                         session: app_session,
                     });
+                    workspace::AppState::set_global(app_state.clone(), cx);
 
                     workspace::init(app_state.clone(), cx);
                     editor::init(cx);
