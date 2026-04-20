@@ -2407,7 +2407,8 @@ impl Terminal {
 
     pub fn mouse_move(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
-        if self.mouse_mode(e.modifiers.shift) {
+        let mouse_mode = self.mouse_mode(e.modifiers.shift);
+        if mouse_mode {
             // A ctrl/cmd press on a link suppressed its button-press report in
             // `mouse_down`. Since the app never saw the press, we must swallow
             // the whole gesture rather than forward later motion/release
@@ -2434,7 +2435,13 @@ impl Terminal {
                     }
                 }
             }
-        } else {
+        }
+        // Under mouse reporting the hover underline would otherwise only refresh on an
+        // unrelated modifier/scroll event, even though `mouse_down` still opens links
+        // there when `open_links_in_mouse_mode` is set. `schedule_find_hyperlink`
+        // self-gates on Cmd being held, the position being in bounds, and distance/time
+        // throttling, so running it on every move is cheap.
+        if !mouse_mode || TerminalSettings::get_global(cx).open_links_in_mouse_mode {
             self.schedule_find_hyperlink(e.modifiers, e.position, cx);
         }
         cx.notify();
