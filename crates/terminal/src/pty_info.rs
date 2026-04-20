@@ -30,6 +30,10 @@ impl ProcessIdGetter {
 
 #[cfg(unix)]
 impl ProcessIdGetter {
+    pub(crate) fn pty_fd(&self) -> std::os::fd::RawFd {
+        self.handle
+    }
+
     fn pid(&self) -> Option<Pid> {
         // Negative pid means error.
         // Zero pid means no foreground process group is set on the PTY yet.
