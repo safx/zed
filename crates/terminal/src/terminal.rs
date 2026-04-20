@@ -1,3 +1,4 @@
+pub mod active_terminals;
 mod mappings;
 
 mod alacritty;
@@ -1027,6 +1028,7 @@ impl TerminalBuilder {
             path_style,
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
+            _active_terminal_registration: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
             #[cfg(test)]
@@ -1239,6 +1241,14 @@ impl TerminalBuilder {
 
                 let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
 
+                #[cfg(unix)]
+                let active_terminal_registration = Some(active_terminals::register(
+                    pty_info.pid_getter().pty_fd(),
+                    pty_info.pid_getter().fallback_pid().as_u32(),
+                ));
+                #[cfg(not(unix))]
+                let active_terminal_registration: Option<active_terminals::Registration> = None;
+
                 //And connect them together
                 let pty_tx =
                     spawn_event_loop(term.clone(), events_tx, pty, pty_options.drain_on_exit)?;
@@ -1316,6 +1326,7 @@ impl TerminalBuilder {
                         .unwrap_or_default()
                 },
                 pending_cwd_boundary: None,
+                _active_terminal_registration: active_terminal_registration,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
                 #[cfg(test)]
@@ -1489,6 +1500,7 @@ pub struct Terminal {
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
     pending_cwd_boundary: Option<i32>,
+    _active_terminal_registration: Option<active_terminals::Registration>,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
     #[cfg(test)]
