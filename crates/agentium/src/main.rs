@@ -16,6 +16,18 @@ use workspace::SplitDirection;
 actions!(agentium, [Quit]);
 
 fn quit(_: &Quit, cx: &mut App) {
+    // Give PTY children (Claude Code in particular) a chance to run their
+    // graceful-shutdown paths before we tear the app down. The poll loop
+    // inside `broadcast_sigterm_and_wait` exits early once every signaled
+    // process group is empty, so this is typically ~1 s in practice.
+    #[cfg(unix)]
+    terminal::active_terminals::broadcast_sigterm_and_wait(
+        std::env::var("AGENTIUM_QUIT_SIGTERM_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(5)),
+    );
     cx.quit();
 }
 
