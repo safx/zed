@@ -2522,7 +2522,18 @@ impl Drop for Terminal {
             pty_tx.0.send(Msg::Shutdown).ok();
             info.terminate_child_process();
 
-            let timer = self.background_executor.timer(Duration::from_millis(100));
+            // On Unix, first send SIGTERM so graceful-shutdown-aware PTY
+            // tenants (e.g. Claude Code) can flush state, then hard-kill
+            // after a grace period. On other platforms there's no
+            // equivalent, so keep the previous short delay.
+            #[cfg(unix)]
+            info.sigterm_current_process();
+            #[cfg(unix)]
+            let hard_kill_delay = Duration::from_secs(3);
+            #[cfg(not(unix))]
+            let hard_kill_delay = Duration::from_millis(100);
+
+            let timer = self.background_executor.timer(hard_kill_delay);
             self.background_executor
                 .spawn(async move {
                     timer.await;
