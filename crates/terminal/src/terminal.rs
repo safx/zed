@@ -77,9 +77,20 @@ use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
 
 /// How long the shell and its foreground job get to exit gracefully after a
-/// closed terminal sends SIGHUP/SIGTERM, before being SIGKILLed. Must stay
-/// comfortably below [`gpui::SHUTDOWN_TIMEOUT`] so the escalation also
-/// completes when the whole app is quitting.
+/// closed terminal sends SIGHUP/SIGTERM, before being SIGKILLed.
+///
+/// On Unix this deliberately exceeds [`gpui::SHUTDOWN_TIMEOUT`], because
+/// graceful-shutdown-aware PTY tenants (Claude Code in particular) need seconds,
+/// not milliseconds, to flush their session state and run session-end hooks when
+/// a pane is closed. The trade-off is that when the whole app is quitting the
+/// escalation no longer completes, so a job that ignores SIGTERM is orphaned
+/// rather than SIGKILLed (see #47412); the panic path handles its own escalation
+/// via [`active_terminals::broadcast_sigterm_and_wait`].
+#[cfg(unix)]
+const PROCESS_KILL_GRACE_PERIOD: Duration = Duration::from_secs(3);
+/// Windows has no equivalent graceful signal, so there is nothing to wait for and
+/// the escalation stays comfortably inside [`gpui::SHUTDOWN_TIMEOUT`].
+#[cfg(not(unix))]
 const PROCESS_KILL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 /// Sends SIGTERM to the terminal's shell and foreground process groups, and
