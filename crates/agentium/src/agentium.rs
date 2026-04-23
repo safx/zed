@@ -2879,7 +2879,7 @@ impl Render for AgentiumApp {
                                         .child({
                                             let (ref_icon, ref_label): (Option<IconName>, SharedString) =
                                                 if let Some((Some(branch), _, _, _, _, _)) = git_info.as_ref() {
-                                                    (Some(IconName::GitBranchAlt), branch.clone().into())
+                                                    (Some(IconName::GitBranch), branch.clone().into())
                                                 } else if let Some((None, _, head_tags, _, _, _)) = git_info.as_ref() {
                                                     if let Some(tag) = head_tags.first() {
                                                         (Some(IconName::Tag), tag.clone().into())
@@ -3007,7 +3007,7 @@ impl Render for AgentiumApp {
                                     .full_width()
                                     .style(ButtonStyle::Subtle),
                             )
-                            .anchor(Corner::BottomLeft)
+                            .anchor(Anchor::BottomLeft)
                     }))
                     .when_some(self.rate_limits.as_ref(), |sidebar, rate_limits| {
                         let is_stale =
@@ -3060,7 +3060,7 @@ impl Render for AgentiumApp {
                         deferred(
                             anchored()
                                 .position(*position)
-                                .anchor(Corner::TopLeft)
+                                .anchor(Anchor::TopLeft)
                                 .child(menu.clone()),
                         )
                         .with_priority(1)
@@ -3069,7 +3069,7 @@ impl Render for AgentiumApp {
                         deferred(
                             anchored()
                                 .position(*position)
-                                .anchor(Corner::TopLeft)
+                                .anchor(Anchor::TopLeft)
                                 .child(menu.clone()),
                         )
                         .with_priority(1)
@@ -3135,7 +3135,7 @@ impl AgentiumRecentProjects {
         let db = WorkspaceDb::global(cx);
         cx.spawn_in(window, async move |this, cx| {
             let workspaces = db
-                .recent_workspaces_on_disk(fs.as_ref())
+                .recent_project_workspaces(fs.as_ref())
                 .await
                 .log_err()
                 .unwrap_or_default();
@@ -3215,7 +3215,7 @@ impl AgentiumRecentProjectsDelegate {
         cx.spawn_in(window, async move |this, cx| {
             db.delete_workspace_by_id(workspace_id).await.log_err();
             let workspaces = db
-                .recent_workspaces_on_disk(fs.as_ref())
+                .recent_project_workspaces(fs.as_ref())
                 .await
                 .log_err()
                 .unwrap_or_default();
