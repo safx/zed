@@ -1449,7 +1449,7 @@ pub(crate) fn new_agentium_pane(
                             IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
                             Tooltip::text("New…"),
                         )
-                        .anchor(Corner::TopRight)
+                        .anchor(Anchor::TopRight)
                         .with_handle(pane.new_item_context_menu_handle.clone())
                         .menu(move |_window, cx| {
                             let focus_handle = focus_handle.clone();
@@ -1477,7 +1477,7 @@ pub(crate) fn new_agentium_pane(
                                 .icon_size(IconSize::Small),
                             Tooltip::text("Split Pane"),
                         )
-                        .anchor(Corner::TopRight)
+                        .anchor(Anchor::TopRight)
                         .with_handle(pane.split_item_context_menu_handle.clone())
                         .menu(|window, cx| {
                             ContextMenu::build(window, cx, |menu: ui::ContextMenu, _, _| {
