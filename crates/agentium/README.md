@@ -116,6 +116,28 @@ agentium claude sessions [--pr <NUMBER>] [--all-worktrees|-a]
 
 The mapping is populated automatically: when a Claude Code session submits a user prompt (`user-prompt-submit` hook), the arena is marked dirty; when a PR is subsequently fetched for that arena, all sessions in the arena are linked to that PR. Branch switches reset the dirty flag so stale associations aren't written after checkout. Data is stored at `~/Library/Application Support/Agentium/pr.json`.
 
+### `agentium claude grep`
+
+Search user and assistant messages across Claude Code session transcripts under `~/.claude/projects/` belonging to the current repository.
+
+```
+agentium claude grep [--only-current-worktree|-c] [--ignore-case|-i] <PATTERN>
+```
+
+- `<PATTERN>` — Rust regex (the [`regex` crate](https://docs.rs/regex/) syntax).
+- `-c` / `--only-current-worktree` — search only the current worktree's project directory (default: every worktree returned by `git worktree list --porcelain`).
+- `-i` / `--ignore-case` — case-insensitive matching.
+
+Only message content authored by the user or assistant is searched. Reasoning blocks (`thinking`), tool calls (`tool_use`, `server_tool_use`), and tool results (`tool_result`) are excluded, as are `progress`, `file-history-snapshot`, and other non-conversation entries. When a message spans multiple lines, only the first matching line is printed.
+
+Output is ripgrep-like when stdout is a TTY (file headers in red, `<line>:<role>:<timestamp>:` prefix in yellow, matches highlighted with a yellow background), and machine-readable when piped:
+
+```
+<file>:<line>:<role>:<timestamp>:<content>
+```
+
+Exit codes: `0` on match, `1` on no match, `2` on invalid regex.
+
 ## Building
 
 ```
