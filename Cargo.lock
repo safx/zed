@@ -478,6 +478,7 @@ dependencies = [
  "paths",
  "picker",
  "project",
+ "regex",
  "release_channel",
  "reqwest_client",
  "schemars 1.0.4",
