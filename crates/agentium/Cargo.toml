@@ -50,6 +50,7 @@ parking_lot.workspace = true
 paths.workspace = true
 picker.workspace = true
 project.workspace = true
+regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true
 search.workspace = true

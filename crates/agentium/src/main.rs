@@ -147,6 +147,17 @@ enum ClaudeAction {
         #[arg(long, short = 'a')]
         all_worktrees: bool,
     },
+    /// Grep Claude Code session transcripts (user / assistant messages)
+    Grep {
+        /// Regular expression pattern
+        pattern: String,
+        /// Only search the current worktree (default: search all worktrees of the repository)
+        #[arg(long, short = 'c')]
+        only_current_worktree: bool,
+        /// Case-insensitive matching
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -213,6 +224,240 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
         Some((byte_index, _)) => s[..byte_index].to_string(),
         None => s.to_string(),
     }
+}
+
+/// Extract the plain user-authored text from a `type: "user"` entry's
+/// `message.content`. Returns `None` if there is no text to search.
+///
+/// `content` is either a string (legacy) or an array of parts. Array parts
+/// with `type == "tool_result"` are excluded per the grep spec; we only keep
+/// `type == "text"` parts.
+fn extract_user_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    let arr = content.as_array()?;
+    let mut buf = String::new();
+    for part in arr {
+        if part.get("type").and_then(|v| v.as_str()) == Some("text")
+            && let Some(text) = part.get("text").and_then(|v| v.as_str())
+        {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(text);
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Extract the plain text authored by the assistant from a `type: "assistant"`
+/// entry's `message.content`. Skips reasoning (`thinking`) and tool calls
+/// (`tool_use`, `server_tool_use`) per the grep spec.
+fn extract_assistant_text(content: &serde_json::Value) -> Option<String> {
+    let arr = content.as_array()?;
+    let mut buf = String::new();
+    for part in arr {
+        if part.get("type").and_then(|v| v.as_str()) == Some("text")
+            && let Some(text) = part.get("text").and_then(|v| v.as_str())
+        {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(text);
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Render a line with all regex matches highlighted using ANSI
+/// "yellow background + black foreground" — matches ripgrep's default.
+fn highlight_matches(line: &str, regex: &regex::Regex) -> String {
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut cursor = 0;
+    for m in regex.find_iter(line) {
+        if m.start() < cursor {
+            // zero-width or overlapping match safety; stop to avoid infinite writes
+            continue;
+        }
+        out.push_str(&line[cursor..m.start()]);
+        out.push_str("\x1b[30;43m");
+        out.push_str(&line[m.start()..m.end()]);
+        out.push_str("\x1b[0m");
+        cursor = m.end();
+        if m.start() == m.end() {
+            // zero-width match: advance by one char to avoid looping
+            if let Some((next_idx, _)) = line[cursor..].char_indices().nth(1) {
+                out.push_str(&line[cursor..cursor + next_idx]);
+                cursor += next_idx;
+            } else {
+                break;
+            }
+        }
+    }
+    out.push_str(&line[cursor..]);
+    out
+}
+
+fn run_claude_grep(pattern: &str, only_current_worktree: bool, ignore_case: bool) {
+    use std::io::{IsTerminal, Write};
+
+    let regex = match regex::RegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("error: invalid regex '{pattern}': {err}");
+            std::process::exit(2);
+        }
+    };
+
+    let worktree_paths = match resolve_worktree_paths(only_current_worktree) {
+        Ok(paths) => paths,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let projects_root = util::paths::home_dir().join(".claude").join("projects");
+    let use_color = std::io::stdout().is_terminal();
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    let mut any_match = false;
+    let mut any_file_printed = false;
+
+    for worktree_path in &worktree_paths {
+        let dir_name = claude_project_dir_name(worktree_path);
+        let project_dir = projects_root.join(&dir_name);
+
+        let entries = match std::fs::read_dir(&project_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let mut jsonl_files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+            .collect();
+        jsonl_files.sort();
+
+        for file_path in &jsonl_files {
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let file_str = file_path.to_string_lossy();
+            let mut file_header_printed = false;
+
+            for (line_index, raw_line) in content.lines().enumerate() {
+                let line_no = line_index + 1;
+                if raw_line.is_empty() {
+                    continue;
+                }
+                let json: serde_json::Value = match serde_json::from_str(raw_line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let entry_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let text = match entry_type {
+                    "user" => extract_user_text(&json["message"]["content"]),
+                    "assistant" => extract_assistant_text(&json["message"]["content"]),
+                    _ => continue,
+                };
+                let Some(text) = text else { continue };
+
+                // Per spec: show the first matching line only.
+                let Some(matched_line) = text.lines().find(|l| regex.is_match(l)) else {
+                    continue;
+                };
+
+                let timestamp = json
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let role = entry_type;
+
+                any_match = true;
+
+                if use_color {
+                    if !file_header_printed {
+                        if any_file_printed {
+                            let _ = writeln!(out);
+                        }
+                        let _ = writeln!(out, "\x1b[31m{}\x1b[0m", file_str);
+                        file_header_printed = true;
+                        any_file_printed = true;
+                    }
+                    let highlighted = highlight_matches(matched_line, &regex);
+                    let _ = writeln!(
+                        out,
+                        "\x1b[33m{}:{}:{}:\x1b[0m{}",
+                        line_no, role, timestamp, highlighted
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{}:{}:{}:{}:{}",
+                        file_str, line_no, role, timestamp, matched_line
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = out.flush();
+
+    if !any_match {
+        std::process::exit(1);
+    }
+}
+
+/// Resolve canonical paths to search in `~/.claude/projects/`.
+///
+/// With `only_current: true`, returns only the current worktree. Otherwise
+/// returns every worktree of the current git repository via
+/// `git worktree list --porcelain`.
+fn resolve_worktree_paths(only_current: bool) -> anyhow::Result<Vec<String>> {
+    if only_current {
+        let current = std::env::current_dir()?;
+        let canonical = std::fs::canonicalize(&current)?;
+        return Ok(vec![canonical.to_string_lossy().into_owned()]);
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "`git worktree list` failed (not inside a git repository?)"
+        ));
+    }
+    let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "not inside a git repository or no worktrees found"
+        ));
+    }
+    Ok(paths)
+}
+
+/// Convert a filesystem path to the corresponding directory name under
+/// `~/.claude/projects/`. Claude Code replaces every character outside
+/// `[A-Za-z0-9]` with `-`.
+fn claude_project_dir_name(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn agentium_socket_path() -> PathBuf {
@@ -565,48 +810,12 @@ fn main() {
         Some(Command::Claude {
             action: ClaudeAction::Sessions { pr, all_worktrees },
         }) => {
-            let project_paths = if all_worktrees {
-                let output = std::process::Command::new("git")
-                    .args(["worktree", "list", "--porcelain"])
-                    .output()
-                    .ok();
-                let paths: Vec<String> = output
-                    .iter()
-                    .flat_map(|o| {
-                        String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .filter_map(|line| line.strip_prefix("worktree "))
-                            .filter_map(|p| std::fs::canonicalize(p).ok())
-                            .map(|p| p.to_string_lossy().to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                if paths.is_empty() {
-                    eprintln!("Error: not inside a git repository or no worktrees found");
+            let project_paths = match resolve_worktree_paths(!all_worktrees) {
+                Ok(paths) => paths,
+                Err(err) => {
+                    eprintln!("Error: {err}");
                     std::process::exit(1);
                 }
-                paths
-            } else {
-                let project_path = std::process::Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
-                    .output()
-                    .ok()
-                    .and_then(|output| {
-                        if output.status.success() {
-                            String::from_utf8(output.stdout)
-                                .ok()
-                                .map(|s| s.trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .and_then(|p| std::fs::canonicalize(&p).ok())
-                    .map(|p| p.to_string_lossy().to_string());
-                let Some(project_path) = project_path else {
-                    eprintln!("Error: not inside a git repository");
-                    std::process::exit(1);
-                };
-                vec![project_path]
             };
 
             let db_path = paths::data_dir().join("pr.json");
@@ -649,6 +858,17 @@ fn main() {
                     first = false;
                 }
             }
+            return;
+        }
+        Some(Command::Claude {
+            action:
+                ClaudeAction::Grep {
+                    pattern,
+                    only_current_worktree,
+                    ignore_case,
+                },
+        }) => {
+            run_claude_grep(&pattern, only_current_worktree, ignore_case);
             return;
         }
         Some(Command::Pane { action }) => {
