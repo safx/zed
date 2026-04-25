@@ -1205,6 +1205,16 @@ fn main() {
                         KeyBinding::new("ctrl-]", workspace::ActivateNextPane, Some("Workspace")),
                         KeyBinding::new("cmd-[", workspace::ActivatePreviousItem::default(), Some("Pane")),
                         KeyBinding::new("cmd-]", workspace::ActivateNextItem::default(), Some("Pane")),
+                        KeyBinding::new("cmd-t", agentium::OpenNewItemMenu, Some("Workspace")),
+                        KeyBinding::new("cmd-t", agentium::OpenNewItemMenu, Some("Agentium")),
+                        KeyBinding::new("c", agentium::NewClaudeCode, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("t", workspace::NewTerminal::default(), Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("s", agentium::NewGitStatus, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("g", agentium::NewGitGraph, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("d", agentium::NewDiffView, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("b", agentium::NewBranchDiff, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("p", agentium::NewProjectSearch, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("f", agentium::NewFileBrowser, Some("AgentiumNewItemMenu")),
                     ]);
 
                     let worktree_path = initial_workspace_path;

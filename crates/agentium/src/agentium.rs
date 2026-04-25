@@ -44,7 +44,7 @@ pub enum PaneContentType {
     GitGraph,
 }
 
-actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph]);
+actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu]);
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
 #[action(namespace = agentium)]
