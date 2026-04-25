@@ -29,7 +29,7 @@ use workspace::{
 
 use crate::{
     NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
-    NewProjectSearch, PaneContentType, file_browser_view::FileBrowserView,
+    NewProjectSearch, OpenNewItemMenu, PaneContentType, file_browser_view::FileBrowserView,
     git_status_view::GitStatusView,
 };
 
@@ -1091,6 +1091,14 @@ impl Render for Arena {
                     .on_action(cx.listener(|this, _: &NewGitGraph, window, cx| {
                         this.add_git_graph(window, cx);
                     }))
+                    .on_action(cx.listener(|this, _: &OpenNewItemMenu, window, cx| {
+                        let handle = this
+                            .active_pane
+                            .read(cx)
+                            .new_item_context_menu_handle
+                            .clone();
+                        handle.toggle(window, cx);
+                    }))
                     .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                         this.activate_pane_in_direction(SplitDirection::Left, window, cx);
                     }))
@@ -1458,7 +1466,8 @@ pub(crate) fn new_agentium_pane(
                                 _window,
                                 cx,
                                 |menu: ui::ContextMenu, _, _| {
-                                    menu.context(focus_handle.clone())
+                                    menu.key_context("AgentiumNewItemMenu")
+                                        .context(focus_handle.clone())
                                         .action("Claude Code", NewClaudeCode.boxed_clone())
                                         .action("Terminal", NewTerminal::default().boxed_clone())
                                         .action("Git Status", NewGitStatus.boxed_clone())
