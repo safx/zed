@@ -29,8 +29,8 @@ use workspace::{
 
 use crate::{
     NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
-    NewProjectSearch, OpenNewItemMenu, PaneContentType, file_browser_view::FileBrowserView,
-    git_status_view::GitStatusView,
+    NewProjectSearch, OpenNewItemMenu, OpenSplitMenu, PaneContentType,
+    file_browser_view::FileBrowserView, git_status_view::GitStatusView,
 };
 
 pub(crate) enum ArenaEvent {
@@ -1099,6 +1099,14 @@ impl Render for Arena {
                             .clone();
                         handle.toggle(window, cx);
                     }))
+                    .on_action(cx.listener(|this, _: &OpenSplitMenu, window, cx| {
+                        let handle = this
+                            .active_pane
+                            .read(cx)
+                            .split_item_context_menu_handle
+                            .clone();
+                        handle.toggle(window, cx);
+                    }))
                     .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                         this.activate_pane_in_direction(SplitDirection::Left, window, cx);
                     }))
@@ -1460,24 +1468,27 @@ pub(crate) fn new_agentium_pane(
                         )
                         .anchor(Anchor::TopRight)
                         .with_handle(pane.new_item_context_menu_handle.clone())
-                        .menu(move |_window, cx| {
+                        .menu({
                             let focus_handle = focus_handle.clone();
-                            Some(ContextMenu::build(
-                                _window,
-                                cx,
-                                |menu: ui::ContextMenu, _, _| {
-                                    menu.key_context("AgentiumNewItemMenu")
-                                        .context(focus_handle.clone())
-                                        .action("Claude Code", NewClaudeCode.boxed_clone())
-                                        .action("Terminal", NewTerminal::default().boxed_clone())
-                                        .action("Git Status", NewGitStatus.boxed_clone())
-                                        .action("Git Graph", NewGitGraph.boxed_clone())
-                                        .action("Git Diff", NewDiffView.boxed_clone())
-                                        .action("Git Diff (Branch)", NewBranchDiff.boxed_clone())
-                                        .action("Project Search", NewProjectSearch.boxed_clone())
-                                        .action("File Browser", NewFileBrowser.boxed_clone())
-                                },
-                            ))
+                            move |_window, cx| {
+                                let focus_handle = focus_handle.clone();
+                                Some(ContextMenu::build(
+                                    _window,
+                                    cx,
+                                    |menu: ui::ContextMenu, _, _| {
+                                        menu.key_context("AgentiumNewItemMenu")
+                                            .context(focus_handle.clone())
+                                            .action("Claude Code", NewClaudeCode.boxed_clone())
+                                            .action("Terminal", NewTerminal::default().boxed_clone())
+                                            .action("Git Status", NewGitStatus.boxed_clone())
+                                            .action("Git Graph", NewGitGraph.boxed_clone())
+                                            .action("Git Diff", NewDiffView.boxed_clone())
+                                            .action("Git Diff (Branch)", NewBranchDiff.boxed_clone())
+                                            .action("Project Search", NewProjectSearch.boxed_clone())
+                                            .action("File Browser", NewFileBrowser.boxed_clone())
+                                    },
+                                ))
+                            }
                         }),
                 )
                 .child(
@@ -1489,12 +1500,15 @@ pub(crate) fn new_agentium_pane(
                         )
                         .anchor(Anchor::TopRight)
                         .with_handle(pane.split_item_context_menu_handle.clone())
-                        .menu(|window, cx| {
+                        .menu(move |window, cx| {
+                            let focus_handle = focus_handle.clone();
                             ContextMenu::build(window, cx, |menu: ui::ContextMenu, _, _| {
-                                menu.action("Split Right", SplitRight::default().boxed_clone())
+                                menu.key_context("AgentiumSplitMenu")
+                                    .context(focus_handle.clone())
                                     .action("Split Left", SplitLeft::default().boxed_clone())
-                                    .action("Split Up", SplitUp::default().boxed_clone())
                                     .action("Split Down", SplitDown::default().boxed_clone())
+                                    .action("Split Up", SplitUp::default().boxed_clone())
+                                    .action("Split Right", SplitRight::default().boxed_clone())
                             })
                             .into()
                         }),
