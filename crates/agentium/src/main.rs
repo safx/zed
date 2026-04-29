@@ -1215,6 +1215,12 @@ fn main() {
                         KeyBinding::new("b", agentium::NewBranchDiff, Some("AgentiumNewItemMenu")),
                         KeyBinding::new("p", agentium::NewProjectSearch, Some("AgentiumNewItemMenu")),
                         KeyBinding::new("f", agentium::NewFileBrowser, Some("AgentiumNewItemMenu")),
+                        KeyBinding::new("cmd-shift-t", agentium::OpenSplitMenu, Some("Workspace")),
+                        KeyBinding::new("cmd-shift-t", agentium::OpenSplitMenu, Some("Agentium")),
+                        KeyBinding::new("h", workspace::SplitLeft::default(), Some("AgentiumSplitMenu")),
+                        KeyBinding::new("j", workspace::SplitDown::default(), Some("AgentiumSplitMenu")),
+                        KeyBinding::new("k", workspace::SplitUp::default(), Some("AgentiumSplitMenu")),
+                        KeyBinding::new("l", workspace::SplitRight::default(), Some("AgentiumSplitMenu")),
                     ]);
 
                     let worktree_path = initial_workspace_path;
