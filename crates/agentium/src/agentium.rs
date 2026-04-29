@@ -978,6 +978,7 @@ impl AgentiumApp {
     fn deploy_arena_context_menu(
         &mut self,
         arena_entity: Entity<Arena>,
+        project_url: Option<String>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -987,15 +988,25 @@ impl AgentiumApp {
         let arena_for_rename = arena_entity.clone();
         let arena_for_close = arena_entity;
         let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
-            menu.entry(
+            let menu = menu.entry(
                 "Rename…",
                 None,
                 window.handler_for(&this, move |this, window, cx| {
                     this.start_rename_arena(arena_for_rename.clone(), window, cx);
                 }),
-            )
-            .separator()
-            .entry(
+            );
+            let menu = if let Some(url) = project_url {
+                menu.entry(
+                    "Open GitHub Repository",
+                    None,
+                    window.handler_for(&this, move |_this, _window, cx| {
+                        cx.open_url(&url);
+                    }),
+                )
+            } else {
+                menu
+            };
+            menu.separator().entry(
                 "Close",
                 None,
                 window.handler_for(&this, move |this, window, cx| {
@@ -2714,6 +2725,9 @@ impl Render for AgentiumApp {
                                         (None, None)
                                     };
 
+                                    let project_url = git_info.as_ref()
+                                        .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
+
                                     div()
                                         .id(("arena", arena.id))
                                         .px_2()
@@ -2737,8 +2751,6 @@ impl Render for AgentiumApp {
                                                 || !running_infos.is_empty()
                                                 || !ready_infos.is_empty()
                                                 || !busy_infos.is_empty();
-                                            let project_url = git_info.as_ref()
-                                                .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
                                             div()
                                                 .flex()
                                                 .flex_row()
@@ -2748,8 +2760,8 @@ impl Render for AgentiumApp {
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .when(is_renaming, |d| d.child(self.rename_editor.clone()))
                                                 .when(!is_renaming, |d| {
-                                                    if is_active && project_url.is_some() {
-                                                        let url = project_url.clone().unwrap();
+                                                    if is_active {
+                                                        let arena_for_rename = arena_entity.clone();
                                                         d.child(
                                                             div()
                                                                 .id(("arena-name", arena.id))
@@ -2758,9 +2770,13 @@ impl Render for AgentiumApp {
                                                                 .hover(|d| d.bg(colors.element_hover))
                                                                 .child(arena.name.clone())
                                                                 .on_click(cx.listener(
-                                                                    move |_this, _event: &ClickEvent, _window, cx| {
+                                                                    move |this, _event: &ClickEvent, window, cx| {
                                                                         cx.stop_propagation();
-                                                                        cx.open_url(&url);
+                                                                        this.start_rename_arena(
+                                                                            arena_for_rename.clone(),
+                                                                            window,
+                                                                            cx,
+                                                                        );
                                                                     },
                                                                 ))
                                                         )
@@ -2979,6 +2995,7 @@ impl Render for AgentiumApp {
                                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                                 this.deploy_arena_context_menu(
                                                     arena_entity.clone(),
+                                                    project_url.clone(),
                                                     event.position,
                                                     window,
                                                     cx,
