@@ -5,6 +5,7 @@ set -euo pipefail
 build_flag="--release"
 target_dir="release"
 open_result=false
+release_mode=false
 
 help_info() {
   echo "
@@ -12,13 +13,28 @@ Usage: ${0##*/} [options] [architecture]
 Build the Agentium.app bundle for macOS.
 
 Options:
-  -d    Compile in debug mode
-  -o    Open the resulting app after build.
+  -d    Compile in debug mode.
+  -o    Open the resulting app (or DMG output directory in -r mode) after build.
+  -r    Release mode: codesign with Developer ID + Hardened Runtime, package
+        a DMG, submit it to Apple for notarization, and staple the ticket.
   -h    Display this help and exit.
+
+Release mode (-r) requires the following environment variables:
+  APPLE_SIGNING_IDENTITY        e.g. \"Developer ID Application: Your Name (TEAMID)\"
+  APPLE_NOTARIZATION_KEY        Contents of the App Store Connect API .p8 key
+  APPLE_NOTARIZATION_KEY_ID     Key ID for the API key
+  APPLE_NOTARIZATION_ISSUER_ID  Issuer ID for the API key
+
+Optional in release mode (intended for CI):
+  MACOS_CERTIFICATE             Base64-encoded .p12 to import into a temp keychain.
+  MACOS_CERTIFICATE_PASSWORD    Password for the .p12 above.
+
+When MACOS_CERTIFICATE is unset, the signing identity is taken from the
+existing keychain (typical for local builds where the cert is in login.keychain).
   "
 }
 
-while getopts 'doh' flag
+while getopts 'dorh' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -28,14 +44,31 @@ do
             build_flag=""
             target_dir="debug"
             ;;
+        r) release_mode=true;;
         h)
            help_info
            exit 0
            ;;
+        *)
+            help_info
+            exit 1
+            ;;
     esac
 done
 
 shift $((OPTIND-1))
+
+if [ "$release_mode" = true ] && [ "$target_dir" = "debug" ]; then
+    echo "error: -r and -d cannot be combined; release mode requires a release build" >&2
+    exit 1
+fi
+
+if [ "$release_mode" = true ]; then
+    : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY must be set in release mode}"
+    : "${APPLE_NOTARIZATION_KEY:?APPLE_NOTARIZATION_KEY must be set in release mode}"
+    : "${APPLE_NOTARIZATION_KEY_ID:?APPLE_NOTARIZATION_KEY_ID must be set in release mode}"
+    : "${APPLE_NOTARIZATION_ISSUER_ID:?APPLE_NOTARIZATION_ISSUER_ID must be set in release mode}"
+fi
 
 export CXXFLAGS="-stdlib=libc++"
 
@@ -51,23 +84,161 @@ if [[ $# -gt 0 && -n "$1" ]]; then
     target_triple="$1"
 fi
 
+arch_suffix=""
+case "$target_triple" in
+    x86_64-apple-darwin)  arch_suffix="x86_64" ;;
+    aarch64-apple-darwin) arch_suffix="aarch64" ;;
+    *)
+        if [ "$release_mode" = true ]; then
+            echo "Unsupported architecture for release: $target_triple" >&2
+            exit 1
+        fi
+        ;;
+esac
+
+temp_keychain=""
+notarization_key_file=""
+notarization_log_file=""
+cleanup() {
+    if [ -n "$notarization_key_file" ] && [ -f "$notarization_key_file" ]; then
+        rm -f "$notarization_key_file"
+    fi
+    if [ -n "$notarization_log_file" ] && [ -f "$notarization_log_file" ]; then
+        rm -f "$notarization_log_file"
+    fi
+    if [ -n "$temp_keychain" ]; then
+        security delete-keychain "$temp_keychain" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+if [ "$release_mode" = true ] && [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
+    echo "Importing signing certificate into a temporary keychain"
+    temp_keychain="agentium-build.keychain"
+    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$temp_keychain"
+    security set-keychain-settings -lut 21600 "$temp_keychain"
+    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$temp_keychain"
+
+    # Add the temp keychain to the user search list, leaving the original default keychain alone.
+    existing_keychains=$(security list-keychains -d user | sed -e 's/^[[:space:]]*//' -e 's/"//g')
+    # shellcheck disable=SC2086
+    security list-keychains -d user -s "$temp_keychain" $existing_keychains
+
+    cert_file=$(mktemp)
+    echo "$MACOS_CERTIFICATE" | base64 --decode > "$cert_file"
+    security import "$cert_file" -k "$temp_keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    rm -f "$cert_file"
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" "$temp_keychain" >/dev/null
+fi
+
 echo "Compiling agentium binary for ${target_triple}"
 cargo build ${build_flag} --package agentium --target "${target_triple}"
 
 echo "Creating application bundle"
-pushd crates/agentium
+pushd crates/agentium >/dev/null
 app_path=$(cargo bundle ${build_flag} --target "${target_triple}" --select-workspace-root | xargs)
-popd
+popd >/dev/null
 echo "Bundled ${app_path}"
 
 cp "target/${target_triple}/${target_dir}/agentium" "${app_path}/Contents/MacOS/agentium"
 
-echo "Signing application bundle"
-/usr/bin/codesign --force --deep \
-    --entitlements crates/agentium/resources/agentium.entitlements \
-    --sign - \
-    "${app_path}"
+if [ "$release_mode" = true ]; then
+    echo "Signing application bundle with identity: $APPLE_SIGNING_IDENTITY"
+    /usr/bin/codesign --force --timestamp --options runtime \
+        --entitlements crates/agentium/resources/agentium.entitlements \
+        --sign "$APPLE_SIGNING_IDENTITY" \
+        "${app_path}/Contents/MacOS/agentium"
+    /usr/bin/codesign --force --timestamp --options runtime \
+        --entitlements crates/agentium/resources/agentium.entitlements \
+        --sign "$APPLE_SIGNING_IDENTITY" \
+        "${app_path}"
+
+    echo "Verifying app signature"
+    /usr/bin/codesign --verify --deep --strict --verbose=2 "${app_path}"
+else
+    echo "Signing application bundle (ad-hoc)"
+    /usr/bin/codesign --force --deep \
+        --entitlements crates/agentium/resources/agentium.entitlements \
+        --sign - \
+        "${app_path}"
+fi
+
+if [ "$release_mode" = false ]; then
+    if [ "$open_result" = true ]; then
+        open "${app_path}"
+    fi
+    exit 0
+fi
+
+# --- Release mode: build a DMG, notarize it, and staple the ticket. ---
+
+xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
+
+dmg_target_directory="target/${target_triple}/${target_dir}"
+dmg_source_directory="${dmg_target_directory}/dmg"
+dmg_file_path="${dmg_target_directory}/Agentium-${arch_suffix}.dmg"
+
+rm -rf "${dmg_source_directory}"
+mkdir -p "${dmg_source_directory}"
+cp -R "${app_path}" "${dmg_source_directory}/"
+
+echo "Adding /Applications symlink to ${dmg_source_directory}"
+ln -s /Applications "${dmg_source_directory}/Applications"
+
+echo "Creating DMG at ${dmg_file_path}"
+rm -f "${dmg_file_path}"
+hdiutil create -volname Agentium -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+
+# The /Applications symlink inside the source directory can confuse tools that
+# scan the workspace, so remove it once it has been baked into the DMG image.
+rm -f "${dmg_source_directory}/Applications"
+
+echo "Signing DMG"
+/usr/bin/codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "${dmg_file_path}"
+
+echo "Submitting DMG for notarization (this can take several minutes)"
+notarization_key_file=$(mktemp)
+printf '%s' "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
+
+# notarytool returns exit 0 even when the submission status is "Invalid", so
+# we tee the output to a log file and parse the final status ourselves.
+notarization_log_file=$(mktemp)
+"${xcode_bin_dir_path}/notarytool" submit --wait \
+    --key "$notarization_key_file" \
+    --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+    --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
+    "${dmg_file_path}" 2>&1 | tee "$notarization_log_file"
+
+notary_status=$(awk '$1 == "status:" {print $2}' "$notarization_log_file" | tail -1)
+submission_id=$(awk '/^[[:space:]]*id:/ {print $2; exit}' "$notarization_log_file")
+
+if [ "$notary_status" != "Accepted" ]; then
+    echo >&2
+    echo "Notarization failed (status: ${notary_status:-unknown})." >&2
+    if [ -n "$submission_id" ]; then
+        echo "Fetching notarization log for submission ${submission_id}:" >&2
+        "${xcode_bin_dir_path}/notarytool" log "$submission_id" \
+            --key "$notarization_key_file" \
+            --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+            --issuer "$APPLE_NOTARIZATION_ISSUER_ID" >&2 || true
+    fi
+    exit 1
+fi
+
+rm -f "$notarization_key_file" "$notarization_log_file"
+notarization_key_file=""
+notarization_log_file=""
+
+echo "Stapling notarization ticket to DMG"
+"${xcode_bin_dir_path}/stapler" staple "${dmg_file_path}"
+
+echo "Verifying stapled DMG with Gatekeeper"
+spctl --assess --type open --context context:primary-signature -v "${dmg_file_path}" || true
+
+echo
+echo "Release artifact ready:"
+echo "  ${dmg_file_path}"
 
 if [ "$open_result" = true ]; then
-    open "${app_path}"
+    open "${dmg_target_directory}"
 fi
