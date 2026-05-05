@@ -1,6 +1,9 @@
 mod arena;
 mod file_browser_view;
 mod git_status_view;
+mod review_view;
+
+pub use review_view::ReviewView;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};

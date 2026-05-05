@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+buffer_diff.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -42,8 +43,10 @@ language.workspace = true
 libc.workspace = true
 reqwest_client.workspace = true
 log.workspace = true
+markdown.workspace = true
 markdown_preview.workspace = true
 menu.workspace = true
+multi_buffer.workspace = true
 languages = { workspace = true, features = ["load-grammars"] }
 node_runtime.workspace = true
 parking_lot.workspace = true
