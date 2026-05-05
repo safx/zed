@@ -63,6 +63,8 @@ The arena sidebar shows pill-shaped badges:
 - Blue pill — completed Claude sessions (clickable: opens a menu to jump to the specific terminal)
 - White/black pill (theme-inverted) — terminals running a non-Claude foreground command, refreshed every 2 seconds
 
+Terminals that previously hosted a Claude Code session are excluded from the white/black pill until that session ends. The `SessionEnd` hook is the canonical way to release the terminal so it can be counted as non-Claude busy when running other commands afterwards; on macOS, a caffeinate-based monitor is also used as a fallback for hard exits (SIGKILL, terminal close).
+
 The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info for display. A "!" indicator appears if no update has been received for over 1 hour.
 
 ## CLI
