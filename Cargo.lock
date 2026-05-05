@@ -448,6 +448,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assets",
+ "buffer_diff",
  "chrono",
  "clap",
  "clap_complete",
@@ -471,8 +472,10 @@ dependencies = [
  "languages",
  "libc",
  "log",
+ "markdown",
  "markdown_preview",
  "menu",
+ "multi_buffer",
  "node_runtime",
  "parking_lot",
  "paths",
