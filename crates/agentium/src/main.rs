@@ -163,6 +163,7 @@ enum ClaudeAction {
 #[derive(clap::Subcommand)]
 enum ClaudeHookEvent {
     SessionStart,
+    SessionEnd,
     Stop,
     Notification,
     UserPromptSubmit,
@@ -471,6 +472,7 @@ fn agentium_socket_path() -> PathBuf {
 enum IpcMessage {
     WorkspacePath(PathBuf),
     ClaudeSessionStart { session_id: String, ancestor_pids: Vec<u32> },
+    ClaudeSessionEnd { session_id: String },
     ClaudeStop { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeNotification { session_id: String, ancestor_pids: Vec<u32>, title: String },
     ClaudeUserPromptSubmit { session_id: String, ancestor_pids: Vec<u32>, prompt: String },
@@ -590,6 +592,9 @@ fn start_ipc_listener(
                         match json["type"].as_str() {
                             Some("claude_session_start") => {
                                 IpcMessage::ClaudeSessionStart { session_id, ancestor_pids }
+                            }
+                            Some("claude_session_end") => {
+                                IpcMessage::ClaudeSessionEnd { session_id }
                             }
                             Some("claude_stop") => {
                                 IpcMessage::ClaudeStop { session_id, ancestor_pids, title }
@@ -732,6 +737,7 @@ fn main() {
 
             let msg_type = match event {
                 ClaudeHookEvent::SessionStart => "claude_session_start",
+                ClaudeHookEvent::SessionEnd => "claude_session_end",
                 ClaudeHookEvent::Stop => "claude_stop",
                 ClaudeHookEvent::Notification => "claude_notification",
                 ClaudeHookEvent::UserPromptSubmit => "claude_user_prompt_submit",
@@ -1313,6 +1319,15 @@ fn main() {
                                                 .update(cx, |app, _window, cx| {
                                                     app.register_claude_session(
                                                         session_id, ancestor_pids, cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::ClaudeSessionEnd { session_id } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.handle_claude_session_end(
+                                                        &session_id, cx,
                                                     );
                                                 })
                                                 .log_err();
