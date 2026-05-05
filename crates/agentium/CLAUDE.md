@@ -53,9 +53,10 @@ Additionally, many default keybindings in `assets/keymaps/` are scoped to `"cont
 
 `SharedSessionState` holds several `Rc<RefCell<...>>` sets shared between `AgentiumApp` (which writes them) and per-pane indicator closures (which read them to decide dot colors). Because all access is on the single foreground thread, `Rc<RefCell<...>>` is used instead of `Arc<Mutex<...>>`.
 
-The canonical state lives in `AgentiumApp::claude_sessions: HashMap<String, ClaudeSession>`, where each session has a `ClaudeSessionState` enum (`Idle`, `Running`, `Completed`). After every mutation, `sync_session_derived_state()` rebuilds the derived PID sets:
+The canonical state lives in `AgentiumApp::claude_sessions: HashMap<String, ClaudeSession>`, where each session has a `ClaudeSessionState` enum (`Idle`, `Running`, `WaitingPermission`, `Completed`). After every mutation, `sync_session_derived_state()` rebuilds the derived PID sets:
 
 - `running_shell_pids` — PIDs of sessions in `Running` state (green dot)
+- `permission_shell_pids` — PIDs of sessions in `WaitingPermission` state (orange badge)
 - `ready_shell_pids` — PIDs of sessions in `Completed` state (blue dot + border)
 - `acknowledged_task_pids` — PIDs of non-Claude task terminals the user has acknowledged via key input (suppresses dot)
 - `pid_to_session_id` — all sessions, for Fork Session lookups
@@ -124,10 +125,12 @@ On macOS, Claude Code spawns `caffeinate -i -t 300` as a direct child process on
 
 A background monitor task (`_caffeinate_monitor_task`) polls every 3 seconds and checks each `Running`/`WaitingPermission` session:
 - `ancestor_pids[0]` is the Claude Code node process PID (the hook process's parent)
-- `libc::kill(pid, 0)` checks if the Claude process is alive — if dead, transition to `Idle` immediately
-- `pgrep -P <pid> caffeinate` checks for a caffeinate child — if absent for >5 seconds (`caffeinate_absent_since` HashMap), transition to `Idle`
+- `libc::kill(pid, 0)` checks if the Claude process is alive — if dead, the session entry is **removed** from `claude_sessions` (not merely transitioned to `Idle`), so its wrapper PID is released from `pid_to_session_id` and the terminal becomes eligible for the busy-non-Claude badge again. This is the safety net for hard kills (SIGKILL, terminal close, crash) where the `SessionEnd` hook does not fire.
+- `pgrep -P <pid> caffeinate` checks for a caffeinate child — if absent for >5 seconds (`caffeinate_absent_since` HashMap), transition to `Idle` (the session is **kept** because the next turn may revive it).
 
 The 5-second grace period avoids false positives at turn boundaries, where caffeinate is briefly absent between the `UserPromptSubmit` hook and the moment Claude spawns a new caffeinate for the next turn (typically <1 second).
+
+Clean Claude exits (`/exit`, `Ctrl+D`, idle `Ctrl+C`, `/logout`, `/clear`) flow through the `SessionEnd` hook → `handle_claude_session_end`, which also removes the session entry. The caffeinate-based path is the fallback for cases where `SessionEnd` cannot run.
 
 ## `fallback_pid` is not the shell's live PID
 
@@ -144,6 +147,8 @@ For features that need a live foreground process name, own a `sysinfo::System` d
 ## "Is this a Claude terminal?" uses `pid_to_session_id`, not state-specific sets
 
 For checks of the form "does this shell host a Claude Code session?", use `session_state.pid_to_session_id` — it contains every session regardless of state (Idle / Running / WaitingPermission / Completed). The state-specific sets (`running_shell_pids`, `permission_shell_pids`, `ready_shell_pids`) each miss at least one legitimate Claude state; using them to "exclude Claude terminals" would wrongly count idle Claude terminals as non-Claude.
+
+Entries are removed from `pid_to_session_id` (via `claude_sessions.remove()` + `sync_session_derived_state()`) only when Claude actually exits — either through the `SessionEnd` hook handler or the caffeinate monitor's `kill(pid, 0)` failure. So a terminal that *was* a Claude session but has since been quit becomes eligible for the busy-non-Claude badge again.
 
 ## `HeadChanged` fires on commits, not just branch switches
 
