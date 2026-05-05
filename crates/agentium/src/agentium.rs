@@ -409,10 +409,13 @@ impl AgentiumApp {
                             }
 
                             if !alive {
-                                if let Some(session) =
-                                    this.claude_sessions.get_mut(session_id)
-                                {
-                                    session.state = ClaudeSessionState::Idle;
+                                // The Claude process is gone — drop the session entirely
+                                // so that pid_to_session_id releases the wrapper PID and
+                                // the terminal can show as a non-Claude busy terminal
+                                // again. SessionEnd is the canonical cleanup path; this
+                                // is the safety net for hard kills (SIGKILL, terminal
+                                // close, crash) where SessionEnd doesn't fire.
+                                if this.claude_sessions.remove(session_id).is_some() {
                                     changed = true;
                                 }
                                 this.caffeinate_absent_since.remove(session_id);
@@ -1299,6 +1302,15 @@ impl AgentiumApp {
                 self.notify_all_panes(cx);
                 cx.notify();
             }
+        }
+    }
+
+    pub fn handle_claude_session_end(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if self.claude_sessions.remove(session_id).is_some() {
+            self.caffeinate_absent_since.remove(session_id);
+            self.sync_session_derived_state();
+            self.notify_all_panes(cx);
+            cx.notify();
         }
     }
 

@@ -38,6 +38,7 @@ Add the following to your Claude Code `settings.json`:
 {
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command", "command": "agentium claude hook session-start" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "agentium claude hook session-end" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "agentium claude hook stop" }] }],
     "Notification": [{ "matcher": "", "hooks": [{ "type": "command", "command": "agentium claude hook notification" }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentium claude hook user-prompt-submit" }] }],
@@ -96,7 +97,7 @@ agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 
 ### `agentium claude hook <event>`
 
-Claude Code hook integration. Events: `session-start`, `stop`, `notification`, `user-prompt-submit`, `permission-request`, `post-tool-use`, `post-tool-use-failure`.
+Claude Code hook integration. Events: `session-start`, `session-end`, `stop`, `notification`, `user-prompt-submit`, `permission-request`, `post-tool-use`, `post-tool-use-failure`.
 
 ### `agentium claude statusline`
 
