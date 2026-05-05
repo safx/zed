@@ -1292,11 +1292,13 @@ impl FileFinderDelegate {
 
             let query_path = query.path_query();
             if let Ok(mut query_path) = RelPath::new(Path::new(query_path), path_style) {
+                let worktree_filter = self.worktree_filter;
                 let available_worktree = self
                     .project
                     .read(cx)
                     .visible_worktrees(cx)
                     .filter(|worktree| !worktree.read(cx).is_single_file())
+                    .filter(|wt| worktree_filter.map_or(true, |id| wt.read(cx).id() == id))
                     .collect::<Vec<_>>();
                 let worktree_count = available_worktree.len();
                 let mut expect_worktree = available_worktree.first().cloned();
