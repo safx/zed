@@ -30,6 +30,8 @@ struct ReviewDocument {
     target: String,
     #[serde(default)]
     groups: Vec<ReviewGroup>,
+    #[serde(default)]
+    review: Option<ReviewSection>,
 }
 
 #[derive(serde::Deserialize)]
@@ -68,6 +70,8 @@ struct ReviewComment {
     model: Option<String>,
     #[serde(default)]
     duplicate_of: Option<DuplicateOf>,
+    #[serde(skip)]
+    overall: bool,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -316,12 +320,21 @@ impl project::ProjectItem for ReviewItem {
                 group_first_hunk_loc.push(group_first);
             }
 
-            // Collect comments from all groups, flattened.
-            let comments: Vec<ReviewComment> = document
+            // Collect comments from all groups, plus the overall reviewer's
+            // top-level comments. Overall ones are tagged so the model label
+            // can be rendered as "model (overall)".
+            let mut comments: Vec<ReviewComment> = document
                 .groups
                 .iter()
                 .flat_map(|g| g.review.iter().flat_map(|r| r.comments.iter().cloned()))
                 .collect();
+            if let Some(overall) = &document.review {
+                for c in &overall.comments {
+                    let mut c = c.clone();
+                    c.overall = true;
+                    comments.push(c);
+                }
+            }
 
             let group_titles_summaries: Vec<(String, Option<String>)> = document
                 .groups
@@ -731,7 +744,12 @@ fn insert_review_blocks(
                 cx,
             )
         });
-        let model = comment.model.clone().map(SharedString::from);
+        let model = match (comment.model.as_deref(), comment.overall) {
+            (Some(m), true) => Some(SharedString::from(format!("{m} (overall)"))),
+            (Some(m), false) => Some(SharedString::from(m.to_string())),
+            (None, true) => Some(SharedString::from("(overall)")),
+            (None, false) => None,
+        };
         let severity = parse_severity(&comment.severity);
         let body_lines = comment.body.lines().count() as u32;
         let height = body_lines.saturating_add(2).clamp(3, 24);
