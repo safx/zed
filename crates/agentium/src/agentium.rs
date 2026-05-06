@@ -5,6 +5,10 @@ mod review_view;
 
 pub use review_view::ReviewView;
 
+#[derive(Clone)]
+pub struct AgentiumWorkspaceHandle(pub Entity<Workspace>);
+impl gpui::Global for AgentiumWorkspaceHandle {}
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
