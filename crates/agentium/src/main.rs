@@ -1275,6 +1275,9 @@ fn main() {
                                         cx,
                                     )
                                 });
+                                cx.set_global(agentium::AgentiumWorkspaceHandle(
+                                    workspace_entity.clone(),
+                                ));
                                 window.set_window_title("Agentium");
                                 cx.new(|cx| {
                                     agentium::AgentiumApp::new(
