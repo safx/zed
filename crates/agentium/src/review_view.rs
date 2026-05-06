@@ -781,9 +781,10 @@ fn insert_review_blocks(
     let mut blocks: Vec<BlockProperties<multi_buffer::Anchor>> = Vec::new();
 
     for ga in group_anchors {
+        let group_index = ga.index;
         let title = SharedString::from(match &ga.phase {
-            Some(phase) => format!("{}. [{}] {}", ga.index + 1, phase, ga.title),
-            None => format!("{}. {}", ga.index + 1, ga.title),
+            Some(phase) => format!("{}. [{}] {}", group_index + 1, phase, ga.title),
+            None => format!("{}. {}", group_index + 1, ga.title),
         });
         let summary = ga.summary.clone().map(SharedString::from);
         let focus = ga.focus.clone();
@@ -799,7 +800,13 @@ fn insert_review_blocks(
             style: BlockStyle::Sticky,
             priority: 0,
             render: Arc::new(move |bcx: &mut BlockContext| {
-                render_group_header(title.clone(), summary.clone(), focus.clone(), bcx)
+                render_group_header(
+                    group_index,
+                    title.clone(),
+                    summary.clone(),
+                    focus.clone(),
+                    bcx,
+                )
             }),
         });
     }
@@ -892,6 +899,7 @@ fn insert_review_blocks(
 }
 
 fn render_group_header(
+    group_index: usize,
     title: SharedString,
     summary: Option<SharedString>,
     focus: Vec<ResolvedFocus>,
@@ -915,7 +923,7 @@ fn render_group_header(
                 .child(summary),
         );
     }
-    for (fi, item) in focus.into_iter().enumerate() {
+    for (focus_index, item) in focus.into_iter().enumerate() {
         let (icon, color) = match item.result {
             FocusResult::Pass => ("✓", status.success),
             FocusResult::Fail => ("✗", status.error),
@@ -923,7 +931,9 @@ fn render_group_header(
             FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
         };
         let row = h_flex()
-            .id(SharedString::from(format!("review-focus-{}", fi)))
+            .id(SharedString::from(format!(
+                "review-focus-{group_index}-{focus_index}"
+            )))
             .gap_2()
             .items_center()
             .text_xs()
@@ -936,7 +946,14 @@ fn render_group_header(
                     .font_weight(FontWeight::BOLD)
                     .child(icon),
             )
-            .child(div().text_color(colors.text).child(item.desc.clone()));
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.text)
+                    .child(item.desc.clone()),
+            );
         let row = if !item.reason.is_empty() {
             row.tooltip(Tooltip::text(item.reason.clone()))
         } else {
