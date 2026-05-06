@@ -7,7 +7,8 @@ use clap::{CommandFactory, Parser};
 use futures::StreamExt as _;
 use gpui::*;
 use settings::{
-    KeymapFile, SettingsStore, ThemeName, ThemeSelection, watch_config_file, DEFAULT_KEYMAP_PATH,
+    ActivePaneModifiers, InactiveOpacity, KeymapFile, SettingsStore, ThemeName, ThemeSelection,
+    watch_config_file, DEFAULT_KEYMAP_PATH,
 };
 use ui::ActiveTheme;
 use util::ResultExt as _;
@@ -191,24 +192,6 @@ fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8(output).unwrap_or_else(|_| input.to_string())
-}
-
-/// Merges user settings JSON with agentium-specific defaults.
-/// User file values take precedence; defaults fill in missing keys.
-fn merge_settings_with_defaults(
-    user_content: &str,
-    defaults: &serde_json::Value,
-) -> String {
-    let mut merged = defaults.clone();
-    if let Ok(user_value) = serde_json::from_str::<serde_json::Value>(user_content) {
-        if let (Some(merged_obj), Some(user_obj)) = (merged.as_object_mut(), user_value.as_object())
-        {
-            for (key, value) in user_obj {
-                merged_obj.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    merged.to_string()
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -1123,40 +1106,43 @@ fn main() {
                         paths::settings_file().clone(),
                     );
 
-                    let agentium_defaults = {
-                        let mut defaults = serde_json::json!({
-                            "active_pane_modifiers": {"inactive_opacity": 0.65},
+                    // Push Agentium's defaults into the SettingsStore's default settings
+                    // (rather than merging into user settings on every reload). Otherwise,
+                    // any path that calls `set_user_settings` with the raw user file
+                    // content — e.g. `update_settings_file_inner` after a settings write
+                    // triggered by the diff-style toggle — would clobber these values.
+                    // Mutate individual fields rather than replacing the whole struct, so
+                    // sibling defaults like `border_size` (required by `WorkspaceSettings`)
+                    // remain populated.
+                    let theme_name_for_defaults = theme_name.clone();
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_default_settings(cx, |content| {
+                            let modifiers = content
+                                .workspace
+                                .active_pane_modifiers
+                                .get_or_insert_with(ActivePaneModifiers::default);
+                            modifiers.inactive_opacity = Some(InactiveOpacity(0.65));
+                            if let Some(name) = theme_name_for_defaults {
+                                content.theme.theme =
+                                    Some(ThemeSelection::Static(ThemeName(name.into())));
+                            }
                         });
-                        if let Some(ref name) = theme_name {
-                            defaults["theme"] = serde_json::json!(name);
-                        }
-                        defaults
-                    };
+                    });
 
-                    // Initial load: merge user settings file with agentium defaults.
-                    // User file values take precedence; agentium defaults fill in gaps.
                     let initial_content = cx
                         .foreground_executor()
                         .block_on(settings_file_rx.next())
                         .unwrap_or_default();
-                    let merged =
-                        merge_settings_with_defaults(&initial_content, &agentium_defaults);
                     SettingsStore::update_global(cx, |store, cx| {
-                        _ = store.set_user_settings(&merged, cx);
+                        _ = store.set_user_settings(&initial_content, cx);
                     });
 
-                    // Watch for changes and re-merge.
-                    cx.spawn({
-                        let agentium_defaults = agentium_defaults.clone();
-                        async move |cx| {
-                            let _settings_watcher = _settings_watcher;
-                            while let Some(content) = settings_file_rx.next().await {
-                                let merged =
-                                    merge_settings_with_defaults(&content, &agentium_defaults);
-                                cx.update_global(|store: &mut SettingsStore, cx| {
-                                    _ = store.set_user_settings(&merged, cx);
-                                });
-                            }
+                    cx.spawn(async move |cx| {
+                        let _settings_watcher = _settings_watcher;
+                        while let Some(content) = settings_file_rx.next().await {
+                            cx.update_global(|store: &mut SettingsStore, cx| {
+                                _ = store.set_user_settings(&content, cx);
+                            });
                         }
                     })
                     .detach();
