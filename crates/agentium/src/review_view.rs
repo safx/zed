@@ -15,7 +15,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use ui::{ActiveTheme, Color, Icon, IconName, h_flex};
+use ui::{ActiveTheme, Color, Icon, IconName, Tooltip, h_flex};
 use util::rel_path::RelPath;
 use workspace::ItemHandle as _;
 use workspace::Workspace;
@@ -41,9 +41,13 @@ struct ReviewGroup {
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
     hunks: Vec<ReviewHunk>,
     #[serde(default)]
     review: Option<ReviewSection>,
+    #[serde(default)]
+    review_focus: Vec<String>,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -57,6 +61,18 @@ struct ReviewHunk {
 struct ReviewSection {
     #[serde(default)]
     comments: Vec<ReviewComment>,
+    #[serde(default)]
+    focus: Vec<ReviewFocus>,
+}
+
+#[derive(serde::Deserialize, Default, Clone)]
+struct ReviewFocus {
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    result: String,
+    #[serde(default)]
+    reason: String,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -100,11 +116,38 @@ fn parse_severity(s: &str) -> Severity {
     }
 }
 
+#[derive(Copy, Clone)]
+enum FocusResult {
+    Pass,
+    Fail,
+    Unsure,
+    Pending,
+    Other,
+}
+
+fn parse_focus_result(s: &str) -> FocusResult {
+    match s {
+        "pass" => FocusResult::Pass,
+        "fail" => FocusResult::Fail,
+        "unsure" => FocusResult::Unsure,
+        _ => FocusResult::Other,
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedFocus {
+    desc: SharedString,
+    result: FocusResult,
+    reason: SharedString,
+}
+
 #[derive(Clone)]
 struct GroupAnchor {
     index: usize,
     title: String,
     summary: Option<String>,
+    phase: Option<SharedString>,
+    focus: Vec<ResolvedFocus>,
     first_hunk_anchor: multi_buffer::Anchor,
 }
 
@@ -342,6 +385,59 @@ impl project::ProjectItem for ReviewItem {
                 .map(|g| (g.title.clone(), g.summary.clone()))
                 .collect();
 
+            let group_phases: Vec<Option<SharedString>> = document
+                .groups
+                .iter()
+                .map(|g| {
+                    g.phase
+                        .as_ref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| SharedString::from(s.clone()))
+                })
+                .collect();
+
+            // Spec (strict 3-way): if review.focus is non-empty use it; otherwise
+            // fall back to review_focus as Pending rows; otherwise empty.
+            // length mismatch is silent-dropped with a log::warn.
+            let group_focus: Vec<Vec<ResolvedFocus>> = document
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(gi, g)| {
+                    let post: &[ReviewFocus] = g
+                        .review
+                        .as_ref()
+                        .map(|s| s.focus.as_slice())
+                        .unwrap_or(&[]);
+                    let pre: &[String] = &g.review_focus;
+                    if !post.is_empty() {
+                        if pre.len() > post.len() {
+                            log::warn!(
+                                "review: group {gi}: review_focus ({}) > review.focus ({}), {} dropped",
+                                pre.len(),
+                                post.len(),
+                                pre.len() - post.len(),
+                            );
+                        }
+                        post.iter()
+                            .map(|f| ResolvedFocus {
+                                desc: SharedString::from(f.desc.clone()),
+                                result: parse_focus_result(&f.result),
+                                reason: SharedString::from(f.reason.clone()),
+                            })
+                            .collect()
+                    } else {
+                        pre.iter()
+                            .map(|desc| ResolvedFocus {
+                                desc: SharedString::from(desc.clone()),
+                                result: FocusResult::Pending,
+                                reason: SharedString::default(),
+                            })
+                            .collect()
+                    }
+                })
+                .collect();
+
             // path_to_buffer for review_view's later block-anchor computations.
             let path_to_buffer: HashMap<String, Entity<Buffer>> = path_to_loaded
                 .iter()
@@ -419,10 +515,14 @@ impl project::ProjectItem for ReviewItem {
                             continue;
                         };
                         let (title, summary) = group_titles_summaries[gi].clone();
+                        let phase = group_phases[gi].clone();
+                        let focus = group_focus[gi].clone();
                         group_anchors.push(GroupAnchor {
                             index: gi,
                             title,
                             summary,
+                            phase,
+                            focus,
                             first_hunk_anchor: mb_anchor,
                         });
                     }
@@ -681,16 +781,25 @@ fn insert_review_blocks(
     let mut blocks: Vec<BlockProperties<multi_buffer::Anchor>> = Vec::new();
 
     for ga in group_anchors {
-        let title = SharedString::from(format!("#{} {}", ga.index + 1, ga.title));
+        let title = SharedString::from(match &ga.phase {
+            Some(phase) => format!("{}. [{}] {}", ga.index + 1, phase, ga.title),
+            None => format!("{}. {}", ga.index + 1, ga.title),
+        });
         let summary = ga.summary.clone().map(SharedString::from);
-        let height = if summary.is_some() { 3 } else { 2 };
+        let focus = ga.focus.clone();
+        let mut height: u32 = 1;
+        if summary.is_some() {
+            height += 1;
+        }
+        height += focus.len() as u32;
+        height += 1;
         blocks.push(BlockProperties {
             placement: BlockPlacement::Above(ga.first_hunk_anchor),
             height: Some(height),
             style: BlockStyle::Sticky,
             priority: 0,
             render: Arc::new(move |bcx: &mut BlockContext| {
-                render_group_header(title.clone(), summary.clone(), bcx)
+                render_group_header(title.clone(), summary.clone(), focus.clone(), bcx)
             }),
         });
     }
@@ -785,10 +894,12 @@ fn insert_review_blocks(
 fn render_group_header(
     title: SharedString,
     summary: Option<SharedString>,
+    focus: Vec<ResolvedFocus>,
     bcx: &mut BlockContext,
 ) -> AnyElement {
     let cx = &*bcx.app;
     let colors = cx.theme().colors();
+    let status = cx.theme().status();
     let mut content = div().flex().flex_col().child(
         div()
             .text_sm()
@@ -803,6 +914,35 @@ fn render_group_header(
                 .text_color(colors.text_muted)
                 .child(summary),
         );
+    }
+    for (fi, item) in focus.into_iter().enumerate() {
+        let (icon, color) = match item.result {
+            FocusResult::Pass => ("✓", status.success),
+            FocusResult::Fail => ("✗", status.error),
+            FocusResult::Unsure => ("?", status.warning),
+            FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
+        };
+        let row = h_flex()
+            .id(SharedString::from(format!("review-focus-{}", fi)))
+            .gap_2()
+            .items_center()
+            .text_xs()
+            .child(
+                div()
+                    .w_4()
+                    .flex()
+                    .justify_center()
+                    .text_color(color)
+                    .font_weight(FontWeight::BOLD)
+                    .child(icon),
+            )
+            .child(div().text_color(colors.text).child(item.desc.clone()));
+        let row = if !item.reason.is_empty() {
+            row.tooltip(Tooltip::text(item.reason.clone()))
+        } else {
+            row
+        };
+        content = content.child(row);
     }
     div()
         .px_3()
