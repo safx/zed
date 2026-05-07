@@ -4092,6 +4092,23 @@ impl EditorElement {
             Block::BufferHeader { excerpt, height } => {
                 let mut result = v_flex().id(block_id).w_full();
 
+                let is_sticky = sticky_header_excerpt_id == Some(excerpt.buffer_id());
+
+                if self.should_show_buffer_headers() {
+                    let editor_read = self.editor.read(cx);
+                    let multibuffer_snapshot = editor_read.buffer.read(cx).snapshot(cx);
+                    let buffer = excerpt.buffer(&multibuffer_snapshot);
+                    if let Some(extra) = editor_read
+                        .addons
+                        .values()
+                        .find_map(|addon| {
+                            addon.render_buffer_header_extra(excerpt, &buffer, window, cx)
+                        })
+                    {
+                        result = result.child(extra);
+                    }
+                }
+
                 if self.should_show_buffer_headers() {
                     let jump_data = header_jump_data(
                         snapshot,
@@ -4101,7 +4118,7 @@ impl EditorElement {
                         latest_selection_anchors,
                     );
 
-                    if sticky_header_excerpt_id != Some(excerpt.buffer_id()) {
+                    if !is_sticky {
                         let selected = selected_buffer_ids.contains(&excerpt.buffer_id());
 
                         result = result.child(div().pr(editor_margins.right).child(
@@ -4597,13 +4614,30 @@ impl EditorElement {
 
         let available_width = hitbox.bounds.size.width - right_margin;
 
+        let editor_read = self.editor.read(cx);
+        let multibuffer_snapshot = editor_read.buffer.read(cx).snapshot(cx);
+        let buffer_snapshot = excerpt.buffer(&multibuffer_snapshot);
+        let extra_element = editor_read
+            .addons
+            .values()
+            .find_map(|addon| {
+                addon.render_buffer_header_extra(excerpt, &buffer_snapshot, window, cx)
+            });
+        let extra_height = snapshot
+            .display_snapshot
+            .extra_buffer_header_height(excerpt.buffer_id());
+        let _ = editor_read;
+
+        let total_header_rows = FILE_HEADER_HEIGHT + extra_height;
+        let gradient_height = total_header_rows as f32 * line_height;
+
         let mut header = v_flex()
             .w_full()
             .relative()
             .child(
                 div()
                     .w(available_width)
-                    .h(FILE_HEADER_HEIGHT as f32 * line_height)
+                    .h(gradient_height)
                     .bg(linear_gradient(
                         0.,
                         linear_color_stop(editor_bg_color.opacity(0.), 0.),
@@ -4612,6 +4646,7 @@ impl EditorElement {
                     .absolute()
                     .top_0(),
             )
+            .children(extra_element)
             .child(
                 self.render_buffer_header(excerpt, false, selected, true, jump_data, window, cx)
                     .into_any_element(),
@@ -4629,7 +4664,7 @@ impl EditorElement {
                 continue;
             };
 
-            let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+            let max_row = display_row.0.saturating_sub(total_header_rows);
             let offset = scroll_position.y - max_row as f64;
 
             if offset > 0.0 {
@@ -11207,7 +11242,14 @@ impl Element for EditorElement {
                     let has_sticky_buffer_header =
                         sticky_buffer_header.is_some() || sticky_header_excerpt_id.is_some();
                     let sticky_header_height = if has_sticky_buffer_header {
-                        let full_height = FILE_HEADER_HEIGHT as f32 * line_height;
+                        let sticky_extra_height =
+                            sticky_header_excerpt_id
+                                .map(|id| {
+                                    snapshot.display_snapshot.extra_buffer_header_height(id)
+                                })
+                                .unwrap_or(0);
+                        let total_header_rows = FILE_HEADER_HEIGHT + sticky_extra_height;
+                        let full_height = total_header_rows as f32 * line_height;
                         let display_row = blocks
                             .iter()
                             .filter(|block| block.is_buffer_header)
@@ -11216,7 +11258,8 @@ impl Element for EditorElement {
                             });
                         let offset = match display_row {
                             Some(display_row) => {
-                                let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+                                let max_row =
+                                    display_row.0.saturating_sub(total_header_rows);
                                 let offset = (scroll_position.y - max_row as f64).max(0.0);
                                 let slide_up =
                                     Pixels::from(offset * ScrollPixelOffset::from(line_height));
