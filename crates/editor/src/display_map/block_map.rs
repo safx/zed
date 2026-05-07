@@ -45,6 +45,7 @@ pub struct BlockMap {
     excerpt_header_height: u32,
     pub(super) folded_buffers: HashSet<BufferId>,
     buffers_with_disabled_headers: HashSet<BufferId>,
+    extra_buffer_header_heights: HashMap<BufferId, u32>,
     pub(super) deferred_edits: Cell<Patch<WrapRow>>,
 }
 
@@ -79,7 +80,9 @@ pub struct BlockSnapshot {
     pub(super) buffer_header_height: u32,
     pub(super) excerpt_header_height: u32,
     pub(super) buffers_with_disabled_headers: HashSet<BufferId>,
+    pub(super) extra_buffer_header_heights: HashMap<BufferId, u32>,
 }
+
 
 impl Deref for BlockSnapshot {
     type Target = WrapSnapshot;
@@ -664,6 +667,7 @@ impl BlockMap {
             custom_blocks_by_id: TreeMap::default(),
             folded_buffers: HashSet::default(),
             buffers_with_disabled_headers: HashSet::default(),
+            extra_buffer_header_heights: HashMap::default(),
             transforms: RefCell::new(transforms),
             wrap_snapshot: RefCell::new(wrap_snapshot.clone()),
             buffer_header_height,
@@ -699,6 +703,7 @@ impl BlockMap {
                 buffer_header_height: self.buffer_header_height,
                 excerpt_header_height: self.excerpt_header_height,
                 buffers_with_disabled_headers: self.buffers_with_disabled_headers.clone(),
+                extra_buffer_header_heights: self.extra_buffer_header_heights.clone(),
             },
         }
     }
@@ -1270,10 +1275,15 @@ impl BlockMap {
                             Bias::Right,
                         );
 
+                        let extra = self
+                            .extra_buffer_header_heights
+                            .get(&new_buffer_id)
+                            .copied()
+                            .unwrap_or(0);
                         return Some((
                             BlockPlacement::Replace(wrap_row..=wrap_end_row),
                             Block::FoldedBuffer {
-                                height: height + self.buffer_header_height,
+                                height: height + self.buffer_header_height + extra,
                                 first_excerpt,
                             },
                         ));
@@ -1283,6 +1293,11 @@ impl BlockMap {
                 let starts_new_buffer = new_buffer_id.is_some();
                 let block = if starts_new_buffer && buffer.show_headers() {
                     height += self.buffer_header_height;
+                    if let Some(extra) = new_buffer_id
+                        .and_then(|id| self.extra_buffer_header_heights.get(&id))
+                    {
+                        height += extra;
+                    }
                     Block::BufferHeader {
                         excerpt: excerpt_boundary.next,
                         height,
@@ -2169,6 +2184,53 @@ impl BlockMapWriter<'_> {
         }
     }
 
+    pub fn set_extra_buffer_header_heights(
+        &mut self,
+        heights: HashMap<BufferId, u32>,
+        multi_buffer: &MultiBuffer,
+        cx: &App,
+    ) {
+        let multi_buffer_snapshot = multi_buffer.snapshot(cx);
+        let mut ranges = Vec::new();
+        let old = std::mem::replace(
+            &mut self.block_map.extra_buffer_header_heights,
+            heights.clone(),
+        );
+        let changed_ids: HashSet<BufferId> = old
+            .keys()
+            .chain(heights.keys())
+            .filter(|id| old.get(id) != heights.get(id))
+            .copied()
+            .collect();
+        for buffer_id in changed_ids {
+            ranges.extend(multi_buffer_snapshot.range_for_buffer(buffer_id));
+        }
+        ranges.sort_unstable_by_key(|range| range.start);
+
+        let mut edits = Patch::default();
+        let wrap_snapshot = self.block_map.wrap_snapshot.borrow().clone();
+        for range in ranges {
+            let last_edit_row = cmp::min(
+                wrap_snapshot.make_wrap_point(range.end, Bias::Right).row() + WrapRow(1),
+                wrap_snapshot.max_point().row(),
+            ) + WrapRow(1);
+            let range =
+                wrap_snapshot.make_wrap_point(range.start, Bias::Left).row()..last_edit_row;
+            edits.push(Edit {
+                old: range.clone(),
+                new: range,
+            });
+        }
+
+        self.block_map.sync(
+            &wrap_snapshot,
+            edits,
+            self.companion
+                .as_ref()
+                .map(BlockMapWriterCompanion::companion_view),
+        );
+    }
+
     #[ztracing::instrument(skip_all)]
     fn blocks_intersecting_buffer_range(
         &self,
@@ -2207,6 +2269,13 @@ impl BlockSnapshot {
     #[inline(always)]
     pub fn has_replacement_blocks(&self) -> bool {
         self.transforms.summary().has_replacement_blocks
+    }
+
+    pub fn extra_buffer_header_height(&self, buffer_id: BufferId) -> u32 {
+        self.extra_buffer_header_heights
+            .get(&buffer_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
