@@ -917,6 +917,29 @@ impl DisplayMap {
         )
     }
 
+    pub fn set_extra_buffer_header_heights(
+        &mut self,
+        heights: HashMap<language::BufferId, u32>,
+        cx: &mut App,
+    ) {
+        let (self_wrap_snapshot, self_wrap_edits) = self.sync_through_wrap(cx);
+
+        Self::with_synced_companion_mut(
+            self.entity_id,
+            &self.companion,
+            cx,
+            |companion_view, cx| {
+                self.block_map
+                    .write(
+                        self_wrap_snapshot.clone(),
+                        self_wrap_edits.clone(),
+                        companion_view,
+                    )
+                    .set_extra_buffer_header_heights(heights, self.buffer.read(cx), cx);
+            },
+        )
+    }
+
     #[instrument(skip_all)]
     pub(crate) fn is_buffer_folded(&self, buffer_id: language::BufferId) -> bool {
         self.block_map.folded_buffers.contains(&buffer_id)
@@ -2454,6 +2477,10 @@ impl DisplaySnapshot {
 
     pub fn excerpt_header_height(&self) -> u32 {
         self.block_snapshot.excerpt_header_height
+    }
+
+    pub fn extra_buffer_header_height(&self, buffer_id: BufferId) -> u32 {
+        self.block_snapshot.extra_buffer_header_height(buffer_id)
     }
 
     /// Given a `DisplayPoint`, returns another `DisplayPoint` corresponding to

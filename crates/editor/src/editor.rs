@@ -771,6 +771,20 @@ pub trait Addon: 'static {
         None
     }
 
+    fn render_buffer_header_extra(
+        &self,
+        _: &ExcerptBoundaryInfo,
+        _: &language::BufferSnapshot,
+        _: &Window,
+        _: &App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    fn buffer_header_extra_height(&self, _buffer_id: language::BufferId) -> u32 {
+        0
+    }
+
     fn extend_buffer_header_context_menu(
         &self,
         menu: ui::ContextMenu,
@@ -8595,6 +8609,19 @@ impl Editor {
         if let Some(autoscroll) = autoscroll {
             self.request_autoscroll(autoscroll, cx);
         }
+        cx.notify();
+    }
+
+    pub fn set_extra_buffer_header_heights(
+        &mut self,
+        heights: impl IntoIterator<Item = (language::BufferId, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let heights: HashMap<language::BufferId, u32> = heights.into_iter().collect();
+        self.display_map
+            .update(cx, |display_map, cx| {
+                display_map.set_extra_buffer_header_heights(heights, cx)
+            });
         cx.notify();
     }
 

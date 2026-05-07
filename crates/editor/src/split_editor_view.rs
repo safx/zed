@@ -552,6 +552,19 @@ impl SplitBufferHeadersElement {
         let editor_bg_color = cx.theme().colors().editor_background;
         let selected = selected_buffer_ids.contains(&excerpt.buffer_id());
 
+        let editor_read = self.rhs_editor.read(cx);
+        let multibuffer_snapshot = editor_read.buffer.read(cx).snapshot(cx);
+        let buffer_snapshot = excerpt.buffer(&multibuffer_snapshot);
+        let extra_element = editor_read.addons.values().find_map(|addon| {
+            addon.render_buffer_header_extra(excerpt, &buffer_snapshot, window, cx)
+        });
+        let extra_height = snapshot
+            .display_snapshot
+            .extra_buffer_header_height(excerpt.buffer_id());
+
+        let total_header_rows = FILE_HEADER_HEIGHT + extra_height;
+        let gradient_height = total_header_rows as f32 * line_height;
+
         let mut header = v_flex()
             .id("sticky-buffer-header")
             .w(available_width)
@@ -559,7 +572,7 @@ impl SplitBufferHeadersElement {
             .child(
                 div()
                     .w(available_width)
-                    .h(FILE_HEADER_HEIGHT as f32 * line_height)
+                    .h(gradient_height)
                     .bg(linear_gradient(
                         0.,
                         linear_color_stop(editor_bg_color.opacity(0.), 0.),
@@ -568,6 +581,7 @@ impl SplitBufferHeadersElement {
                     .absolute()
                     .top_0(),
             )
+            .children(extra_element)
             .child(
                 render_buffer_header(
                     &self.rhs_editor,
@@ -594,7 +608,7 @@ impl SplitBufferHeadersElement {
                 continue;
             }
 
-            let max_row = block_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+            let max_row = block_row.0.saturating_sub(total_header_rows);
             let offset = scroll_position.y - max_row as f64;
 
             if offset > 0.0 {
@@ -652,17 +666,30 @@ impl SplitBufferHeadersElement {
                 latest_selection_anchors,
             );
 
-            let mut header = render_buffer_header(
-                &self.rhs_editor,
-                excerpt,
-                is_folded,
-                selected,
-                false,
-                jump_data,
-                window,
-                cx,
-            )
-            .into_any_element();
+            let editor_read = self.rhs_editor.read(cx);
+            let multibuffer_snapshot = editor_read.buffer.read(cx).snapshot(cx);
+            let buffer_snapshot = excerpt.buffer(&multibuffer_snapshot);
+            let extra_element = editor_read.addons.values().find_map(|addon| {
+                addon.render_buffer_header_extra(excerpt, &buffer_snapshot, window, cx)
+            });
+
+            let mut header = v_flex()
+                .w(available_width)
+                .children(extra_element)
+                .child(
+                    render_buffer_header(
+                        &self.rhs_editor,
+                        excerpt,
+                        is_folded,
+                        selected,
+                        false,
+                        jump_data,
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                )
+                .into_any_element();
 
             let y_offset = (block_row.0 as f64 - scroll_position.y) * f64::from(line_height);
             let origin = point(bounds.origin.x, bounds.origin.y + Pixels::from(y_offset));
