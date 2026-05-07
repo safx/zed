@@ -8,14 +8,14 @@ use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{prelude::*, *};
 use language::{Buffer, BufferId, BufferSnapshot, Capability, LanguageRegistry, Point};
 use markdown::{CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement};
-use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey, ToOffset as _};
+use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
 use project::{Project, ProjectEntryId, ProjectPath};
 use settings::Settings;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use ui::{ActiveTheme, Color, Icon, IconName, Tooltip, h_flex};
+use ui::{ActiveTheme, Color, Icon, IconName, Tooltip, h_flex, v_flex};
 use util::rel_path::RelPath;
 use workspace::ItemHandle as _;
 use workspace::Workspace;
@@ -142,13 +142,10 @@ struct ResolvedFocus {
 }
 
 #[derive(Clone)]
-struct GroupAnchor {
-    index: usize,
-    title: String,
-    summary: Option<String>,
-    phase: Option<SharedString>,
+struct GroupHeaderInfo {
+    title: SharedString,
+    summary: Option<SharedString>,
     focus: Vec<ResolvedFocus>,
-    first_hunk_anchor: multi_buffer::Anchor,
 }
 
 pub struct ReviewItem {
@@ -156,10 +153,10 @@ pub struct ReviewItem {
     entry_id: Option<ProjectEntryId>,
     workspace_entity: Entity<Workspace>,
     rhs_multibuffer: Entity<MultiBuffer>,
-    group_anchors: Vec<GroupAnchor>,
     path_to_buffer: HashMap<String, Entity<Buffer>>,
     comments: Vec<ReviewComment>,
     buffer_id_to_group_number: Arc<HashMap<BufferId, usize>>,
+    buffer_id_to_focus: Arc<HashMap<BufferId, GroupHeaderInfo>>,
 }
 
 impl project::ProjectItem for ReviewItem {
@@ -175,10 +172,13 @@ impl project::ProjectItem for ReviewItem {
         if !is_review_json {
             return None;
         }
+        log::info!("review: try_open matched for {:?}", path.path);
 
         let path = path.clone();
+        let log_path = format!("{:?}", path.path);
         let project = project.clone();
         Some(cx.spawn(async move |cx| {
+            let result: anyhow::Result<Entity<Self>> = async {
             let workspace_entity = cx.update(|cx| -> anyhow::Result<Entity<Workspace>> {
                 let handle = cx
                     .try_global::<AgentiumWorkspaceHandle>()
@@ -333,13 +333,8 @@ impl project::ProjectItem for ReviewItem {
             // the path's first appearance in the document.
             let mut path_to_ranges: Vec<(String, (u64, Vec<Range<Point>>))> = Vec::new();
             let mut next_prefix: u64 = 0;
-            // For each group, the location (path + range) of its first hunk; used to
-            // compute the group header anchor after MultiBuffer is built.
-            let mut group_first_hunk_loc: Vec<Option<(String, Range<Point>)>> =
-                Vec::with_capacity(document.groups.len());
 
             for group in &document.groups {
-                let mut group_first: Option<(String, Range<Point>)> = None;
                 for hunk in &group.hunks {
                     let start_row = hunk.new_start.saturating_sub(1);
                     let end_row = start_row.saturating_add(hunk.new_lines);
@@ -356,11 +351,7 @@ impl project::ProjectItem for ReviewItem {
                         path_to_ranges.len() - 1
                     };
                     path_to_ranges[idx].1.1.push(range.clone());
-                    if group_first.is_none() {
-                        group_first = Some((hunk.path.clone(), range.clone()));
-                    }
                 }
-                group_first_hunk_loc.push(group_first);
             }
 
             // Collect comments from all groups, plus the overall reviewer's
@@ -378,23 +369,6 @@ impl project::ProjectItem for ReviewItem {
                     comments.push(c);
                 }
             }
-
-            let group_titles_summaries: Vec<(String, Option<String>)> = document
-                .groups
-                .iter()
-                .map(|g| (g.title.clone(), g.summary.clone()))
-                .collect();
-
-            let group_phases: Vec<Option<SharedString>> = document
-                .groups
-                .iter()
-                .map(|g| {
-                    g.phase
-                        .as_ref()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| SharedString::from(s.clone()))
-                })
-                .collect();
 
             // Spec (strict 3-way): if review.focus is non-empty use it; otherwise
             // fall back to review_focus as Pending rows; otherwise empty.
@@ -445,11 +419,11 @@ impl project::ProjectItem for ReviewItem {
                 .collect();
 
             // Build the unified rhs MultiBuffer synchronously.
-            let (rhs_multibuffer, group_anchors, buffer_id_to_group_number) = cx.update(
+            let (rhs_multibuffer, buffer_id_to_group_number, buffer_id_to_focus) = cx.update(
                 |cx| -> anyhow::Result<(
                     Entity<MultiBuffer>,
-                    Vec<GroupAnchor>,
                     Arc<HashMap<BufferId, usize>>,
+                    HashMap<BufferId, GroupHeaderInfo>,
                 )> {
                     let rhs_multibuffer = cx.new(|cx| {
                         let mut mb = MultiBuffer::new(Capability::ReadOnly);
@@ -458,7 +432,6 @@ impl project::ProjectItem for ReviewItem {
                     });
 
                     let context_lines = multibuffer_context_lines(cx);
-                    let mut path_keys: HashMap<String, PathKey> = HashMap::new();
                     rhs_multibuffer.update(cx, |mb, cx| {
                         for (path_str, (prefix, ranges)) in &path_to_ranges {
                             let Some((buffer, diff)) = path_to_loaded.get(path_str) else {
@@ -473,7 +446,6 @@ impl project::ProjectItem for ReviewItem {
                                 }
                             };
                             let path_key = PathKey::with_sort_prefix(*prefix, rel_path);
-                            path_keys.insert(path_str.clone(), path_key.clone());
                             let max_row = buffer.read(cx).max_point().row;
                             let clamped = ranges.iter().map(|r| {
                                 let start_row = r.start.row.min(max_row);
@@ -490,66 +462,42 @@ impl project::ProjectItem for ReviewItem {
                         }
                     });
 
-                    let mb_snapshot = rhs_multibuffer.read(cx).snapshot(cx);
-                    let mut group_anchors = Vec::with_capacity(group_first_hunk_loc.len());
-                    for (gi, loc) in group_first_hunk_loc.iter().enumerate() {
-                        let Some((path_str, _)) = loc else {
-                            log::warn!("review: group {gi} has no hunks, header skipped");
-                            continue;
-                        };
-                        let Some(path_key) = path_keys.get(path_str) else {
-                            log::warn!(
-                                "review: group {gi} first hunk path {path_str} not loaded, header skipped",
-                            );
-                            continue;
-                        };
-                        // Anchor at the start of the file's first excerpt so the group
-                        // header renders right below the file's BufferHeader, above all
-                        // hunk content (including context lines).
-                        let Some(mb_anchor) =
-                            rhs_multibuffer.read(cx).location_for_path(path_key, cx)
-                        else {
-                            log::warn!(
-                                "review: group {gi} no excerpt for {path_str}, header skipped",
-                            );
-                            continue;
-                        };
-                        let (title, summary) = group_titles_summaries[gi].clone();
-                        let phase = group_phases[gi].clone();
-                        let focus = group_focus[gi].clone();
-                        group_anchors.push(GroupAnchor {
-                            index: gi,
-                            title,
-                            summary,
-                            phase,
-                            focus,
-                            first_hunk_anchor: mb_anchor,
-                        });
-                    }
-                    // Sort by buffer offset so the on-screen order of group headers
-                    // matches reading order. When a path is shared across groups,
-                    // document order may differ from row order.
-                    group_anchors.sort_by_key(|ga| ga.first_hunk_anchor.to_offset(&mb_snapshot));
-
                     // Map each buffer to the document-order group number it first
                     // appears in. First-occurrence wins when a file participates in
                     // multiple groups; this preserves the review.json's domain
                     // ordering (e.g. review_priority) over display-row order.
                     let mut buffer_id_to_group_number: HashMap<BufferId, usize> = HashMap::new();
+                    let mut buffer_id_to_focus: HashMap<BufferId, GroupHeaderInfo> =
+                        HashMap::default();
                     for (gi, group) in document.groups.iter().enumerate() {
+                        let mut first_buffer_in_group = true;
                         for hunk in &group.hunks {
                             let Some(buffer) = path_to_buffer.get(&hunk.path) else {
                                 continue;
                             };
                             let id = buffer.read(cx).remote_id();
                             buffer_id_to_group_number.entry(id).or_insert(gi + 1);
+                            if first_buffer_in_group {
+                                let title = match &group.phase {
+                                    Some(phase) => format!("{}. [{}] {}", gi + 1, phase, group.title),
+                                    None => format!("{}. {}", gi + 1, group.title),
+                                };
+                                buffer_id_to_focus
+                                    .entry(id)
+                                    .or_insert_with(|| GroupHeaderInfo {
+                                        title: SharedString::from(title),
+                                        summary: group.summary.clone().map(SharedString::from),
+                                        focus: group_focus[gi].clone(),
+                                    });
+                                first_buffer_in_group = false;
+                            }
                         }
                     }
 
                     Ok((
                         rhs_multibuffer,
-                        group_anchors,
                         Arc::new(buffer_id_to_group_number),
+                        buffer_id_to_focus,
                     ))
                 },
             )?;
@@ -568,11 +516,16 @@ impl project::ProjectItem for ReviewItem {
                 entry_id,
                 workspace_entity,
                 rhs_multibuffer,
-                group_anchors,
                 path_to_buffer,
                 comments,
                 buffer_id_to_group_number,
+                buffer_id_to_focus: Arc::new(buffer_id_to_focus),
             }))
+            }.await;
+            if let Err(ref err) = result {
+                log::error!("review: try_open failed for {log_path}: {err:#}");
+            }
+            result
         }))
     }
 
@@ -712,19 +665,19 @@ impl ProjectItem for ReviewView {
         let (
             workspace_entity,
             rhs_multibuffer,
-            group_anchors,
             path_to_buffer,
             comments,
             buffer_id_to_group_number,
+            buffer_id_to_focus,
         ) = {
             let item_ref = item.read(cx);
             (
                 item_ref.workspace_entity.clone(),
                 item_ref.rhs_multibuffer.clone(),
-                item_ref.group_anchors.clone(),
                 item_ref.path_to_buffer.clone(),
                 item_ref.comments.clone(),
                 item_ref.buffer_id_to_group_number.clone(),
+                item_ref.buffer_id_to_focus.clone(),
             )
         };
 
@@ -746,18 +699,33 @@ impl ProjectItem for ReviewView {
         // and start_temporary_diff_override on the rhs editor (split.rs:506-509),
         // so no post-construction setup is needed.
 
+        let extra_heights: HashMap<BufferId, u32> = buffer_id_to_focus
+            .iter()
+            .map(|(id, info)| {
+                let mut height: u32 = 1; // title
+                if info.summary.is_some() {
+                    height += 1;
+                }
+                height += info.focus.len() as u32;
+                height += 1; // padding
+                (*id, height)
+            })
+            .collect();
         splittable.update(cx, |s, cx| {
-            s.rhs_editor().update(cx, |editor, _cx| {
+            s.rhs_editor().update(cx, |editor, cx| {
                 editor.register_addon(AgentiumReviewAddon {
                     buffer_id_to_group_number,
+                    buffer_id_to_focus,
                 });
+                if !extra_heights.is_empty() {
+                    editor.set_extra_buffer_header_heights(extra_heights, cx);
+                }
             });
         });
 
         insert_review_blocks(
             &splittable,
             &rhs_multibuffer,
-            &group_anchors,
             &path_to_buffer,
             &comments,
             &language_registry,
@@ -771,7 +739,6 @@ impl ProjectItem for ReviewView {
 fn insert_review_blocks(
     splittable: &Entity<SplittableEditor>,
     rhs_multibuffer: &Entity<MultiBuffer>,
-    group_anchors: &[GroupAnchor],
     path_to_buffer: &HashMap<String, Entity<Buffer>>,
     comments: &[ReviewComment],
     language_registry: &Arc<LanguageRegistry>,
@@ -779,37 +746,6 @@ fn insert_review_blocks(
 ) {
     let mb_snapshot = rhs_multibuffer.read(cx).snapshot(cx);
     let mut blocks: Vec<BlockProperties<multi_buffer::Anchor>> = Vec::new();
-
-    for ga in group_anchors {
-        let group_index = ga.index;
-        let title = SharedString::from(match &ga.phase {
-            Some(phase) => format!("{}. [{}] {}", group_index + 1, phase, ga.title),
-            None => format!("{}. {}", group_index + 1, ga.title),
-        });
-        let summary = ga.summary.clone().map(SharedString::from);
-        let focus = ga.focus.clone();
-        let mut height: u32 = 1;
-        if summary.is_some() {
-            height += 1;
-        }
-        height += focus.len() as u32;
-        height += 1;
-        blocks.push(BlockProperties {
-            placement: BlockPlacement::Above(ga.first_hunk_anchor),
-            height: Some(height),
-            style: BlockStyle::Sticky,
-            priority: 0,
-            render: Arc::new(move |bcx: &mut BlockContext| {
-                render_group_header(
-                    group_index,
-                    title.clone(),
-                    summary.clone(),
-                    focus.clone(),
-                    bcx,
-                )
-            }),
-        });
-    }
 
     let mut path_to_snapshot: HashMap<&str, BufferSnapshot> = HashMap::new();
     for comment in comments {
@@ -896,79 +832,6 @@ fn insert_review_blocks(
             editor.insert_blocks(blocks, None, cx);
         });
     });
-}
-
-fn render_group_header(
-    group_index: usize,
-    title: SharedString,
-    summary: Option<SharedString>,
-    focus: Vec<ResolvedFocus>,
-    bcx: &mut BlockContext,
-) -> AnyElement {
-    let cx = &*bcx.app;
-    let colors = cx.theme().colors();
-    let status = cx.theme().status();
-    let mut content = div().flex().flex_col().child(
-        div()
-            .text_sm()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(colors.text)
-            .child(title),
-    );
-    if let Some(summary) = summary {
-        content = content.child(
-            div()
-                .text_xs()
-                .text_color(colors.text_muted)
-                .child(summary),
-        );
-    }
-    for (focus_index, item) in focus.into_iter().enumerate() {
-        let (icon, color) = match item.result {
-            FocusResult::Pass => ("✓", status.success),
-            FocusResult::Fail => ("✗", status.error),
-            FocusResult::Unsure => ("?", status.warning),
-            FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
-        };
-        let row = h_flex()
-            .id(SharedString::from(format!(
-                "review-focus-{group_index}-{focus_index}"
-            )))
-            .gap_2()
-            .items_center()
-            .text_xs()
-            .child(
-                div()
-                    .w_4()
-                    .flex()
-                    .justify_center()
-                    .text_color(color)
-                    .font_weight(FontWeight::BOLD)
-                    .child(icon),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(colors.text)
-                    .child(item.desc.clone()),
-            );
-        let row = if !item.reason.is_empty() {
-            row.tooltip(Tooltip::text(item.reason.clone()))
-        } else {
-            row
-        };
-        content = content.child(row);
-    }
-    div()
-        .px_3()
-        .py_1p5()
-        .bg(colors.elevated_surface_background)
-        .border_b_1()
-        .border_color(colors.border)
-        .child(content)
-        .into_any_element()
 }
 
 fn severity_label(severity: Severity) -> &'static str {
@@ -1070,6 +933,7 @@ fn render_review_comment(
 
 struct AgentiumReviewAddon {
     buffer_id_to_group_number: Arc<HashMap<BufferId, usize>>,
+    buffer_id_to_focus: Arc<HashMap<BufferId, GroupHeaderInfo>>,
 }
 
 impl Addon for AgentiumReviewAddon {
@@ -1095,6 +959,83 @@ impl Addon for AgentiumReviewAddon {
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(format!("#{n}"))
+                .into_any_element(),
+        )
+    }
+
+    fn render_buffer_header_extra(
+        &self,
+        _: &ExcerptBoundaryInfo,
+        buffer: &BufferSnapshot,
+        _: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let info = self.buffer_id_to_focus.get(&buffer.remote_id())?;
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        let buffer_id = buffer.remote_id();
+        let mut content = v_flex().w_full().px_3().py_1p5().gap_0p5();
+        content = content.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text)
+                .child(info.title.clone()),
+        );
+        if let Some(summary) = &info.summary {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .child(summary.clone()),
+            );
+        }
+        for (focus_idx, item) in info.focus.iter().enumerate() {
+            let (icon, color) = match item.result {
+                FocusResult::Pass => ("✓", status.success),
+                FocusResult::Fail => ("✗", status.error),
+                FocusResult::Unsure => ("?", status.warning),
+                FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
+            };
+            let row = h_flex()
+                .id(SharedString::from(format!(
+                    "buf-focus-{}-{focus_idx}",
+                    buffer_id.to_proto()
+                )))
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .child(
+                    div()
+                        .w_4()
+                        .flex()
+                        .justify_center()
+                        .text_color(color)
+                        .font_weight(FontWeight::BOLD)
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(colors.text)
+                        .child(item.desc.clone()),
+                );
+            let row = if !item.reason.is_empty() {
+                row.tooltip(Tooltip::text(item.reason.clone()))
+            } else {
+                row
+            };
+            content = content.child(row);
+        }
+        Some(
+            div()
+                .w_full()
+                .bg(colors.elevated_surface_background)
+                .border_b_1()
+                .border_color(colors.border)
+                .child(content)
                 .into_any_element(),
         )
     }
