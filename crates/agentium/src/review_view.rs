@@ -14,10 +14,12 @@ use language::{Buffer, BufferId, BufferSnapshot, Capability, LanguageRegistry, P
 use markdown::{CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement};
 use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
 use project::{Project, ProjectEntryId, ProjectItem as _, ProjectPath};
-use settings::Settings;
+use settings::{DiffViewStyle, Settings};
 use std::any::TypeId;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use ui::{ActiveTheme, Color, ContextMenu, Icon, IconName, Tooltip, h_flex, v_flex};
 use util::ResultExt as _;
@@ -561,6 +563,7 @@ pub struct ReviewView {
     splittable: Entity<SplittableEditor>,
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     context_menu_target: Option<CommentTarget>,
+    _split_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<EditorEvent> for ReviewView {}
@@ -822,27 +825,102 @@ impl ProjectItem for ReviewView {
                     buffer_id_to_focus,
                 });
                 if !extra_heights.is_empty() {
-                    editor.set_extra_buffer_header_heights(extra_heights, cx);
+                    editor.set_extra_buffer_header_heights(extra_heights.clone(), cx);
                 }
             });
         });
 
         let weak_review = cx.entity().downgrade();
-        insert_review_blocks(
-            &splittable,
-            &rhs_multibuffer,
-            &path_to_buffer,
-            &comments,
-            &language_registry,
-            weak_review,
-            cx,
-        );
+
+        // SplittableEditor::new schedules `split()` via `window.defer` (split.rs:541),
+        // and `split()` is what calls `set_companion` on the RHS DisplayMap. Until
+        // that runs, custom blocks inserted on the RHS have no entry in the
+        // companion's `custom_block_to_balancing_block` map, so neither
+        // `BlockMapWriter::insert` (block_map.rs:1812) nor later `resize_blocks`
+        // (block_map.rs:1881) create or update a matching LHS `Block::Spacer`.
+        // The LHS then drifts below the comment block — most visibly when the
+        // markdown text wraps differently at varying widths, which dynamically
+        // resizes the RHS block but not the absent LHS spacer.
+        //
+        // `set_extra_buffer_header_heights` is also per-editor and is *not*
+        // propagated to the companion (see block_map.rs:2119), so we mirror the
+        // same heights on the LHS once it exists — without registering the addon
+        // there, so the reserved space renders empty and acts as a pure spacer
+        // for the review_focus card above each hunk.
+        let split_subscription = if splittable.read(cx).diff_view_style()
+            == DiffViewStyle::Unified
+        {
+            insert_review_blocks(
+                &splittable,
+                &rhs_multibuffer,
+                &path_to_buffer,
+                &comments,
+                &language_registry,
+                weak_review,
+                cx,
+            );
+            None
+        } else {
+            let rhs_multibuffer = rhs_multibuffer.clone();
+            let language_registry = language_registry.clone();
+            let extra_heights_for_lhs = extra_heights;
+            let inserted = Rc::new(Cell::new(false));
+            Some(
+                cx.observe(&splittable, move |_this, splittable, cx| {
+                    if inserted.get() {
+                        return;
+                    }
+                    let Some(lhs_editor) = splittable.read(cx).lhs_editor().cloned() else {
+                        return;
+                    };
+                    inserted.set(true);
+                    // `extra_heights_for_lhs` is keyed by RHS buffer IDs (from
+                    // `path_to_buffer`), but the LHS multibuffer holds the diff's
+                    // *base text* buffer entities — different `BufferId`s — so
+                    // calling `set_extra_buffer_header_heights` on the LHS with
+                    // the RHS map is silently a no-op. Remap RHS IDs to LHS IDs
+                    // via the diff that links them (`diff.buffer_id()` is the RHS
+                    // ID; the diff is registered on the LHS multibuffer keyed by
+                    // its own base-text buffer ID).
+                    let lhs_multibuffer = lhs_editor.read(cx).buffer().clone();
+                    let mut lhs_heights: HashMap<BufferId, u32> = HashMap::default();
+                    {
+                        let mb = lhs_multibuffer.read(cx);
+                        for lhs_buffer in mb.all_buffers_iter() {
+                            let lhs_id = lhs_buffer.read(cx).remote_id();
+                            let Some(diff) = mb.diff_for(lhs_id) else {
+                                continue;
+                            };
+                            let rhs_id = diff.read(cx).buffer_id;
+                            if let Some(&h) = extra_heights_for_lhs.get(&rhs_id) {
+                                lhs_heights.insert(lhs_id, h);
+                            }
+                        }
+                    }
+                    if !lhs_heights.is_empty() {
+                        lhs_editor.update(cx, |editor, cx| {
+                            editor.set_extra_buffer_header_heights(lhs_heights, cx);
+                        });
+                    }
+                    insert_review_blocks(
+                        &splittable,
+                        &rhs_multibuffer,
+                        &path_to_buffer,
+                        &comments,
+                        &language_registry,
+                        weak_review.clone(),
+                        cx,
+                    );
+                }),
+            )
+        };
 
         Self {
             item,
             splittable,
             context_menu: None,
             context_menu_target: None,
+            _split_subscription: split_subscription,
         }
     }
 }
