@@ -2,20 +2,25 @@ use anyhow::{Context as _, anyhow};
 use buffer_diff::BufferDiff;
 use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle};
 use editor::hover_popover::diagnostics_markdown_style;
-use editor::{Addon, Editor, EditorEvent, EditorSettings, SplittableEditor, multibuffer_context_lines};
+use editor::scroll::Autoscroll;
+use editor::{
+    Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    multibuffer_context_lines,
+};
 use git::Oid;
 use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{prelude::*, *};
 use language::{Buffer, BufferId, BufferSnapshot, Capability, LanguageRegistry, Point};
 use markdown::{CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement};
 use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
-use project::{Project, ProjectEntryId, ProjectPath};
+use project::{Project, ProjectEntryId, ProjectItem as _, ProjectPath};
 use settings::Settings;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use ui::{ActiveTheme, Color, Icon, IconName, Tooltip, h_flex, v_flex};
+use ui::{ActiveTheme, Color, ContextMenu, Icon, IconName, Tooltip, h_flex, v_flex};
+use util::ResultExt as _;
 use util::rel_path::RelPath;
 use workspace::ItemHandle as _;
 use workspace::Workspace;
@@ -23,6 +28,15 @@ use workspace::item::{Item, ItemBufferKind, ProjectItem};
 use workspace::searchable::SearchableItemHandle;
 
 use crate::AgentiumWorkspaceHandle;
+
+actions!(agentium_review_view, [CopyComment, RevealComment]);
+
+#[derive(Clone)]
+struct CommentTarget {
+    path: String,
+    line: u32,
+    body: String,
+}
 
 #[derive(serde::Deserialize)]
 struct ReviewDocument {
@@ -545,6 +559,8 @@ impl project::ProjectItem for ReviewItem {
 pub struct ReviewView {
     item: Entity<ReviewItem>,
     splittable: Entity<SplittableEditor>,
+    context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
+    context_menu_target: Option<CommentTarget>,
 }
 
 impl EventEmitter<EditorEvent> for ReviewView {}
@@ -555,9 +571,97 @@ impl Focusable for ReviewView {
     }
 }
 
+impl ReviewView {
+    fn deploy_comment_menu(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        target: CommentTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu_target = Some(target);
+        let focus_handle = self.focus_handle(cx);
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.context(focus_handle)
+                .action("Copy", Box::new(CopyComment))
+                .action("Reveal in Editor", Box::new(RevealComment))
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            this.context_menu_target.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn copy_comment(&mut self, _: &CopyComment, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.context_menu_target.as_ref() else {
+            return;
+        };
+        let text = format!("At {}: {}\n{}", target.path, target.line, target.body);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn reveal_comment(&mut self, _: &RevealComment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.context_menu_target.clone() else {
+            return;
+        };
+        let buffer = self
+            .item
+            .read(cx)
+            .path_to_buffer
+            .get(&target.path)
+            .cloned();
+        let workspace = self.item.read(cx).workspace_entity.clone();
+        let Some(buffer) = buffer else {
+            return;
+        };
+        let Some(project_path) = buffer.read(cx).project_path(cx) else {
+            return;
+        };
+        let open_task = workspace.update(cx, |ws, cx| {
+            ws.open_path(project_path, None, true, window, cx)
+        });
+        cx.spawn_in(window, async move |_this, cx| -> Option<()> {
+            let item = open_task.await.log_err()?;
+            let editor = item.downcast::<Editor>()?;
+            editor
+                .update_in(cx, |editor, window, cx| {
+                    let row = target.line.saturating_sub(1);
+                    let pos = Point::new(row, 0);
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |s| s.select_ranges([pos..pos]),
+                    );
+                })
+                .log_err()?;
+            Some(())
+        })
+        .detach();
+    }
+}
+
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.splittable.clone()
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .key_context("AgentiumReviewView")
+            .on_action(cx.listener(Self::copy_comment))
+            .on_action(cx.listener(Self::reveal_comment))
+            .child(self.splittable.clone())
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(3)
+            }))
     }
 }
 
@@ -723,16 +827,23 @@ impl ProjectItem for ReviewView {
             });
         });
 
+        let weak_review = cx.entity().downgrade();
         insert_review_blocks(
             &splittable,
             &rhs_multibuffer,
             &path_to_buffer,
             &comments,
             &language_registry,
+            weak_review,
             cx,
         );
 
-        Self { item, splittable }
+        Self {
+            item,
+            splittable,
+            context_menu: None,
+            context_menu_target: None,
+        }
     }
 }
 
@@ -742,6 +853,7 @@ fn insert_review_blocks(
     path_to_buffer: &HashMap<String, Entity<Buffer>>,
     comments: &[ReviewComment],
     language_registry: &Arc<LanguageRegistry>,
+    weak_review: WeakEntity<ReviewView>,
     cx: &mut Context<ReviewView>,
 ) {
     let mb_snapshot = rhs_multibuffer.read(cx).snapshot(cx);
@@ -807,6 +919,12 @@ fn insert_review_blocks(
         let height = body_lines.saturating_add(2).clamp(3, 24);
 
         let markdown_for_render = markdown.clone();
+        let target = CommentTarget {
+            path: comment.path.clone(),
+            line: comment.line,
+            body: comment.body.clone(),
+        };
+        let weak_review = weak_review.clone();
         blocks.push(BlockProperties {
             placement: BlockPlacement::Below(mb_anchor),
             height: Some(height),
@@ -818,6 +936,8 @@ fn insert_review_blocks(
                     model.clone(),
                     markdown_for_render.clone(),
                     is_duplicate,
+                    weak_review.clone(),
+                    target.clone(),
                     bcx,
                 )
             }),
@@ -847,6 +967,8 @@ fn render_review_comment(
     model: Option<SharedString>,
     markdown: Entity<Markdown>,
     is_duplicate: bool,
+    weak_review: WeakEntity<ReviewView>,
+    target: CommentTarget,
     bcx: &mut BlockContext,
 ) -> AnyElement {
     let cx = &*bcx.app;
@@ -919,6 +1041,21 @@ fn render_review_comment(
         .border_l_2()
         .bg(bg)
         .border_color(border)
+        // Stops propagation so the editor's window-level right-click handler
+        // (mouse_context_menu::deploy_context_menu in editor::element) does not
+        // fire. Depends on block elements being painted after
+        // editor::paint_mouse_listeners so they appear later in the LIFO bubble
+        // dispatch order.
+        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+            cx.stop_propagation();
+            let position = event.position;
+            let target = target.clone();
+            weak_review
+                .update(cx, |this, cx| {
+                    this.deploy_comment_menu(position, target, window, cx);
+                })
+                .log_err();
+        })
         .child(header_row)
         .child(
             MarkdownElement::new(markdown, style).code_block_renderer(
