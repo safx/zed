@@ -4,15 +4,15 @@ use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockSt
 use editor::hover_popover::diagnostics_markdown_style;
 use editor::scroll::Autoscroll;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
     multibuffer_context_lines,
 };
 use git::Oid;
 use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{prelude::*, *};
-use language::{Buffer, BufferId, BufferSnapshot, Capability, LanguageRegistry, Point};
+use language::{Buffer, BufferSnapshot, Capability, LanguageRegistry, Point};
 use markdown::{CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement};
-use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer, PathKey};
+use multi_buffer::{MultiBuffer, PathKey};
 use project::{Project, ProjectEntryId, ProjectItem as _, ProjectPath};
 use settings::{DiffViewStyle, Settings};
 use std::any::TypeId;
@@ -21,12 +21,15 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use ui::{ActiveTheme, Color, ContextMenu, Icon, IconName, Tooltip, h_flex, v_flex};
+use ui::{
+    ActiveTheme, Button, ButtonCommon, ButtonStyle, Clickable, Color, ContextMenu, FluentBuilder,
+    Icon, IconName, LabelSize, Tooltip, h_flex, v_flex,
+};
 use util::ResultExt as _;
 use util::rel_path::RelPath;
-use workspace::ItemHandle as _;
+use workspace::Toolbar;
 use workspace::Workspace;
-use workspace::item::{Item, ItemBufferKind, ProjectItem};
+use workspace::item::{Item, ItemBufferKind, ItemHandle, ProjectItem};
 use workspace::searchable::SearchableItemHandle;
 
 use crate::AgentiumWorkspaceHandle;
@@ -158,21 +161,22 @@ struct ResolvedFocus {
 }
 
 #[derive(Clone)]
-struct GroupHeaderInfo {
+struct GroupData {
+    number: usize,
     title: SharedString,
     summary: Option<SharedString>,
     focus: Vec<ResolvedFocus>,
+    hunks: Vec<ReviewHunk>,
+    comments: Vec<ReviewComment>,
 }
 
 pub struct ReviewItem {
     project_path: ProjectPath,
     entry_id: Option<ProjectEntryId>,
     workspace_entity: Entity<Workspace>,
-    rhs_multibuffer: Entity<MultiBuffer>,
-    path_to_buffer: HashMap<String, Entity<Buffer>>,
-    comments: Vec<ReviewComment>,
-    buffer_id_to_group_number: Arc<HashMap<BufferId, usize>>,
-    buffer_id_to_focus: Arc<HashMap<BufferId, GroupHeaderInfo>>,
+    path_to_loaded: HashMap<String, (Entity<Buffer>, Entity<BufferDiff>)>,
+    groups: Vec<GroupData>,
+    overall_comments: Vec<ReviewComment>,
 }
 
 impl project::ProjectItem for ReviewItem {
@@ -217,6 +221,11 @@ impl project::ProjectItem for ReviewItem {
                 .with_context(|| format!("reading {}", abs_path.display()))?;
             let document: ReviewDocument = serde_json::from_str(&content)
                 .with_context(|| format!("parsing {} as review JSON", abs_path.display()))?;
+            anyhow::ensure!(
+                !document.groups.is_empty(),
+                "review.json {} has no groups",
+                abs_path.display(),
+            );
 
             let repo = repo.ok_or_else(|| anyhow!("no active git repository"))?;
             let head_sha = repo.read_with(cx, |r, _| {
@@ -344,179 +353,77 @@ impl project::ProjectItem for ReviewItem {
                 .map(|(p, b, d)| (p, (b, d)))
                 .collect();
 
-            // Per-file merging: collect all hunks for each path across all groups.
-            // Vec preserves first-occurrence order so PathKey sort_prefix tracks
-            // the path's first appearance in the document.
-            let mut path_to_ranges: Vec<(String, (u64, Vec<Range<Point>>))> = Vec::new();
-            let mut next_prefix: u64 = 0;
-
-            for group in &document.groups {
-                for hunk in &group.hunks {
-                    let start_row = hunk.new_start.saturating_sub(1);
-                    let end_row = start_row.saturating_add(hunk.new_lines);
-                    let range = Point::new(start_row, 0)..Point::new(end_row, 0);
-                    let idx = if let Some(idx) = path_to_ranges
-                        .iter()
-                        .position(|(p, _)| p == &hunk.path)
-                    {
-                        idx
-                    } else {
-                        let p = next_prefix;
-                        next_prefix = next_prefix.saturating_add(1);
-                        path_to_ranges.push((hunk.path.clone(), (p, Vec::new())));
-                        path_to_ranges.len() - 1
-                    };
-                    path_to_ranges[idx].1.1.push(range.clone());
-                }
-            }
-
-            // Collect comments from all groups, plus the overall reviewer's
-            // top-level comments. Overall ones are tagged so the model label
-            // can be rendered as "model (overall)".
-            let mut comments: Vec<ReviewComment> = document
-                .groups
-                .iter()
-                .flat_map(|g| g.review.iter().flat_map(|r| r.comments.iter().cloned()))
-                .collect();
-            if let Some(overall) = &document.review {
-                for c in &overall.comments {
-                    let mut c = c.clone();
-                    c.overall = true;
-                    comments.push(c);
-                }
-            }
-
             // Spec (strict 3-way): if review.focus is non-empty use it; otherwise
             // fall back to review_focus as Pending rows; otherwise empty.
             // length mismatch is silent-dropped with a log::warn.
-            let group_focus: Vec<Vec<ResolvedFocus>> = document
-                .groups
-                .iter()
-                .enumerate()
-                .map(|(gi, g)| {
-                    let post: &[ReviewFocus] = g
-                        .review
-                        .as_ref()
-                        .map(|s| s.focus.as_slice())
-                        .unwrap_or(&[]);
-                    let pre: &[String] = &g.review_focus;
-                    if !post.is_empty() {
-                        if pre.len() > post.len() {
-                            log::warn!(
-                                "review: group {gi}: review_focus ({}) > review.focus ({}), {} dropped",
-                                pre.len(),
-                                post.len(),
-                                pre.len() - post.len(),
-                            );
-                        }
-                        post.iter()
-                            .map(|f| ResolvedFocus {
-                                desc: SharedString::from(f.desc.clone()),
-                                result: parse_focus_result(&f.result),
-                                reason: SharedString::from(f.reason.clone()),
-                            })
-                            .collect()
-                    } else {
-                        pre.iter()
-                            .map(|desc| ResolvedFocus {
-                                desc: SharedString::from(desc.clone()),
-                                result: FocusResult::Pending,
-                                reason: SharedString::default(),
-                            })
-                            .collect()
+            let resolve_focus = |gi: usize, g: &ReviewGroup| -> Vec<ResolvedFocus> {
+                let post: &[ReviewFocus] = g
+                    .review
+                    .as_ref()
+                    .map(|s| s.focus.as_slice())
+                    .unwrap_or(&[]);
+                let pre: &[String] = &g.review_focus;
+                if !post.is_empty() {
+                    if pre.len() > post.len() {
+                        log::warn!(
+                            "review: group {gi}: review_focus ({}) > review.focus ({}), {} dropped",
+                            pre.len(),
+                            post.len(),
+                            pre.len() - post.len(),
+                        );
                     }
-                })
-                .collect();
+                    post.iter()
+                        .map(|f| ResolvedFocus {
+                            desc: SharedString::from(f.desc.clone()),
+                            result: parse_focus_result(&f.result),
+                            reason: SharedString::from(f.reason.clone()),
+                        })
+                        .collect()
+                } else {
+                    pre.iter()
+                        .map(|desc| ResolvedFocus {
+                            desc: SharedString::from(desc.clone()),
+                            result: FocusResult::Pending,
+                            reason: SharedString::default(),
+                        })
+                        .collect()
+                }
+            };
 
-            // path_to_buffer for review_view's later block-anchor computations.
-            let path_to_buffer: HashMap<String, Entity<Buffer>> = path_to_loaded
-                .iter()
-                .map(|(p, (b, _))| (p.clone(), b.clone()))
-                .collect();
+            let mut groups: Vec<GroupData> = Vec::with_capacity(document.groups.len());
+            for (gi, group) in document.groups.iter().enumerate() {
+                let number = gi + 1;
+                let title = match &group.phase {
+                    Some(phase) => format!("{}. [{}] {}", number, phase, group.title),
+                    None => format!("{}. {}", number, group.title),
+                };
+                let comments: Vec<ReviewComment> = group
+                    .review
+                    .iter()
+                    .flat_map(|r| r.comments.iter().cloned())
+                    .collect();
+                groups.push(GroupData {
+                    number,
+                    title: SharedString::from(title),
+                    summary: group.summary.clone().map(SharedString::from),
+                    focus: resolve_focus(gi, group),
+                    hunks: group.hunks.clone(),
+                    comments,
+                });
+            }
 
-            // Build the unified rhs MultiBuffer synchronously.
-            let (rhs_multibuffer, buffer_id_to_group_number, buffer_id_to_focus) = cx.update(
-                |cx| -> anyhow::Result<(
-                    Entity<MultiBuffer>,
-                    Arc<HashMap<BufferId, usize>>,
-                    HashMap<BufferId, GroupHeaderInfo>,
-                )> {
-                    let rhs_multibuffer = cx.new(|cx| {
-                        let mut mb = MultiBuffer::new(Capability::ReadOnly);
-                        mb.set_all_diff_hunks_expanded(cx);
-                        mb
-                    });
-
-                    let context_lines = multibuffer_context_lines(cx);
-                    rhs_multibuffer.update(cx, |mb, cx| {
-                        for (path_str, (prefix, ranges)) in &path_to_ranges {
-                            let Some((buffer, diff)) = path_to_loaded.get(path_str) else {
-                                continue;
-                            };
-                            mb.add_diff(diff.clone(), cx);
-                            let rel_path = match RelPath::unix(path_str) {
-                                Ok(p) => p.into_arc(),
-                                Err(err) => {
-                                    log::warn!("review: skipping {path_str}: invalid path: {err}");
-                                    continue;
-                                }
-                            };
-                            let path_key = PathKey::with_sort_prefix(*prefix, rel_path);
-                            let max_row = buffer.read(cx).max_point().row;
-                            let clamped = ranges.iter().map(|r| {
-                                let start_row = r.start.row.min(max_row);
-                                let end_row = r.end.row.min(max_row);
-                                Point::new(start_row, 0)..Point::new(end_row, 0)
-                            });
-                            mb.set_excerpts_for_path(
-                                path_key,
-                                buffer.clone(),
-                                clamped,
-                                context_lines,
-                                cx,
-                            );
-                        }
-                    });
-
-                    // Map each buffer to the document-order group number it first
-                    // appears in. First-occurrence wins when a file participates in
-                    // multiple groups; this preserves the review.json's domain
-                    // ordering (e.g. review_priority) over display-row order.
-                    let mut buffer_id_to_group_number: HashMap<BufferId, usize> = HashMap::new();
-                    let mut buffer_id_to_focus: HashMap<BufferId, GroupHeaderInfo> =
-                        HashMap::default();
-                    for (gi, group) in document.groups.iter().enumerate() {
-                        let mut first_buffer_in_group = true;
-                        for hunk in &group.hunks {
-                            let Some(buffer) = path_to_buffer.get(&hunk.path) else {
-                                continue;
-                            };
-                            let id = buffer.read(cx).remote_id();
-                            buffer_id_to_group_number.entry(id).or_insert(gi + 1);
-                            if first_buffer_in_group {
-                                let title = match &group.phase {
-                                    Some(phase) => format!("{}. [{}] {}", gi + 1, phase, group.title),
-                                    None => format!("{}. {}", gi + 1, group.title),
-                                };
-                                buffer_id_to_focus
-                                    .entry(id)
-                                    .or_insert_with(|| GroupHeaderInfo {
-                                        title: SharedString::from(title),
-                                        summary: group.summary.clone().map(SharedString::from),
-                                        focus: group_focus[gi].clone(),
-                                    });
-                                first_buffer_in_group = false;
-                            }
-                        }
-                    }
-
-                    Ok((
-                        rhs_multibuffer,
-                        Arc::new(buffer_id_to_group_number),
-                        buffer_id_to_focus,
-                    ))
-                },
-            )?;
+            let overall_comments: Vec<ReviewComment> =
+                document.review.as_ref().map_or_else(Vec::new, |overall| {
+                    overall
+                        .comments
+                        .iter()
+                        .map(|c| {
+                            let mut c = c.clone();
+                            c.overall = true;
+                            c
+                        })
+                        .collect()
+                });
 
             log::info!(
                 "review: opened {} (base={}, target={}, {} groups, {} unique files)",
@@ -531,11 +438,9 @@ impl project::ProjectItem for ReviewItem {
                 project_path: path,
                 entry_id,
                 workspace_entity,
-                rhs_multibuffer,
-                path_to_buffer,
-                comments,
-                buffer_id_to_group_number,
-                buffer_id_to_focus: Arc::new(buffer_id_to_focus),
+                path_to_loaded,
+                groups,
+                overall_comments,
             }))
             }.await;
             if let Err(ref err) = result {
@@ -560,7 +465,11 @@ impl project::ProjectItem for ReviewItem {
 
 pub struct ReviewView {
     item: Entity<ReviewItem>,
+    active_group: usize,
     splittable: Entity<SplittableEditor>,
+    project: Entity<Project>,
+    language_registry: Arc<LanguageRegistry>,
+    toolbar: Option<WeakEntity<Toolbar>>,
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     context_menu_target: Option<CommentTarget>,
     _split_subscription: Option<Subscription>,
@@ -614,9 +523,9 @@ impl ReviewView {
         let buffer = self
             .item
             .read(cx)
-            .path_to_buffer
+            .path_to_loaded
             .get(&target.path)
-            .cloned();
+            .map(|(b, _)| b.clone());
         let workspace = self.item.read(cx).workspace_entity.clone();
         let Some(buffer) = buffer else {
             return;
@@ -646,15 +555,176 @@ impl ReviewView {
         })
         .detach();
     }
+
+    fn set_active_group(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index == self.active_group || index >= self.item.read(cx).groups.len() {
+            return;
+        }
+        self.active_group = index;
+
+        let weak_review = cx.entity().downgrade();
+        let (splittable, sub) = build_splittable_for_group(
+            &self.item,
+            index,
+            &self.project,
+            &self.language_registry,
+            weak_review,
+            window,
+            cx,
+        );
+        self.splittable = splittable;
+        self._split_subscription = sub;
+
+        // BufferSearchBar (and other ToolbarItemViews) caches a `WeakEntity<SplittableEditor>`
+        // that becomes stale when we swap the inner splittable. Re-fire the toolbar's
+        // `set_active_item` path — the same operation `Pane::update_toolbar` performs —
+        // so each ToolbarItemView's `set_active_pane_item` re-runs and refreshes its
+        // cached handles. Deferred because `Toolbar::set_active_item` calls
+        // `item.act_as_type(...)` which reads the ReviewView entity, but we're
+        // currently inside its update closure.
+        if let Some(toolbar) = self.toolbar.as_ref().and_then(|w| w.upgrade()) {
+            let self_weak = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let Some(self_handle) = self_weak.upgrade() else {
+                    return;
+                };
+                toolbar.update(cx, |toolbar, cx| {
+                    toolbar.set_active_item(Some(&self_handle as &dyn ItemHandle), window, cx);
+                });
+            });
+        }
+
+        window.focus(&self.splittable.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn render_group_header(
+        &self,
+        group: &GroupData,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        let mut content = v_flex().w_full().px_3().py_2().gap_0p5();
+        content = content.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text)
+                .child(group.title.clone()),
+        );
+        if let Some(summary) = group.summary.as_ref() {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .child(summary.clone()),
+            );
+        }
+        for (focus_idx, item) in group.focus.iter().enumerate() {
+            let (icon, color) = match item.result {
+                FocusResult::Pass => ("✓", status.success),
+                FocusResult::Fail => ("✗", status.error),
+                FocusResult::Unsure => ("?", status.warning),
+                FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
+            };
+            let row = h_flex()
+                .id(SharedString::from(format!(
+                    "group-focus-{}-{focus_idx}",
+                    group.number
+                )))
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .child(
+                    div()
+                        .w_4()
+                        .flex()
+                        .justify_center()
+                        .text_color(color)
+                        .font_weight(FontWeight::BOLD)
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(colors.text)
+                        .child(item.desc.clone()),
+                );
+            let row = if !item.reason.is_empty() {
+                row.tooltip(Tooltip::text(item.reason.clone()))
+            } else {
+                row
+            };
+            content = content.child(row);
+        }
+        div()
+            .w_full()
+            .bg(colors.elevated_surface_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .child(content)
+    }
+
+    fn render_tab_strip(
+        &self,
+        groups: &[GroupData],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let active = self.active_group;
+        h_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .bg(colors.editor_background)
+            .border_b_1()
+            .border_color(colors.border)
+            .children(groups.iter().enumerate().map(|(i, group)| {
+                let is_active = i == active;
+                Button::new(
+                    ("review-group-tab", i),
+                    group.number.to_string(),
+                )
+                .label_size(LabelSize::Small)
+                .style(if is_active {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_active_group(i, window, cx);
+                }))
+            }))
+    }
 }
 
 impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let active = self.active_group;
+        let item = self.item.read(cx);
+        let tabs = (!item.groups.is_empty())
+            .then(|| self.render_tab_strip(&item.groups, cx).into_any_element());
+        let header = item
+            .groups
+            .get(active)
+            .map(|g| self.render_group_header(g, cx).into_any_element());
+
+        v_flex()
             .size_full()
             .key_context("AgentiumReviewView")
             .on_action(cx.listener(Self::copy_comment))
             .on_action(cx.listener(Self::reveal_comment))
+            .when_some(tabs, |this, t| this.child(t))
+            .when_some(header, |this, h| this.child(h))
             .child(self.splittable.clone())
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
@@ -762,162 +832,32 @@ impl ProjectItem for ReviewView {
 
     fn for_project_item(
         project: Entity<Project>,
-        _pane: Option<&workspace::Pane>,
+        pane: Option<&workspace::Pane>,
         item: Entity<Self::Item>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let language_registry = project.read(cx).languages().clone();
-
-        let (
-            workspace_entity,
-            rhs_multibuffer,
-            path_to_buffer,
-            comments,
-            buffer_id_to_group_number,
-            buffer_id_to_focus,
-        ) = {
-            let item_ref = item.read(cx);
-            (
-                item_ref.workspace_entity.clone(),
-                item_ref.rhs_multibuffer.clone(),
-                item_ref.path_to_buffer.clone(),
-                item_ref.comments.clone(),
-                item_ref.buffer_id_to_group_number.clone(),
-                item_ref.buffer_id_to_focus.clone(),
-            )
-        };
-
-        let style = EditorSettings::get_global(cx).diff_view_style;
-
-        let splittable = cx.new(|cx| {
-            SplittableEditor::new(
-                style,
-                rhs_multibuffer.clone(),
-                project.clone(),
-                workspace_entity,
-                window,
-                cx,
-            )
-        });
-
-        // SplittableEditor::new internally calls disable_runnables,
-        // disable_inline_diagnostics, set_minimap_visibility(Disabled, ...),
-        // and start_temporary_diff_override on the rhs editor (split.rs:506-509),
-        // so no post-construction setup is needed.
-
-        let extra_heights: HashMap<BufferId, u32> = buffer_id_to_focus
-            .iter()
-            .map(|(id, info)| {
-                let mut height: u32 = 1; // title
-                if info.summary.is_some() {
-                    height += 1;
-                }
-                height += info.focus.len() as u32;
-                height += 1; // padding
-                (*id, height)
-            })
-            .collect();
-        splittable.update(cx, |s, cx| {
-            s.rhs_editor().update(cx, |editor, cx| {
-                editor.register_addon(AgentiumReviewAddon {
-                    buffer_id_to_group_number,
-                    buffer_id_to_focus,
-                });
-                if !extra_heights.is_empty() {
-                    editor.set_extra_buffer_header_heights(extra_heights.clone(), cx);
-                }
-            });
-        });
+        let toolbar = pane.map(|p| p.toolbar().downgrade());
 
         let weak_review = cx.entity().downgrade();
-
-        // SplittableEditor::new schedules `split()` via `window.defer` (split.rs:541),
-        // and `split()` is what calls `set_companion` on the RHS DisplayMap. Until
-        // that runs, custom blocks inserted on the RHS have no entry in the
-        // companion's `custom_block_to_balancing_block` map, so neither
-        // `BlockMapWriter::insert` (block_map.rs:1812) nor later `resize_blocks`
-        // (block_map.rs:1881) create or update a matching LHS `Block::Spacer`.
-        // The LHS then drifts below the comment block — most visibly when the
-        // markdown text wraps differently at varying widths, which dynamically
-        // resizes the RHS block but not the absent LHS spacer.
-        //
-        // `set_extra_buffer_header_heights` is also per-editor and is *not*
-        // propagated to the companion (see block_map.rs:2119), so we mirror the
-        // same heights on the LHS once it exists — without registering the addon
-        // there, so the reserved space renders empty and acts as a pure spacer
-        // for the review_focus card above each hunk.
-        let split_subscription = if splittable.read(cx).diff_view_style()
-            == DiffViewStyle::Unified
-        {
-            insert_review_blocks(
-                &splittable,
-                &rhs_multibuffer,
-                &path_to_buffer,
-                &comments,
-                &language_registry,
-                weak_review,
-                cx,
-            );
-            None
-        } else {
-            let rhs_multibuffer = rhs_multibuffer.clone();
-            let language_registry = language_registry.clone();
-            let extra_heights_for_lhs = extra_heights;
-            let inserted = Rc::new(Cell::new(false));
-            Some(
-                cx.observe(&splittable, move |_this, splittable, cx| {
-                    if inserted.get() {
-                        return;
-                    }
-                    let Some(lhs_editor) = splittable.read(cx).lhs_editor().cloned() else {
-                        return;
-                    };
-                    inserted.set(true);
-                    // `extra_heights_for_lhs` is keyed by RHS buffer IDs (from
-                    // `path_to_buffer`), but the LHS multibuffer holds the diff's
-                    // *base text* buffer entities — different `BufferId`s — so
-                    // calling `set_extra_buffer_header_heights` on the LHS with
-                    // the RHS map is silently a no-op. Remap RHS IDs to LHS IDs
-                    // via the diff that links them (`diff.buffer_id()` is the RHS
-                    // ID; the diff is registered on the LHS multibuffer keyed by
-                    // its own base-text buffer ID).
-                    let lhs_multibuffer = lhs_editor.read(cx).buffer().clone();
-                    let mut lhs_heights: HashMap<BufferId, u32> = HashMap::default();
-                    {
-                        let mb = lhs_multibuffer.read(cx);
-                        for lhs_buffer in mb.all_buffers_iter() {
-                            let lhs_id = lhs_buffer.read(cx).remote_id();
-                            let Some(diff) = mb.diff_for(lhs_id) else {
-                                continue;
-                            };
-                            let rhs_id = diff.read(cx).buffer_id;
-                            if let Some(&h) = extra_heights_for_lhs.get(&rhs_id) {
-                                lhs_heights.insert(lhs_id, h);
-                            }
-                        }
-                    }
-                    if !lhs_heights.is_empty() {
-                        lhs_editor.update(cx, |editor, cx| {
-                            editor.set_extra_buffer_header_heights(lhs_heights, cx);
-                        });
-                    }
-                    insert_review_blocks(
-                        &splittable,
-                        &rhs_multibuffer,
-                        &path_to_buffer,
-                        &comments,
-                        &language_registry,
-                        weak_review.clone(),
-                        cx,
-                    );
-                }),
-            )
-        };
+        let (splittable, split_subscription) = build_splittable_for_group(
+            &item,
+            0,
+            &project,
+            &language_registry,
+            weak_review,
+            window,
+            cx,
+        );
 
         Self {
             item,
+            active_group: 0,
             splittable,
+            project,
+            language_registry,
+            toolbar,
             context_menu: None,
             context_menu_target: None,
             _split_subscription: split_subscription,
@@ -925,10 +865,135 @@ impl ProjectItem for ReviewView {
     }
 }
 
+fn build_splittable_for_group(
+    item: &Entity<ReviewItem>,
+    group_index: usize,
+    project: &Entity<Project>,
+    language_registry: &Arc<LanguageRegistry>,
+    weak_review: WeakEntity<ReviewView>,
+    window: &mut Window,
+    cx: &mut Context<ReviewView>,
+) -> (Entity<SplittableEditor>, Option<Subscription>) {
+    let style = EditorSettings::get_global(cx).diff_view_style;
+
+    let (workspace_entity, path_to_loaded, group_hunks, comments_for_tab) = {
+        let item_ref = item.read(cx);
+        let group = &item_ref.groups[group_index];
+        let mut comments: Vec<ReviewComment> = group.comments.clone();
+        comments.extend(item_ref.overall_comments.iter().cloned());
+        (
+            item_ref.workspace_entity.clone(),
+            item_ref.path_to_loaded.clone(),
+            group.hunks.clone(),
+            comments,
+        )
+    };
+
+    // Per-file aggregation of this group's hunks. Vec preserves first-occurrence
+    // order so PathKey sort_prefix tracks the path's first appearance within
+    // this group (tab-local; not comparable across groups).
+    let mut path_to_ranges: Vec<(String, Vec<Range<Point>>)> = Vec::new();
+    for hunk in &group_hunks {
+        let start_row = hunk.new_start.saturating_sub(1);
+        let end_row = start_row.saturating_add(hunk.new_lines);
+        let range = Point::new(start_row, 0)..Point::new(end_row, 0);
+        if let Some(idx) = path_to_ranges.iter().position(|(p, _)| p == &hunk.path) {
+            path_to_ranges[idx].1.push(range);
+        } else {
+            path_to_ranges.push((hunk.path.clone(), vec![range]));
+        }
+    }
+
+    let rhs_multibuffer = cx.new(|cx| {
+        let mut mb = MultiBuffer::new(Capability::ReadOnly);
+        mb.set_all_diff_hunks_expanded(cx);
+        mb
+    });
+
+    let context_lines = multibuffer_context_lines(cx);
+    rhs_multibuffer.update(cx, |mb, cx| {
+        for (prefix, (path_str, ranges)) in path_to_ranges.iter().enumerate() {
+            let Some((buffer, diff)) = path_to_loaded.get(path_str) else {
+                continue;
+            };
+            mb.add_diff(diff.clone(), cx);
+            let rel_path = match RelPath::unix(path_str) {
+                Ok(p) => p.into_arc(),
+                Err(err) => {
+                    log::warn!("review: skipping {path_str}: invalid path: {err}");
+                    continue;
+                }
+            };
+            let path_key = PathKey::with_sort_prefix(prefix as u64, rel_path);
+            let max_row = buffer.read(cx).max_point().row;
+            let clamped = ranges.iter().map(|r| {
+                let start_row = r.start.row.min(max_row);
+                let end_row = r.end.row.min(max_row);
+                Point::new(start_row, 0)..Point::new(end_row, 0)
+            });
+            mb.set_excerpts_for_path(path_key, buffer.clone(), clamped, context_lines, cx);
+        }
+    });
+
+    let splittable = cx.new(|cx| {
+        SplittableEditor::new(
+            style,
+            rhs_multibuffer.clone(),
+            project.clone(),
+            workspace_entity,
+            window,
+            cx,
+        )
+    });
+
+    // `SplittableEditor::new` schedules `split()` via `window.defer` (split.rs:541)
+    // and `split()` is what calls `set_companion` on the RHS DisplayMap. Until
+    // that runs, custom blocks inserted on the RHS have no entry in the
+    // companion's `custom_block_to_balancing_block` map. For side-by-side mode
+    // we therefore defer the block insertion until the LHS editor appears.
+    let split_subscription = if splittable.read(cx).diff_view_style() == DiffViewStyle::Unified {
+        insert_review_blocks(
+            &splittable,
+            &rhs_multibuffer,
+            &path_to_loaded,
+            &comments_for_tab,
+            language_registry,
+            weak_review,
+            cx,
+        );
+        None
+    } else {
+        let language_registry = language_registry.clone();
+        let inserted = Rc::new(Cell::new(false));
+        Some(
+            cx.observe(&splittable, move |_this, splittable, cx| {
+                if inserted.get() {
+                    return;
+                }
+                if splittable.read(cx).lhs_editor().is_none() {
+                    return;
+                }
+                inserted.set(true);
+                insert_review_blocks(
+                    &splittable,
+                    &rhs_multibuffer,
+                    &path_to_loaded,
+                    &comments_for_tab,
+                    &language_registry,
+                    weak_review.clone(),
+                    cx,
+                );
+            }),
+        )
+    };
+
+    (splittable, split_subscription)
+}
+
 fn insert_review_blocks(
     splittable: &Entity<SplittableEditor>,
     rhs_multibuffer: &Entity<MultiBuffer>,
-    path_to_buffer: &HashMap<String, Entity<Buffer>>,
+    path_to_loaded: &HashMap<String, (Entity<Buffer>, Entity<BufferDiff>)>,
     comments: &[ReviewComment],
     language_registry: &Arc<LanguageRegistry>,
     weak_review: WeakEntity<ReviewView>,
@@ -940,7 +1005,7 @@ fn insert_review_blocks(
     let mut path_to_snapshot: HashMap<&str, BufferSnapshot> = HashMap::new();
     for comment in comments {
         let is_duplicate = comment.duplicate_of.is_some();
-        let Some(buffer) = path_to_buffer.get(comment.path.as_str()) else {
+        let Some((buffer, _)) = path_to_loaded.get(comment.path.as_str()) else {
             log::warn!(
                 "review: skipping comment {}:{}: path not in any group's hunks",
                 comment.path,
@@ -1146,112 +1211,3 @@ fn render_review_comment(
         .into_any_element()
 }
 
-struct AgentiumReviewAddon {
-    buffer_id_to_group_number: Arc<HashMap<BufferId, usize>>,
-    buffer_id_to_focus: Arc<HashMap<BufferId, GroupHeaderInfo>>,
-}
-
-impl Addon for AgentiumReviewAddon {
-    fn to_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn render_buffer_header_controls(
-        &self,
-        _: &ExcerptBoundaryInfo,
-        buffer: &BufferSnapshot,
-        _: &Window,
-        cx: &App,
-    ) -> Option<AnyElement> {
-        let n = self.buffer_id_to_group_number.get(&buffer.remote_id())?;
-        let colors = cx.theme().colors();
-        Some(
-            div()
-                .px_1p5()
-                .rounded_sm()
-                .bg(colors.element_active)
-                .text_color(colors.text)
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(format!("#{n}"))
-                .into_any_element(),
-        )
-    }
-
-    fn render_buffer_header_extra(
-        &self,
-        _: &ExcerptBoundaryInfo,
-        buffer: &BufferSnapshot,
-        _: &Window,
-        cx: &App,
-    ) -> Option<AnyElement> {
-        let info = self.buffer_id_to_focus.get(&buffer.remote_id())?;
-        let colors = cx.theme().colors();
-        let status = cx.theme().status();
-        let buffer_id = buffer.remote_id();
-        let mut content = v_flex().w_full().px_3().py_1p5().gap_0p5();
-        content = content.child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.text)
-                .child(info.title.clone()),
-        );
-        if let Some(summary) = &info.summary {
-            content = content.child(
-                div()
-                    .text_xs()
-                    .text_color(colors.text_muted)
-                    .child(summary.clone()),
-            );
-        }
-        for (focus_idx, item) in info.focus.iter().enumerate() {
-            let (icon, color) = match item.result {
-                FocusResult::Pass => ("✓", status.success),
-                FocusResult::Fail => ("✗", status.error),
-                FocusResult::Unsure => ("?", status.warning),
-                FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
-            };
-            let row = h_flex()
-                .id(SharedString::from(format!(
-                    "buf-focus-{}-{focus_idx}",
-                    buffer_id.to_proto()
-                )))
-                .gap_2()
-                .items_center()
-                .text_xs()
-                .child(
-                    div()
-                        .w_4()
-                        .flex()
-                        .justify_center()
-                        .text_color(color)
-                        .font_weight(FontWeight::BOLD)
-                        .child(icon),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(colors.text)
-                        .child(item.desc.clone()),
-                );
-            let row = if !item.reason.is_empty() {
-                row.tooltip(Tooltip::text(item.reason.clone()))
-            } else {
-                row
-            };
-            content = content.child(row);
-        }
-        Some(
-            div()
-                .w_full()
-                .bg(colors.elevated_surface_background)
-                .border_b_1()
-                .border_color(colors.border)
-                .child(content)
-                .into_any_element(),
-        )
-    }
-}
