@@ -975,6 +975,17 @@ fn main() {
         }
     }
 
+    zlog::init();
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        zlog::init_output_stdout();
+    } else {
+        let result = zlog::init_output_file(paths::log_file(), Some(paths::old_log_file()));
+        if let Err(err) = result {
+            eprintln!("Could not open log file: {err}... Defaulting to stdout");
+            zlog::init_output_stdout();
+        }
+    }
+
     let socket_path = agentium_socket_path();
 
     let app = Application::with_platform(gpui_platform::current_platform(false))
