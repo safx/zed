@@ -11,7 +11,9 @@ use git::Oid;
 use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{prelude::*, *};
 use language::{Buffer, BufferSnapshot, Capability, LanguageRegistry, Point};
-use markdown::{CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement};
+use markdown::{
+    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, WrapButtonVisibility,
+};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{Project, ProjectEntryId, ProjectItem as _, ProjectPath};
 use settings::{DiffViewStyle, Settings};
@@ -1204,6 +1206,7 @@ fn render_review_comment(
             MarkdownElement::new(markdown, style).code_block_renderer(
                 CodeBlockRenderer::Default {
                     copy_button_visibility: CopyButtonVisibility::Hidden,
+                    wrap_button_visibility: WrapButtonVisibility::Hidden,
                     border: false,
                 },
             ),
