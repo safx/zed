@@ -504,6 +504,7 @@ dependencies = [
  "uuid",
  "workspace",
  "zed_actions",
+ "zlog",
 ]
 
 [[package]]
