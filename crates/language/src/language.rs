@@ -81,7 +81,7 @@ use std::{
     str,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst},
+        atomic::{AtomicBool, Ordering},
     },
 };
 use syntax_map::{QueryCursorHandle, SyntaxSnapshot};
