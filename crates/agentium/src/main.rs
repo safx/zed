@@ -413,6 +413,8 @@ fn resolve_worktree_paths(only_current: bool) -> anyhow::Result<Vec<String>> {
         return Ok(vec![canonical.to_string_lossy().into_owned()]);
     }
 
+    // Blocking is fine here: this runs in the synchronous CLI path, not in the app.
+    #[allow(clippy::disallowed_methods)]
     let output = std::process::Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .output()?;
@@ -503,6 +505,8 @@ fn get_ancestor_pids() -> Vec<u32> {
             break;
         }
         pids.push(current);
+        // Blocking is fine here: hook helpers run in the synchronous CLI path.
+        #[allow(clippy::disallowed_methods)]
         match std::process::Command::new("ps")
             .args(["-o", "ppid=", "-p", &current.to_string()])
             .output()
@@ -713,8 +717,10 @@ fn main() {
         Some(Command::Claude {
             action: ClaudeAction::Hook { event },
         }) => {
-            let json: serde_json::Value =
-                serde_json::from_reader(std::io::stdin()).unwrap_or_default();
+            let json: serde_json::Value = std::io::read_to_string(std::io::stdin())
+                .ok()
+                .and_then(|input| serde_json::from_str(&input).ok())
+                .unwrap_or_default();
             let session_id = json["session_id"].as_str().unwrap_or("");
             let ancestor_pids = get_ancestor_pids();
 

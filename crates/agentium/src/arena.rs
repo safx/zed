@@ -676,7 +676,7 @@ impl Arena {
                     terminal,
                     workspace_weak,
                     project.downgrade(),
-                    session_state.ready_shell_pids.clone(),
+                    session_state.ready_shell_pids,
                     &pane,
                     window,
                     cx,
@@ -1422,6 +1422,9 @@ pub(crate) fn new_agentium_pane(
         let split_handler_workspace = workspace.clone();
         let split_handler_project = project.clone();
         let split_handler_session = session_state.clone();
+        // Pane's API requires Arc even though this closure only runs on the
+        // foreground thread (the captured Entity handles are not Send).
+        #[allow(clippy::arc_with_non_send_sync)]
         pane.set_custom_split_handler(Some(Arc::new(
             move |pane_to_split, direction, window, cx| {
                 split_handler_arena
