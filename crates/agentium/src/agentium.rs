@@ -177,6 +177,7 @@ struct PrInfo {
     review_count: usize,
     head_sha: SharedString,
     reviews: Vec<ReviewEntry>,
+    base_ref: SharedString,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -224,12 +225,14 @@ pub struct AgentiumApp {
     // — do not hold the borrow across the arena loop.
     sysinfo_system: RefCell<System>,
     gh_available: bool,
-    pr_info: HashMap<EntityId, PrInfo>,
+    // Invariant: the Vec is never empty — an arena with no PRs has no entry.
+    // This keeps `contains_key` and `Option` call sites meaningful.
+    pr_info: HashMap<EntityId, Vec<PrInfo>>,
     pr_last_checked: HashMap<EntityId, Instant>,
     pr_polling_timed_out: bool,
     _pr_poll_task: Option<Task<()>>,
-    ci_status: HashMap<EntityId, CiInfo>,
-    ci_last_checked: HashMap<EntityId, Instant>,
+    ci_status: HashMap<(EntityId, u32), CiInfo>,
+    ci_last_checked: HashMap<(EntityId, u32), Instant>,
     ci_polling_timed_out: bool,
     _ci_poll_task: Option<Task<()>>,
     _window_activation_subscription: gpui::Subscription,
@@ -271,7 +274,7 @@ impl AgentiumApp {
                     this.last_branch_names.insert(entity_id, current_branch);
 
                     this.pr_info.remove(&entity_id);
-                    this.ci_status.remove(&entity_id);
+                    this.ci_status.retain(|(id, _), _| *id != entity_id);
                     if this.gh_available {
                         this.fetch_pr_for_arena(entity_id, cx);
                     }
@@ -607,15 +610,22 @@ impl AgentiumApp {
                 if pr_stale {
                     self.fetch_pr_for_arena(entity_id, cx);
                 }
-                if let Some(pr) = self.pr_info.get(&entity_id) {
-                    let pr_number = pr.number;
-                    let ci_stale = self
-                        .ci_last_checked
-                        .get(&entity_id)
-                        .map_or(true, |t| t.elapsed() > Duration::from_secs(60));
-                    if ci_stale {
-                        self.fetch_ci_for_arena(entity_id, pr_number, cx);
-                    }
+                let ci_stale_numbers: Vec<u32> = self
+                    .pr_info
+                    .get(&entity_id)
+                    .map(|prs| {
+                        prs.iter()
+                            .filter(|pr| {
+                                self.ci_last_checked
+                                    .get(&(entity_id, pr.number))
+                                    .map_or(true, |t| t.elapsed() > Duration::from_secs(60))
+                            })
+                            .map(|pr| pr.number)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for pr_number in ci_stale_numbers {
+                    self.fetch_ci_for_arena(entity_id, pr_number, cx);
                 }
             }
             let focus = self.arenas[index].focus_handle(cx);
@@ -647,7 +657,7 @@ impl AgentiumApp {
                     let start = Instant::now();
                     let result = cx
                         .background_executor()
-                        .spawn(async move { fetch_pr_info(&working_dir).await })
+                        .spawn(async move { fetch_pr_list(&working_dir).await })
                         .await;
                     let elapsed = start.elapsed();
 
@@ -658,24 +668,7 @@ impl AgentiumApp {
                                 this._pr_poll_task = None;
                                 return true;
                             }
-                            this.pr_last_checked.insert(entity_id, Instant::now());
-                            match result {
-                                Ok(Some(info)) => {
-                                    let pr_number = info.number;
-                                    let had_pr = this.pr_info.contains_key(&entity_id);
-                                    this.pr_info.insert(entity_id, info);
-                                    if !had_pr && !this.ci_polling_timed_out {
-                                        this.fetch_ci_for_arena(entity_id, pr_number, cx);
-                                    }
-                                    if this.pr_dirty.contains(&entity_id) {
-                                        this.save_pr_session_mapping(entity_id, cx);
-                                    }
-                                }
-                                Ok(None) | Err(_) => {
-                                    this.pr_info.remove(&entity_id);
-                                }
-                            }
-                            cx.notify();
+                            this.apply_pr_fetch_result(entity_id, result, cx);
                             false
                         })
                         .unwrap_or(true);
@@ -709,31 +702,52 @@ impl AgentiumApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_pr_info(&working_dir).await })
+                .spawn(async move { fetch_pr_list(&working_dir).await })
                 .await;
             this.update(cx, |this, cx| {
-                this.pr_last_checked.insert(entity_id, Instant::now());
-                match result {
-                    Ok(Some(info)) => {
-                        let pr_number = info.number;
-                        let had_pr = this.pr_info.contains_key(&entity_id);
-                        this.pr_info.insert(entity_id, info);
-                        if !had_pr && !this.ci_polling_timed_out {
-                            this.fetch_ci_for_arena(entity_id, pr_number, cx);
-                        }
-                        if this.pr_dirty.contains(&entity_id) {
-                            this.save_pr_session_mapping(entity_id, cx);
-                        }
-                    }
-                    Ok(None) | Err(_) => {
-                        this.pr_info.remove(&entity_id);
-                    }
-                }
-                cx.notify();
+                this.apply_pr_fetch_result(entity_id, result, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn apply_pr_fetch_result(
+        &mut self,
+        entity_id: EntityId,
+        result: anyhow::Result<Vec<PrInfo>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pr_last_checked.insert(entity_id, Instant::now());
+        match result {
+            Ok(list) if !list.is_empty() => {
+                let existing: HashSet<u32> = self
+                    .pr_info
+                    .get(&entity_id)
+                    .map(|prs| prs.iter().map(|pr| pr.number).collect())
+                    .unwrap_or_default();
+                let new_numbers: Vec<u32> = list
+                    .iter()
+                    .map(|pr| pr.number)
+                    .filter(|number| !existing.contains(number))
+                    .collect();
+                self.pr_info.insert(entity_id, list);
+                // Chain a CI fetch for PRs that just appeared so their status
+                // shows up immediately instead of on the next CI polling cycle.
+                if !self.ci_polling_timed_out {
+                    for number in new_numbers {
+                        self.fetch_ci_for_arena(entity_id, number, cx);
+                    }
+                }
+                if self.pr_dirty.contains(&entity_id) {
+                    self.save_pr_session_mapping(entity_id, cx);
+                }
+            }
+            Ok(_) | Err(_) => {
+                self.pr_info.remove(&entity_id);
+            }
+        }
+        cx.notify();
     }
 
     fn start_ci_polling(&mut self, cx: &mut Context<Self>) {
@@ -744,23 +758,26 @@ impl AgentiumApp {
                         let mut targets = Vec::new();
                         for arena in &this.arenas {
                             let entity_id = arena.entity_id();
-                            let Some(pr) = this.pr_info.get(&entity_id) else {
+                            let Some(prs) = this.pr_info.get(&entity_id) else {
                                 continue;
                             };
-                            if matches!(pr.status, PrStatus::Merged) {
-                                continue;
-                            }
-                            let pr_number = pr.number;
-
                             let interval = this.compute_ci_poll_interval(entity_id, cx);
-                            let last = this.ci_last_checked.get(&entity_id).copied();
-                            let due = last.map_or(true, |t| t.elapsed() >= interval);
+                            for pr in prs {
+                                if matches!(pr.status, PrStatus::Merged) {
+                                    continue;
+                                }
+                                let pr_number = pr.number;
 
-                            if due {
-                                if let Some(working_dir) =
-                                    arena.read(cx).working_directory.clone()
-                                {
-                                    targets.push((entity_id, working_dir, pr_number));
+                                let last =
+                                    this.ci_last_checked.get(&(entity_id, pr_number)).copied();
+                                let due = last.map_or(true, |t| t.elapsed() >= interval);
+
+                                if due {
+                                    if let Some(working_dir) =
+                                        arena.read(cx).working_directory.clone()
+                                    {
+                                        targets.push((entity_id, working_dir, pr_number));
+                                    }
                                 }
                             }
                         }
@@ -786,13 +803,14 @@ impl AgentiumApp {
                                 this._ci_poll_task = None;
                                 return true;
                             }
-                            this.ci_last_checked.insert(entity_id, Instant::now());
+                            this.ci_last_checked
+                                .insert((entity_id, pr_number), Instant::now());
                             match result {
                                 Ok(Some(status)) => {
-                                    this.ci_status.insert(entity_id, status);
+                                    this.ci_status.insert((entity_id, pr_number), status);
                                 }
                                 Ok(None) | Err(_) => {
-                                    this.ci_status.remove(&entity_id);
+                                    this.ci_status.remove(&(entity_id, pr_number));
                                 }
                             }
                             cx.notify();
@@ -814,14 +832,17 @@ impl AgentiumApp {
                         let mut min_remaining = Duration::from_secs(60);
                         for arena in &this.arenas {
                             let entity_id = arena.entity_id();
-                            let dominated_by_merged = this.pr_info.get(&entity_id)
-                                .map_or(true, |pr| matches!(pr.status, PrStatus::Merged));
-                            if !dominated_by_merged {
-                                let interval =
-                                    this.compute_ci_poll_interval(entity_id, cx);
+                            let Some(prs) = this.pr_info.get(&entity_id) else {
+                                continue;
+                            };
+                            let interval = this.compute_ci_poll_interval(entity_id, cx);
+                            for pr in prs {
+                                if matches!(pr.status, PrStatus::Merged) {
+                                    continue;
+                                }
                                 let elapsed = this
                                     .ci_last_checked
-                                    .get(&entity_id)
+                                    .get(&(entity_id, pr.number))
                                     .map_or(Duration::ZERO, |t| t.elapsed());
                                 let remaining = interval.saturating_sub(elapsed);
                                 min_remaining = min_remaining.min(remaining);
@@ -861,13 +882,14 @@ impl AgentiumApp {
                 .spawn(async move { fetch_ci_status(&working_dir, pr_number).await })
                 .await;
             this.update(cx, |this, cx| {
-                this.ci_last_checked.insert(entity_id, Instant::now());
+                this.ci_last_checked
+                    .insert((entity_id, pr_number), Instant::now());
                 match result {
                     Ok(Some(status)) => {
-                        this.ci_status.insert(entity_id, status);
+                        this.ci_status.insert((entity_id, pr_number), status);
                     }
                     Ok(None) | Err(_) => {
-                        this.ci_status.remove(&entity_id);
+                        this.ci_status.remove(&(entity_id, pr_number));
                     }
                 }
                 cx.notify();
@@ -1071,8 +1093,8 @@ impl AgentiumApp {
         self._arena_subscriptions.remove(&entity_id);
         self.pr_info.remove(&entity_id);
         self.pr_last_checked.remove(&entity_id);
-        self.ci_status.remove(&entity_id);
-        self.ci_last_checked.remove(&entity_id);
+        self.ci_status.retain(|(id, _), _| *id != entity_id);
+        self.ci_last_checked.retain(|(id, _), _| *id != entity_id);
         self.pr_dirty.remove(&entity_id);
         self.last_branch_names.remove(&entity_id);
         self.arenas.remove(index);
@@ -1424,10 +1446,10 @@ impl AgentiumApp {
     }
 
     fn save_pr_session_mapping(&mut self, entity_id: EntityId, cx: &mut Context<Self>) {
-        let Some(pr_info) = self.pr_info.get(&entity_id) else {
+        let Some(prs) = self.pr_info.get(&entity_id) else {
             return;
         };
-        let pr_number = pr_info.number;
+        let pr_numbers: Vec<u32> = prs.iter().map(|pr| pr.number).collect();
 
         let working_dir = self
             .arenas
@@ -1449,7 +1471,8 @@ impl AgentiumApp {
 
         let project_entry = self.pr_session_db.entry(project_path).or_default();
         for sid in &session_ids {
-            project_entry.entry(sid.clone()).or_default().pr.insert(pr_number);
+            let data = project_entry.entry(sid.clone()).or_default();
+            data.pr.extend(pr_numbers.iter().copied());
         }
 
         let db_snapshot = self.pr_session_db.clone();
@@ -1944,7 +1967,7 @@ fn repo_name_from_url(url: &str) -> Option<&str> {
 }
 
 fn render_pr_tooltip(
-    pr: Option<&PrInfo>,
+    pr: &PrInfo,
     ci: Option<&CiInfo>,
     branch: Option<&str>,
     cx: &App,
@@ -1954,70 +1977,75 @@ fn render_pr_tooltip(
 
     let mut content = v_flex().gap_1().max_w_96();
 
-    if let Some(pr) = pr {
-        let (status_label, pr_icon, pill_bg): (SharedString, IconName, Hsla) = match pr.status {
-            PrStatus::Draft => ("Draft".into(), IconName::GitPullRequest, colors.text_muted),
-            PrStatus::Open => ("Open".into(), IconName::GitPullRequest, status_colors.success),
-            PrStatus::Merged => (
-                "Merged".into(),
-                IconName::GitGraph,
-                hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
-            ),
-            PrStatus::Closed => (
-                "Closed".into(),
-                IconName::GitPullRequestClosed,
-                status_colors.error,
-            ),
-            PrStatus::Conflicted => (
-                "Conflicted".into(),
-                IconName::GitMergeConflict,
-                status_colors.warning,
-            ),
-        };
+    let (status_label, pr_icon, pill_bg): (SharedString, IconName, Hsla) = match pr.status {
+        PrStatus::Draft => ("Draft".into(), IconName::GitPullRequest, colors.text_muted),
+        PrStatus::Open => ("Open".into(), IconName::GitPullRequest, status_colors.success),
+        PrStatus::Merged => (
+            "Merged".into(),
+            IconName::GitGraph,
+            hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
+        ),
+        PrStatus::Closed => (
+            "Closed".into(),
+            IconName::GitPullRequestClosed,
+            status_colors.error,
+        ),
+        PrStatus::Conflicted => (
+            "Conflicted".into(),
+            IconName::GitMergeConflict,
+            status_colors.warning,
+        ),
+    };
 
-        let pill_bg_dark = Hsla { l: (pill_bg.l * 0.65).min(0.4), ..pill_bg };
-        let pill_text = gpui::white();
-        let status_pill = h_flex()
-            .flex_shrink_0()
-            .gap_1()
-            .items_center()
-            .px_1p5()
-            .py_0p5()
-            .rounded_full()
-            .bg(pill_bg_dark)
-            .text_color(pill_text)
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(Icon::new(pr_icon).size(IconSize::XSmall).color(Color::Custom(pill_text)))
-            .child(status_label);
+    let pill_bg_dark = Hsla { l: (pill_bg.l * 0.65).min(0.4), ..pill_bg };
+    let pill_text = gpui::white();
+    let status_pill = h_flex()
+        .flex_shrink_0()
+        .gap_1()
+        .items_center()
+        .px_1p5()
+        .py_0p5()
+        .rounded_full()
+        .bg(pill_bg_dark)
+        .text_color(pill_text)
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(Icon::new(pr_icon).size(IconSize::XSmall).color(Color::Custom(pill_text)))
+        .child(status_label);
 
-        content = content
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.text)
-                    .child(format!("{} #{}", pr.title, pr.number)),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .overflow_hidden()
-                    .child(status_pill)
-                    .when_some(branch, |d, branch| {
-                        d.child(
-                            div()
-                                .min_w_0()
-                                .flex_shrink()
-                                .truncate()
-                                .text_xs()
-                                .text_color(colors.text_muted)
-                                .child(branch.to_string()),
-                        )
-                    }),
-            );
-    }
+    let flow_label = match branch {
+        Some(branch) if !pr.base_ref.is_empty() => Some(format!("{branch} → {}", pr.base_ref)),
+        Some(branch) => Some(branch.to_string()),
+        None if !pr.base_ref.is_empty() => Some(format!("→ {}", pr.base_ref)),
+        None => None,
+    };
+
+    content = content
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text)
+                .child(format!("{} #{}", pr.title, pr.number)),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .overflow_hidden()
+                .child(status_pill)
+                .when_some(flow_label, |d, label| {
+                    d.child(
+                        div()
+                            .min_w_0()
+                            .flex_shrink()
+                            .truncate()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .child(label),
+                    )
+                }),
+        );
 
     if let Some(ci) = ci {
         if !ci.checks.is_empty() {
@@ -2245,28 +2273,9 @@ fn write_pr_session_db(
     Ok(())
 }
 
-async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<PrInfo>> {
-    let output = smol::process::Command::new("gh")
-        .current_dir(working_dir)
-        .args(&[
-            "pr",
-            "view",
-            "--json",
-            "number,title,state,mergeable,isDraft,url,reviewDecision,headRefOid",
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("no pull requests found") {
-            log::warn!("gh pr view failed: {stderr}");
-        }
-        return Ok(None);
-    }
-
+async fn fetch_pr_list(working_dir: &std::path::Path) -> anyhow::Result<Vec<PrInfo>> {
     #[derive(serde::Deserialize)]
-    struct GhPrView {
+    struct GhPr {
         number: u32,
         title: String,
         state: String,
@@ -2278,57 +2287,136 @@ async fn fetch_pr_info(working_dir: &std::path::Path) -> anyhow::Result<Option<P
         review_decision: String,
         #[serde(rename = "headRefOid")]
         head_ref_oid: String,
+        #[serde(rename = "baseRefName")]
+        base_ref_name: String,
     }
 
-    let pr: GhPrView = serde_json::from_slice(&output.stdout)?;
+    const JSON_FIELDS: &str =
+        "number,title,state,mergeable,isDraft,url,reviewDecision,headRefOid,baseRefName";
 
-    let status = if pr.mergeable == "CONFLICTING" {
-        PrStatus::Conflicted
-    } else if pr.is_draft {
-        PrStatus::Draft
+    let branch_output = smol::process::Command::new("git")
+        .current_dir(working_dir)
+        .args(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await?;
+    let branch = if branch_output.status.success() {
+        let name = String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string();
+        // "HEAD" means detached; fall back to `gh pr view` resolution below.
+        (name != "HEAD" && !name.is_empty()).then_some(name)
     } else {
-        match pr.state.as_str() {
-            "MERGED" => PrStatus::Merged,
-            "CLOSED" => PrStatus::Closed,
-            _ => PrStatus::Open,
-        }
+        None
     };
 
-    let review_decision = match pr.review_decision.as_str() {
-        "APPROVED" => Some(ReviewDecision::Approved),
-        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
-        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
-        _ => None,
-    };
-
-    // Fetch individual reviews via REST API to get avatar URLs.
-    // Parse owner/repo from the PR URL (e.g. "https://github.com/owner/repo/pull/123").
-    let reviews = fetch_reviews(working_dir, &pr.url, &pr.head_ref_oid).await;
-
-    let (reviews, review_count) = match reviews {
-        Ok(entries) => {
-            let count = entries
-                .iter()
-                .filter(|entry| entry.commit_oid.as_ref() == pr.head_ref_oid)
-                .count();
-            (entries, count)
+    let mut gh_prs: Vec<GhPr> = Vec::new();
+    if let Some(branch) = branch {
+        let output = smol::process::Command::new("gh")
+            .current_dir(working_dir)
+            .args(&[
+                "pr",
+                "list",
+                "--head",
+                branch.as_str(),
+                "--state",
+                "all",
+                "--limit",
+                "10",
+                "--json",
+                JSON_FIELDS,
+            ])
+            .output()
+            .await?;
+        if output.status.success() {
+            gh_prs = serde_json::from_slice(&output.stdout)?;
+        } else {
+            log::warn!(
+                "gh pr list failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-        Err(err) => {
-            log::warn!("failed to fetch reviews: {err}");
-            (Vec::new(), 0)
-        }
-    };
+    }
 
-    Ok(Some(PrInfo {
-        number: pr.number,
-        title: pr.title.into(),
-        status,
-        html_url: pr.url.into(),
-        review_decision,
-        review_count,
-        head_sha: pr.head_ref_oid.into(),
-        reviews,
-    }))
+    if gh_prs.is_empty() {
+        // Detached HEAD, list failure, or no same-repo PR for this branch (e.g. a
+        // cross-fork PR that only `gh pr view`'s own branch resolution can find).
+        let output = smol::process::Command::new("gh")
+            .current_dir(working_dir)
+            .args(&["pr", "view", "--json", JSON_FIELDS])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("no pull requests found") {
+                log::warn!("gh pr view failed: {stderr}");
+            }
+            return Ok(Vec::new());
+        }
+        gh_prs = vec![serde_json::from_slice(&output.stdout)?];
+    }
+
+    gh_prs.sort_by_key(|pr| pr.number);
+
+    // Fetch individual reviews via REST API to get avatar URLs, concurrently for
+    // all PRs: the PR polling loop permanently disables itself when one pass
+    // exceeds 5 seconds, so the cost must not grow linearly with the PR count.
+    let reviews_per_pr = futures::future::join_all(
+        gh_prs
+            .iter()
+            .map(|pr| fetch_reviews(working_dir, &pr.url, &pr.head_ref_oid)),
+    )
+    .await;
+
+    Ok(gh_prs
+        .into_iter()
+        .zip(reviews_per_pr)
+        .map(|(pr, reviews)| {
+            let status = if pr.mergeable == "CONFLICTING" {
+                PrStatus::Conflicted
+            } else if pr.is_draft {
+                PrStatus::Draft
+            } else {
+                match pr.state.as_str() {
+                    "MERGED" => PrStatus::Merged,
+                    "CLOSED" => PrStatus::Closed,
+                    _ => PrStatus::Open,
+                }
+            };
+
+            let review_decision = match pr.review_decision.as_str() {
+                "APPROVED" => Some(ReviewDecision::Approved),
+                "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+                "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+                _ => None,
+            };
+
+            let (reviews, review_count) = match reviews {
+                Ok(entries) => {
+                    let count = entries
+                        .iter()
+                        .filter(|entry| entry.commit_oid.as_ref() == pr.head_ref_oid)
+                        .count();
+                    (entries, count)
+                }
+                Err(err) => {
+                    log::warn!("failed to fetch reviews: {err}");
+                    (Vec::new(), 0)
+                }
+            };
+
+            PrInfo {
+                number: pr.number,
+                title: pr.title.into(),
+                status,
+                html_url: pr.url.into(),
+                review_decision,
+                review_count,
+                head_sha: pr.head_ref_oid.into(),
+                reviews,
+                base_ref: pr.base_ref_name.into(),
+            }
+        })
+        .collect())
 }
 
 /// Fetch per-reviewer data via the REST API (`gh api repos/{owner}/{repo}/pulls/{number}/reviews`).
@@ -2593,30 +2681,35 @@ impl Render for AgentiumApp {
                                             .map(|(_, branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted)| (branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
                                     });
 
-                                    let pr_info = self.pr_info.get(&arena_entity.entity_id());
-                                    let is_merged = pr_info
-                                        .map_or(false, |pr| matches!(pr.status, PrStatus::Merged));
-
-                                    let ci_icon_element = if is_merged {
-                                        None
-                                    } else {
-                                        self.ci_status.get(&arena_entity.entity_id()).map(|ci| {
-                                            let (icon, color) = match &ci.status {
-                                                CiStatus::AllPassed => (IconName::Check, status_colors.success),
-                                                CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
-                                                CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
-                                                CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
-                                            };
-                                            Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
-                                        })
-                                    };
-
-                                    let tooltip_pr = pr_info.cloned();
-                                    let tooltip_ci = self.ci_status.get(&arena_entity.entity_id()).cloned();
+                                    let entity_id = arena_entity.entity_id();
+                                    let prs = self.pr_info.get(&entity_id);
+                                    let multiple_prs = prs.map_or(false, |prs| prs.len() > 1);
                                     let tooltip_branch = git_info.as_ref()
                                         .and_then(|(branch, _, _, _, _, _)| branch.clone());
 
-                                    let (pr_element, review_element) = if let Some(pr) = pr_info {
+                                    let mut pr_rows: Vec<(AnyElement, Option<AnyElement>)> = Vec::new();
+                                    for pr in prs.map(|prs| prs.as_slice()).unwrap_or_default() {
+                                        let is_pr_merged = matches!(pr.status, PrStatus::Merged);
+
+                                        let ci_info = self.ci_status.get(&(entity_id, pr.number));
+                                        let ci_icon_element = if is_pr_merged {
+                                            None
+                                        } else {
+                                            ci_info.map(|ci| {
+                                                let (icon, color) = match &ci.status {
+                                                    CiStatus::AllPassed => (IconName::Check, status_colors.success),
+                                                    CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
+                                                    CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
+                                                    CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
+                                                };
+                                                Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
+                                            })
+                                        };
+
+                                        let tooltip_pr = pr.clone();
+                                        let tooltip_ci = ci_info.cloned();
+                                        let tooltip_branch = tooltip_branch.clone();
+
                                         let pr_color = match pr.status {
                                             PrStatus::Draft => colors.text_muted,
                                             PrStatus::Open => status_colors.success,
@@ -2633,7 +2726,10 @@ impl Render for AgentiumApp {
                                         };
                                         let url = pr.html_url.clone();
                                         let pr_el = h_flex()
-                                            .id(("arena-pr", arena.id))
+                                            .id(SharedString::from(format!(
+                                                "arena-pr-{}-{}",
+                                                arena.id, pr.number
+                                            )))
                                             .gap_1()
                                             .items_center()
                                             .px_1()
@@ -2654,13 +2750,20 @@ impl Render for AgentiumApp {
                                                     .child(format!("#{}", pr.number)),
                                             )
                                             .when_some(ci_icon_element, |d, icon| d.child(icon))
+                                            .when(multiple_prs, |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors.text_muted)
+                                                        .max_w_20()
+                                                        .truncate()
+                                                        .child(pr.base_ref.clone()),
+                                                )
+                                            })
                                             .tooltip(Tooltip::element({
-                                                let tooltip_pr = tooltip_pr.clone();
-                                                let tooltip_ci = tooltip_ci.clone();
-                                                let tooltip_branch = tooltip_branch.clone();
                                                 move |_window, cx| {
                                                     render_pr_tooltip(
-                                                        tooltip_pr.as_ref(),
+                                                        &tooltip_pr,
                                                         tooltip_ci.as_ref(),
                                                         tooltip_branch.as_deref(),
                                                         cx,
@@ -2675,9 +2778,10 @@ impl Render for AgentiumApp {
                                                         cx.open_url(&url);
                                                     }
                                                 }))
-                                            });
+                                            })
+                                            .into_any_element();
 
-                                        let review_el = if is_merged {
+                                        let review_el = if is_pr_merged {
                                             None
                                         } else {
                                             match &pr.review_decision {
@@ -2699,7 +2803,10 @@ impl Render for AgentiumApp {
                                                 let tooltip_reviews = pr.reviews.clone();
                                                 let tooltip_head_sha = pr.head_sha.clone();
                                                 h_flex()
-                                                    .id(("arena-review", arena.id))
+                                                    .id(SharedString::from(format!(
+                                                        "arena-review-{}-{}",
+                                                        arena.id, pr.number
+                                                    )))
                                                     .gap_0p5()
                                                     .items_center()
                                                     .px_1()
@@ -2736,13 +2843,15 @@ impl Render for AgentiumApp {
                                                             },
                                                         ))
                                                     })
+                                                    .into_any_element()
                                             })
                                         };
 
-                                        (Some(pr_el), review_el)
-                                    } else {
-                                        (None, None)
-                                    };
+                                        pr_rows.push((pr_el, review_el));
+                                    }
+                                    let mut pr_rows = pr_rows.into_iter();
+                                    let first_pr_row = pr_rows.next();
+                                    let extra_pr_rows: Vec<_> = pr_rows.collect();
 
                                     let project_url = git_info.as_ref()
                                         .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
@@ -2998,12 +3107,25 @@ impl Render for AgentiumApp {
                                                             .child(path),
                                                     )
                                                 })
-                                                .when(pr_element.is_some() || review_element.is_some(), |d| {
+                                                .when(first_pr_row.is_some(), |d| {
                                                     d.child(div().flex_grow())
                                                 })
-                                                .when_some(pr_element, |d, el| d.child(el))
-                                                .when_some(review_element, |d, el| d.child(el))
+                                                .when_some(first_pr_row, |d, (pr_el, review_el)| {
+                                                    d.child(pr_el).children(review_el)
+                                                })
                                         })
+                                        // Rows 4..N: one row per additional PR when the
+                                        // branch has several (e.g. develop + master bases).
+                                        .children(extra_pr_rows.into_iter().map(|(pr_el, review_el)| {
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_xs()
+                                                .min_h(px(16.0))
+                                                .child(div().flex_grow())
+                                                .child(pr_el)
+                                                .children(review_el)
+                                        }))
                                         .on_click(cx.listener(
                                             move |this, _, window, cx| {
                                                 this.switch_arena(i, window, cx)
