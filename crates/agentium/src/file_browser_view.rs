@@ -92,7 +92,6 @@ impl FileBrowserView {
     ) -> Self {
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe(&project, {
-            let worktree_id = worktree_id;
             move |this, _, event: &project::Event, cx| match event {
                 project::Event::WorktreeUpdatedEntries(wt_id, _) => {
                     if Some(*wt_id) == worktree_id {
