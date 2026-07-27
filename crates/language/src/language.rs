@@ -86,7 +86,7 @@ use std::{
     str,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst},
+        atomic::{AtomicBool, Ordering},
     },
 };
 use streaming_iterator::StreamingIterator as _;
