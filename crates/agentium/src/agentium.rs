@@ -3875,6 +3875,10 @@ impl AgentiumApp {
         for task in tasks {
             let task_id = task.id;
             let is_renaming = self.renaming_task == Some(task_id);
+            let contains_active_arena = task.worktrees.iter().any(|row| {
+                matches!(row, WorktreeRow::Live { arena_index }
+                    if Some(*arena_index) == self.active_arena_index)
+            });
             let header = h_flex()
                 .id(SharedString::from(format!("task-header-{task_id}")))
                 .px_2()
@@ -3926,6 +3930,14 @@ impl AgentiumApp {
             let mut section = div()
                 .id(SharedString::from(format!("task-section-{task_id}")))
                 .mb_1()
+                // Width is reserved for every task so the accent line on the
+                // task holding the active arena doesn't shift layout.
+                .border_l_2()
+                .border_color(if contains_active_arena {
+                    colors.text_accent
+                } else {
+                    gpui::transparent_black()
+                })
                 .child(header);
 
             if !task.collapsed {
@@ -3954,9 +3966,9 @@ impl AgentiumApp {
                 }
                 for row in &task.worktrees {
                     section = match row {
-                        WorktreeRow::Live { arena_index } => {
-                            section.child(self.render_arena_row(*arena_index, cx))
-                        }
+                        WorktreeRow::Live { arena_index } => section.child(
+                            div().pl_3().child(self.render_arena_row(*arena_index, cx)),
+                        ),
                         WorktreeRow::Closed { path } => section.child(
                             self.render_closed_worktree_row(
                                 task_id,
