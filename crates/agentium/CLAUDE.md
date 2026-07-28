@@ -105,13 +105,36 @@ Any feature that needs data in `WorkspaceDb` (e.g. recent projects list) must wr
 
 ## GitHub PR and CI polling requires `gh` CLI and chains data dependencies
 
-PR and CI status polling uses the `gh` CLI. At startup, `gh --version` is checked; if unavailable, all PR/CI features are disabled (`gh_available = false`).
+PR and CI status polling uses the `gh` CLI. If unavailable, all PR/CI features are disabled (`gh_available = false`).
 
-Data flows in a chain: PR info must exist before CI polling can run. When `fetch_pr_for_arena` or the PR polling loop inserts a **new** PR entry (`!had_pr`), it immediately triggers `fetch_ci_for_arena` for that arena. Without this chain, CI data would be delayed until the next CI polling cycle (up to 60 seconds).
+An arena's branch can have **multiple PRs** (same head, different bases like develop/master). `fetch_pr_list` runs `gh pr list --head <branch> --state all` and falls back to `gh pr view` (detached HEAD, cross-fork PRs). `pr_info` holds `Vec<PrInfo>` per arena — never an empty Vec, the key is removed instead, so `contains_key` stays meaningful. CI state is keyed by `(EntityId, pr_number)`.
 
-Both PR and CI polling tasks are dropped on window deactivation and restarted on reactivation. A 5-second timeout guard on any `gh` subprocess permanently disables the polling **loop** for the session (`pr_polling_timed_out` / `ci_polling_timed_out`), but one-shot fetches triggered by explicit events (HeadChanged, arena creation/switch, Claude session completion) are not gated by this flag and still work even after a timeout.
+Data flows in a chain: PR info must exist before CI polling can run. When a fetch inserts **newly-appeared PR numbers** (incoming minus existing), it immediately triggers `fetch_ci_for_arena` for each. Without this chain, CI data would be delayed until the next CI polling cycle (up to 60 seconds).
+
+Both PR and CI polling tasks are dropped on window deactivation and restarted on reactivation. A 5-second timeout guard on any `gh` subprocess permanently disables the polling **loop** for the session (`pr_polling_timed_out` / `ci_polling_timed_out`), but one-shot fetches triggered by explicit events (HeadChanged, arena creation/switch, Claude session completion) are not gated by this flag and still work even after a timeout. Because of this guard, per-PR subprocess work inside one fetch pass (e.g. review fetches) must run **concurrently** (`futures::future::join_all`), never sequentially per PR.
 
 CI polling interval is adaptive based on HEAD commit age: <=1 hour → 60s, <=1 day → 180s, >1 day → 300s. The interval is computed on-the-fly via `compute_ci_poll_interval()` using `repo.head_commit.commit_timestamp`, not cached in a HashMap.
+
+## External CLI probes must wait for the login shell environment
+
+Finder launches start with a minimal PATH (`/usr/bin:/bin:...`), so tools installed via brew/mise/npm (`gh`, `bee`) are not found until `util::load_login_shell_environment()` completes. That load is spawned in `main.rs` and its completion is signaled to `AgentiumApp::new` through a `futures::channel::oneshot` receiver; the combined gh/bee availability probe awaits it before running `--version`. Probing earlier permanently disables the integration for the session with no user-visible error (this actually happened: `bee` lives in mise shims and `bee_available` stayed false). Any new external-CLI availability check must hook the same signal.
+
+## board.json has exactly one writer at a time
+
+The task board (`board::Board`, persisted at `data_dir()/board.json`) follows a strict single-writer rule:
+
+- While an app instance is listening on the IPC socket, **only the app writes** — the CLI resolves selectors/paths locally and sends fully-resolved `TaskCommand`s as `{"type":"task_command",...}` datagrams (`dispatch_task_commands` in `main.rs`).
+- The CLI writes the file directly **only** when `connect` fails with `NotFound`/`ConnectionRefused` (no listener). A send failure after a successful connect is an error, never a fallback to direct write — the app has no reload mechanism, so a direct write while it runs would be silently clobbered by the app's next persisted mutation.
+
+macOS caps unix datagrams at 2048 bytes (`net.local.dgram.maxdgram`). Task-command envelopes are kept ≤1900 bytes; an oversized `New` is split into `New` + `AddIssue`×N + `AddArena`×N before sending. `Board::apply` is idempotent (duplicate `New` ids ignored, issues/worktrees deduped) so datagram duplication and CLI retries are safe.
+
+## Sidebar inline editors share one `menu::Confirm`/`Cancel` dispatcher
+
+GPUI actions stop at the first matching handler during bubble dispatch. The sidebar has three inline editors (arena rename, task rename, issue input) and exactly **one** Confirm/Cancel handler pair, on the sidebar column div, which branches on the active editing state. Do not add a second `on_action::<menu::Confirm>` for a new editor — extend the dispatcher, add mutual exclusion in the `start_*` method (each cancels the others), and subscribe to `EditorEvent::Blurred` as **cancel** (matching the existing rename behavior).
+
+## No filesystem calls in sidebar render — cache derived board state
+
+The sidebar re-renders every 2 seconds (`_busy_badge_refresh_task`), so `render` must not call `canonicalize`/`Path::exists`. Path-derived board state (which task worktree maps to a live arena / closed / missing, which arenas are unassigned) lives in `BoardCache`, recomputed by `rebuild_board_cache()` on board mutation (`board_changed`), arena add/remove, startup, and window reactivation. Arena `working_directory` is stored non-canonicalized, so any arena↔worktree comparison must canonicalize both sides (fallback to the raw path on error), following the `save_pr_session_mapping` precedent.
 
 ## PR fetch triggers on Claude session completion
 

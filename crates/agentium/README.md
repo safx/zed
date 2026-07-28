@@ -14,8 +14,9 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **File browser** — navigate project files with expand/collapse, open files for editing
 - **Git graph** — visualize git commit history
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
-- **GitHub PR tracking** — display PR status (draft/open/merged/closed/conflicted) with colored icons per arena, clickable to open in browser. Requires `gh` CLI.
-- **CI status** — poll GitHub Actions check status for PRs with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
+- **GitHub PR tracking** — display every PR of the arena's branch (e.g. one to `develop` and one to `master`) with status icons (draft/open/merged/closed/conflicted) and base branch names, clickable to open in browser. Requires `gh` CLI.
+- **CI status** — poll GitHub Actions check status per PR with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
+- **Task board** — a Tasks sidebar tab with a priority-ordered task list; each task bundles issues (GitHub and Backlog) and arenas (worktrees), so multi-repository work is grouped under one task. Persisted to `~/Library/Application Support/Agentium/board.json`; closed worktrees reopen as arenas with one click. Issue titles/states are fetched via the `gh` and [`bee`](https://nulab.github.io/bee/) CLIs (both optional)
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
 - **Claude Code session ↔ PR tracking** — persist a many-to-many mapping between Claude Code session IDs and GitHub PR numbers per project (`~/Library/Application Support/Agentium/pr.json`), queryable via CLI
 - **Running-command badge** — sidebar pill (theme-inverted white/black) shows the count of terminals in each arena currently running a non-Claude command (e.g. `cargo build`, `sleep 30`)
@@ -96,6 +97,26 @@ agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 ```
 
 - `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
+
+### `agentium task`
+
+Manage the task board. When an Agentium instance is running, commands are handed to it over IPC (changes appear in the Tasks tab immediately); otherwise `board.json` is modified directly.
+
+```
+agentium task new <TITLE> [--issue <ISSUE>]... [--arena <PATH>]...
+agentium task list [--json]
+agentium task add-issue <ISSUE> [--task <TASK>]
+agentium task add-arena [<PATH>] [--task <TASK>]
+agentium task done <TASK>
+```
+
+- `<ISSUE>` accepts a GitHub issue URL, `owner/repo#123`, a Backlog issue URL (`https://<space>/view/PROJ-123`), or a Backlog issue key (`PROJ-123`)
+- `<TASK>` accepts the 1-based index shown by `task list`, a task UUID prefix, or a unique title substring
+- When `--task` is omitted, the task containing the current directory's worktree is used (errors with candidates if ambiguous)
+- `task add-arena` defaults to the current directory; paths are canonicalized
+- `task list --json` includes archived tasks and task ids; the plain listing hides archived tasks
+
+Issue metadata (title, state, URL) is fetched by the running app via `gh issue view` for GitHub and `bee issue view` for Backlog. Backlog integration requires the [`bee`](https://nulab.github.io/bee/) CLI, authenticated via `bee auth login`; without it, issues are shown by key only.
 
 ### `agentium claude hook <event>`
 
