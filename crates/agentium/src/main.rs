@@ -59,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         action: TabAction,
     },
+    /// Task board operations
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -129,6 +134,49 @@ enum PaneContentType {
 #[derive(clap::Subcommand)]
 enum ArenaAction {
     New { path: PathBuf },
+}
+
+#[derive(clap::Subcommand)]
+enum TaskAction {
+    /// Create a new task
+    New {
+        title: String,
+        /// Issue to link (URL, owner/repo#123, or PROJ-198); repeatable
+        #[arg(long)]
+        issue: Vec<String>,
+        /// Worktree path to link; repeatable
+        #[arg(long)]
+        arena: Vec<PathBuf>,
+    },
+    /// List tasks
+    List {
+        /// Output as JSON (includes archived tasks and task ids)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an issue to a task
+    AddIssue {
+        /// Issue reference (URL, owner/repo#123, or PROJ-198)
+        issue: String,
+        /// Task selector: index from `task list`, UUID prefix, or title substring.
+        /// Defaults to the task containing the current directory.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Link a worktree to a task
+    AddArena {
+        /// Worktree path (defaults to the current directory)
+        path: Option<PathBuf>,
+        /// Task selector: index from `task list`, UUID prefix, or title substring.
+        /// Defaults to the task containing the current directory.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Archive a task
+    Done {
+        /// Task selector: index from `task list`, UUID prefix, or title substring
+        task: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -476,6 +524,7 @@ enum IpcMessage {
     ChangeTheme {
         name: String,
     },
+    TaskCommand(agentium::board::TaskCommand),
     ClaudeStatusline {
         five_hour_used_pct: f32,
         five_hour_resets_at: i64,
@@ -495,6 +544,245 @@ fn try_send_path_to_running_instance(
         .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8"))?;
     socket.send(path_bytes.as_bytes())?;
     Ok(())
+}
+
+// Keep envelopes safely under the macOS unix datagram cap
+// (`net.local.dgram.maxdgram` = 2048).
+const MAX_TASK_DATAGRAM_BYTES: usize = 1900;
+
+fn run_task_action(action: TaskAction) -> anyhow::Result<()> {
+    use agentium::board::{self, TaskCommand};
+    use anyhow::Context as _;
+
+    match action {
+        TaskAction::List { json } => {
+            let board = board::load_board();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&board.tasks)?);
+            } else {
+                let tasks: Vec<_> = board.active_tasks().collect();
+                if tasks.is_empty() {
+                    println!("(no tasks)");
+                }
+                for (index, task) in tasks.iter().enumerate() {
+                    let mut line = format!("[{}] {}", index + 1, task.title);
+                    if !task.issues.is_empty() {
+                        let issues = task
+                            .issues
+                            .iter()
+                            .map(|issue| issue.reference.short_label())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        line.push_str(&format!("  issues: {issues}"));
+                    }
+                    if !task.worktrees.is_empty() {
+                        line.push_str(&format!("  worktrees: {}", task.worktrees.len()));
+                    }
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        TaskAction::New {
+            title,
+            issue,
+            arena,
+        } => {
+            let issues = issue
+                .iter()
+                .map(|input| board::parse_issue_ref(input))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let worktrees = arena
+                .iter()
+                .map(|path| canonicalize_existing_path(path))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let id = uuid::Uuid::new_v4();
+            dispatch_task_commands(vec![TaskCommand::New {
+                id,
+                title: title.clone(),
+                issues,
+                worktrees,
+            }])?;
+            println!("created task {id}  {title}");
+            Ok(())
+        }
+        TaskAction::AddIssue { issue, task } => {
+            let board = board::load_board();
+            let task_id = resolve_target_task(&board, task.as_deref())?;
+            let issue = board::parse_issue_ref(&issue)?;
+            let label = issue.reference.short_label();
+            dispatch_task_commands(vec![TaskCommand::AddIssue { task_id, issue }])?;
+            println!("added {label} to task {task_id}");
+            Ok(())
+        }
+        TaskAction::AddArena { path, task } => {
+            let board = board::load_board();
+            let task_id = resolve_target_task(&board, task.as_deref())?;
+            let path = match path {
+                Some(path) => path,
+                None => std::env::current_dir().context("cannot determine current directory")?,
+            };
+            let path = canonicalize_existing_path(&path)?;
+            dispatch_task_commands(vec![TaskCommand::AddArena {
+                task_id,
+                path: path.clone(),
+            }])?;
+            println!("linked {} to task {task_id}", path.display());
+            Ok(())
+        }
+        TaskAction::Done { task } => {
+            let board = board::load_board();
+            let task_id = board.resolve_task(&task)?;
+            dispatch_task_commands(vec![TaskCommand::Archive { task_id }])?;
+            println!("archived task {task_id}");
+            Ok(())
+        }
+    }
+}
+
+fn canonicalize_existing_path(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    std::fs::canonicalize(path).with_context(|| format!("cannot resolve path '{}'", path.display()))
+}
+
+fn resolve_target_task(
+    board: &agentium::board::Board,
+    selector: Option<&str>,
+) -> anyhow::Result<uuid::Uuid> {
+    if let Some(selector) = selector {
+        return board.resolve_task(selector);
+    }
+    let cwd = std::env::current_dir()?;
+    let canonical = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let containing = board.tasks_containing_worktree(&canonical);
+    match containing.len() {
+        1 => Ok(containing[0].id),
+        0 => anyhow::bail!(
+            "current directory is not linked to any task; pass --task <TASK>. Tasks:\n{}",
+            format_active_tasks(board)
+        ),
+        _ => anyhow::bail!(
+            "current directory belongs to multiple tasks; pass --task <TASK>. Tasks:\n{}",
+            format_active_tasks(board)
+        ),
+    }
+}
+
+fn format_active_tasks(board: &agentium::board::Board) -> String {
+    let lines: Vec<String> = board
+        .active_tasks()
+        .enumerate()
+        .map(|(index, task)| format!("  [{}] {}", index + 1, task.title))
+        .collect();
+    if lines.is_empty() {
+        "  (no tasks)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Send the commands to a running Agentium instance, or apply them to
+/// board.json directly when no instance is listening. The file is never
+/// written while an app instance is reachable, so there is always exactly
+/// one writer.
+fn dispatch_task_commands(commands: Vec<agentium::board::TaskCommand>) -> anyhow::Result<()> {
+    use agentium::board::{self, TaskCommand};
+
+    let mut queue = Vec::new();
+    for command in commands {
+        if task_command_envelope(&command)?.len() <= MAX_TASK_DATAGRAM_BYTES {
+            queue.push(command);
+            continue;
+        }
+        match command {
+            // An oversized New is split into its parts so each datagram stays
+            // under the size cap.
+            TaskCommand::New {
+                id,
+                title,
+                issues,
+                worktrees,
+            } => {
+                queue.push(TaskCommand::New {
+                    id,
+                    title,
+                    issues: Vec::new(),
+                    worktrees: Vec::new(),
+                });
+                queue.extend(
+                    issues
+                        .into_iter()
+                        .map(|issue| TaskCommand::AddIssue { task_id: id, issue }),
+                );
+                queue.extend(
+                    worktrees
+                        .into_iter()
+                        .map(|path| TaskCommand::AddArena { task_id: id, path }),
+                );
+            }
+            // Only `New` can be split; anything else oversized is caught by
+            // the size check in the send branch (the direct-write path has no
+            // size limit).
+            other => queue.push(other),
+        }
+    }
+
+    let socket = UnixDatagram::unbound()?;
+    match socket.connect(agentium_socket_path()) {
+        Ok(()) => {
+            // The datagram cap only applies when handing off to a running app.
+            for command in &queue {
+                let size = task_command_envelope(command)?.len();
+                anyhow::ensure!(
+                    size <= MAX_TASK_DATAGRAM_BYTES,
+                    "task command is too large to send ({size} bytes)"
+                );
+            }
+            let total = queue.len();
+            for (index, command) in queue.iter().enumerate() {
+                let payload = task_command_envelope(command)?;
+                socket.send(payload.as_bytes()).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to send command {}/{total} to the running Agentium: {error}\
+                         {}",
+                        index + 1,
+                        if index > 0 {
+                            format!("\nnote: the first {index} command(s) were already sent and may have been applied")
+                        } else {
+                            String::new()
+                        }
+                    )
+                })?;
+            }
+            Ok(())
+        }
+        // Fall back to writing the file only when no app can be listening
+        // (missing or stale socket). Any other connect failure must not
+        // create a second writer while an app may be running.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let mut board = board::load_board();
+            for command in queue {
+                board.apply(command)?;
+            }
+            board::write_board(&board)?;
+            Ok(())
+        }
+        Err(error) => Err(anyhow::Error::from(error)
+            .context("cannot reach the running Agentium over its IPC socket")),
+    }
+}
+
+fn task_command_envelope(command: &agentium::board::TaskCommand) -> anyhow::Result<String> {
+    Ok(serde_json::json!({
+        "type": "task_command",
+        "command": serde_json::to_value(command)?,
+    })
+    .to_string())
 }
 
 fn get_ancestor_pids() -> Vec<u32> {
@@ -673,6 +961,22 @@ fn start_ipc_listener(
                                     continue;
                                 }
                                 IpcMessage::ChangeTheme { name }
+                            }
+                            Some("task_command") => {
+                                // Unlike hook notifications, a dropped task
+                                // command loses a data mutation — never fail
+                                // silently.
+                                match serde_json::from_value::<agentium::board::TaskCommand>(
+                                    json["command"].clone(),
+                                ) {
+                                    Ok(command) => IpcMessage::TaskCommand(command),
+                                    Err(error) => {
+                                        log::warn!(
+                                            "failed to parse task_command over IPC: {error}"
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                             _ => continue,
                         }
@@ -949,6 +1253,13 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
+        Some(Command::Task { action }) => {
+            if let Err(error) = run_task_action(action) {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some(Command::Theme { name }) => {
             let msg = serde_json::json!({
                 "type": "change_theme",
@@ -1017,12 +1328,20 @@ fn main() {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
             settings::init(cx);
 
+            // gh/bee availability checks in AgentiumApp wait for this signal:
+            // Finder launches start with a minimal PATH, so probing before the
+            // login shell environment lands would permanently disable those
+            // integrations for the session.
+            let (env_loaded_tx, env_loaded_rx) = futures::channel::oneshot::channel::<()>();
             #[cfg(unix)]
             cx.background_executor()
                 .spawn(async {
                     util::load_login_shell_environment().await.log_err();
+                    env_loaded_tx.send(()).ok();
                 })
                 .detach();
+            #[cfg(not(unix))]
+            drop(env_loaded_tx);
 
             theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
             *theme::SystemAppearance::global_mut(cx) =
@@ -1287,6 +1606,7 @@ fn main() {
                                         workspace_entity,
                                         project,
                                         app_state,
+                                        env_loaded_rx,
                                         window,
                                         cx,
                                     )
@@ -1452,6 +1772,13 @@ fn main() {
                                                         window,
                                                         cx,
                                                     );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::TaskCommand(command) => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.handle_task_command(command, cx);
                                                 })
                                                 .log_err();
                                         }
