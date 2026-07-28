@@ -1,4 +1,5 @@
 mod arena;
+pub mod board;
 mod file_browser_view;
 mod git_status_view;
 mod review_view;
@@ -34,6 +35,7 @@ use ui::{
 };
 use ui_input::ErasedEditor;
 use util::{ResultExt as _, paths::PathExt};
+use uuid::Uuid;
 use workspace::{
     AppState, Pane, PathList, SerializedWorkspaceLocation, SplitDirection, Workspace,
     WorkspaceDb, WorkspaceId, ZoomOut,
@@ -200,6 +202,28 @@ struct CiInfo {
     checks: Vec<CiCheckEntry>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Repositories,
+    Tasks,
+}
+
+#[derive(Clone)]
+enum WorktreeRow {
+    Live { arena_index: usize },
+    Closed { path: PathBuf },
+    Missing { path: PathBuf },
+}
+
+/// Derived board state that requires filesystem calls (canonicalize/exists),
+/// recomputed on board or arena changes — never during render, which runs
+/// every 2 seconds via `_busy_badge_refresh_task`.
+#[derive(Default)]
+struct BoardCache {
+    task_worktrees: HashMap<Uuid, Vec<WorktreeRow>>,
+    unassigned_arenas: Vec<usize>,
+}
+
 pub struct AgentiumApp {
     arenas: Vec<Entity<Arena>>,
     active_arena_index: Option<usize>,
@@ -242,6 +266,18 @@ pub struct AgentiumApp {
     last_branch_names: HashMap<EntityId, Option<String>>,
     pr_session_db: HashMap<String, HashMap<String, PrSessionData>>,
     _pr_session_db_write_task: Option<Task<()>>,
+    board: board::Board,
+    _board_write_task: Option<Task<()>>,
+    bee_available: bool,
+    _issue_fetch_task: Option<Task<()>>,
+    sidebar_tab: SidebarTab,
+    collapsed_tasks: HashSet<Uuid>,
+    renaming_task: Option<Uuid>,
+    task_rename_editor: Entity<Editor>,
+    adding_issue_to_task: Option<Uuid>,
+    issue_input_editor: Entity<Editor>,
+    issue_input_error: Option<SharedString>,
+    board_cache: BoardCache,
     #[cfg(target_os = "macos")]
     caffeinate_absent_since: HashMap<String, Instant>,
     #[cfg(target_os = "macos")]
@@ -253,6 +289,7 @@ impl AgentiumApp {
         workspace_entity: Entity<Workspace>,
         project: Entity<Project>,
         app_state: Arc<AppState>,
+        env_loaded: futures::channel::oneshot::Receiver<()>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -290,6 +327,24 @@ impl AgentiumApp {
             }
         }).detach();
 
+        let task_rename_editor = cx.new(|cx| Editor::single_line(window, cx));
+        cx.subscribe_in(&task_rename_editor, window, |this: &mut Self, _, event: &EditorEvent, _window, cx| {
+            if let EditorEvent::Blurred = event {
+                this.finish_rename_task(false, cx);
+            }
+        }).detach();
+
+        let issue_input_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("PROJ-123 / owner/repo#12 / URL", window, cx);
+            editor
+        });
+        cx.subscribe_in(&issue_input_editor, window, |this: &mut Self, _, event: &EditorEvent, _window, cx| {
+            if let EditorEvent::Blurred = event {
+                this.finish_add_issue(false, cx);
+            }
+        }).detach();
+
         let window_activation_subscription =
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -305,6 +360,9 @@ impl AgentiumApp {
                     {
                         this.start_ci_polling(cx);
                     }
+                    // Closed/missing worktree rows can go stale if directories
+                    // are deleted or recreated outside Agentium.
+                    this.rebuild_board_cache(cx);
                     // Re-render so rate limit rows can detect expired reset times
                     // and hide progress bars immediately on app reactivation.
                     if this.rate_limits.is_some() {
@@ -317,22 +375,28 @@ impl AgentiumApp {
             });
 
         cx.spawn(async move |this, cx| {
-            let available = cx
+            // Wait for the login shell environment before probing: a Finder
+            // launch starts with a minimal PATH, and probing too early would
+            // permanently disable gh/bee integration for the session.
+            env_loaded.await.ok();
+            let (gh_available, bee_available) = cx
                 .background_executor()
                 .spawn(async {
-                    smol::process::Command::new("gh")
-                        .args(&["--version"])
-                        .output()
-                        .await
-                        .map(|output| output.status.success())
-                        .unwrap_or(false)
+                    futures::join!(
+                        version_check_succeeds("gh"),
+                        version_check_succeeds("bee")
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.gh_available = available;
-                if available {
+                this.gh_available = gh_available;
+                this.bee_available = bee_available;
+                if gh_available {
                     this.start_pr_polling(cx);
                     this.start_ci_polling(cx);
+                }
+                if gh_available || bee_available {
+                    this.fetch_issue_metadata(true, cx);
                 }
             })
             .ok();
@@ -478,7 +542,7 @@ impl AgentiumApp {
             }
         });
 
-        Self {
+        let mut this = Self {
             arenas: Vec::new(),
             active_arena_index: None,
             workspace_entity,
@@ -516,11 +580,25 @@ impl AgentiumApp {
             last_branch_names: HashMap::new(),
             pr_session_db: load_pr_session_db(),
             _pr_session_db_write_task: None,
+            board: board::load_board(),
+            _board_write_task: None,
+            bee_available: false,
+            _issue_fetch_task: None,
+            sidebar_tab: SidebarTab::Repositories,
+            collapsed_tasks: HashSet::new(),
+            renaming_task: None,
+            task_rename_editor,
+            adding_issue_to_task: None,
+            issue_input_editor,
+            issue_input_error: None,
+            board_cache: BoardCache::default(),
             #[cfg(target_os = "macos")]
             caffeinate_absent_since: HashMap::new(),
             #[cfg(target_os = "macos")]
             _caffeinate_monitor_task: caffeinate_monitor_task,
-        }
+        };
+        this.rebuild_board_cache(cx);
+        this
     }
 
     pub fn add_arena_with_path(
@@ -590,6 +668,7 @@ impl AgentiumApp {
         if self.gh_available {
             self.fetch_pr_for_arena(arena_entity.entity_id(), cx);
         }
+        self.rebuild_board_cache(cx);
         let focus = arena_entity.focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
@@ -1017,6 +1096,20 @@ impl AgentiumApp {
     ) {
         let this = cx.entity();
         self.badge_menu.take();
+        let arena_index = self
+            .arenas
+            .iter()
+            .position(|arena| arena.entity_id() == arena_entity.entity_id());
+        let arena_path =
+            arena_index.and_then(|index| self.arena_canonical_path(index, cx));
+        let assigned_tasks =
+            arena_index.map_or(Vec::new(), |index| self.tasks_containing_arena(index, cx));
+        let task_choices: Vec<(Uuid, String)> = self
+            .board
+            .active_tasks()
+            .filter(|task| !assigned_tasks.contains(&task.id))
+            .map(|task| (task.id, task.title.clone()))
+            .collect();
         let arena_for_rename = arena_entity.clone();
         let arena_for_close = arena_entity;
         let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
@@ -1027,6 +1120,45 @@ impl AgentiumApp {
                     this.start_rename_arena(arena_for_rename.clone(), window, cx);
                 }),
             );
+            let menu = if let (Some(arena_index), Some(arena_path)) = (arena_index, arena_path) {
+                let submenu_this = this.clone();
+                let menu = menu.submenu("Assign to Task…", move |mut submenu, window, _cx| {
+                    for (task_id, title) in &task_choices {
+                        let task_id = *task_id;
+                        submenu = submenu.entry(
+                            title.clone(),
+                            None,
+                            window.handler_for(&submenu_this, move |this, _window, cx| {
+                                this.assign_arena_to_task(arena_index, task_id, cx);
+                            }),
+                        );
+                    }
+                    if !task_choices.is_empty() {
+                        submenu = submenu.separator();
+                    }
+                    let arena_path = arena_path.clone();
+                    submenu.entry(
+                        "New Task with Arena",
+                        None,
+                        window.handler_for(&submenu_this, move |this, window, cx| {
+                            this.create_task(Some(arena_path.clone()), window, cx);
+                        }),
+                    )
+                });
+                if assigned_tasks.is_empty() {
+                    menu
+                } else {
+                    menu.entry(
+                        "Remove from Task",
+                        None,
+                        window.handler_for(&this, move |this, _window, cx| {
+                            this.remove_arena_from_tasks(arena_index, cx);
+                        }),
+                    )
+                }
+            } else {
+                menu
+            };
             let menu = if let Some(url) = project_url {
                 menu.entry(
                     "Open GitHub Repository",
@@ -1061,6 +1193,8 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.finish_rename_task(false, cx);
+        self.finish_add_issue(false, cx);
         let name = workspace.read(cx).name.clone();
         self.renaming_arena = Some(workspace);
         self.rename_editor.update(cx, |editor, cx| {
@@ -1098,6 +1232,7 @@ impl AgentiumApp {
         self.pr_dirty.remove(&entity_id);
         self.last_branch_names.remove(&entity_id);
         self.arenas.remove(index);
+        self.rebuild_board_cache(cx);
 
         if self.arenas.is_empty() {
             self.active_arena_index = None;
@@ -1478,6 +1613,499 @@ impl AgentiumApp {
         let db_snapshot = self.pr_session_db.clone();
         self._pr_session_db_write_task = Some(cx.background_spawn(async move {
             write_pr_session_db(&db_snapshot).log_err();
+        }));
+    }
+
+    pub fn handle_task_command(&mut self, command: board::TaskCommand, cx: &mut Context<Self>) {
+        if let Err(error) = self.board.apply(command) {
+            log::warn!("failed to apply task command: {error:#}");
+            return;
+        }
+        self.board_changed(cx);
+        self.fetch_issue_metadata(false, cx);
+    }
+
+    fn board_changed(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_board_cache(cx);
+        self.persist_board(cx);
+        cx.notify();
+    }
+
+    fn persist_board(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.board.clone();
+        self._board_write_task = Some(cx.background_spawn(async move {
+            board::write_board(&snapshot).log_err();
+        }));
+    }
+
+    fn rebuild_board_cache(&mut self, cx: &App) {
+        let canonical_arena_paths: Vec<(PathBuf, usize)> = self
+            .arenas
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arena)| {
+                let directory = arena.read(cx).working_directory.clone()?;
+                let canonical = std::fs::canonicalize(&directory).unwrap_or(directory);
+                Some((canonical, index))
+            })
+            .collect();
+
+        let mut assigned: HashSet<usize> = HashSet::new();
+        let mut task_worktrees: HashMap<Uuid, Vec<WorktreeRow>> = HashMap::new();
+        for task in self.board.tasks.iter().filter(|task| !task.archived) {
+            let mut rows = Vec::new();
+            for worktree in &task.worktrees {
+                match std::fs::canonicalize(worktree) {
+                    Ok(canonical) => {
+                        if let Some((_, arena_index)) = canonical_arena_paths
+                            .iter()
+                            .find(|(path, _)| *path == canonical)
+                        {
+                            assigned.insert(*arena_index);
+                            rows.push(WorktreeRow::Live {
+                                arena_index: *arena_index,
+                            });
+                        } else {
+                            rows.push(WorktreeRow::Closed {
+                                path: worktree.clone(),
+                            });
+                        }
+                    }
+                    Err(_) => rows.push(WorktreeRow::Missing {
+                        path: worktree.clone(),
+                    }),
+                }
+            }
+            task_worktrees.insert(task.id, rows);
+        }
+
+        let unassigned_arenas = (0..self.arenas.len())
+            .filter(|index| !assigned.contains(index))
+            .collect();
+        self.board_cache = BoardCache {
+            task_worktrees,
+            unassigned_arenas,
+        };
+    }
+
+    fn arena_canonical_path(&self, arena_index: usize, cx: &App) -> Option<PathBuf> {
+        let directory = self
+            .arenas
+            .get(arena_index)?
+            .read(cx)
+            .working_directory
+            .clone()?;
+        Some(std::fs::canonicalize(&directory).unwrap_or(directory))
+    }
+
+    fn create_task(&mut self, worktree: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let id = Uuid::new_v4();
+        self.board
+            .apply(board::TaskCommand::New {
+                id,
+                title: "New Task".to_string(),
+                issues: Vec::new(),
+                worktrees: worktree.into_iter().collect(),
+            })
+            .log_err();
+        self.sidebar_tab = SidebarTab::Tasks;
+        self.board_changed(cx);
+        self.start_rename_task(id, window, cx);
+    }
+
+    fn start_add_issue(&mut self, task_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_rename_arena(false, cx);
+        self.finish_rename_task(false, cx);
+        if !self.board.tasks.iter().any(|task| task.id == task_id) {
+            return;
+        }
+        self.adding_issue_to_task = Some(task_id);
+        self.issue_input_error = None;
+        // The input row renders under the task header, so the task must be
+        // expanded for the editor to be visible and focusable.
+        self.collapsed_tasks.remove(&task_id);
+        self.issue_input_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        window.focus(&self.issue_input_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn finish_add_issue(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(task_id) = self.adding_issue_to_task else {
+            return;
+        };
+        if !commit {
+            self.adding_issue_to_task = None;
+            self.issue_input_error = None;
+            cx.notify();
+            return;
+        }
+        let input = self.issue_input_editor.read(cx).text(cx);
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            self.adding_issue_to_task = None;
+            self.issue_input_error = None;
+            cx.notify();
+            return;
+        }
+        match board::parse_issue_ref(trimmed) {
+            Ok(issue) => {
+                self.adding_issue_to_task = None;
+                self.issue_input_error = None;
+                self.board
+                    .apply(board::TaskCommand::AddIssue { task_id, issue })
+                    .log_err();
+                self.board_changed(cx);
+                self.fetch_issue_metadata(false, cx);
+            }
+            // Keep the editor open so the input can be corrected.
+            Err(error) => {
+                self.issue_input_error = Some(SharedString::from(format!("{error:#}")));
+                cx.notify();
+            }
+        }
+    }
+
+    fn start_rename_task(&mut self, task_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_rename_arena(false, cx);
+        self.finish_add_issue(false, cx);
+        let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id) else {
+            return;
+        };
+        let title = task.title.clone();
+        self.renaming_task = Some(task_id);
+        self.task_rename_editor.update(cx, |editor, cx| {
+            editor.set_text(title, window, cx);
+            editor.select_all(&Default::default(), window, cx);
+        });
+        window.focus(&self.task_rename_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn finish_rename_task(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(task_id) = self.renaming_task.take() else {
+            return;
+        };
+        if commit {
+            let new_title = self.task_rename_editor.read(cx).text(cx);
+            let trimmed = new_title.trim();
+            if !trimmed.is_empty() {
+                if let Ok(task) = self.board.task_mut(task_id) {
+                    task.title = trimmed.to_string();
+                }
+                self.persist_board(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn move_task(&mut self, task_id: Uuid, up: bool, cx: &mut Context<Self>) {
+        // Move among visible (non-archived) neighbors; archived entries keep
+        // their positions in the underlying Vec.
+        let visible: Vec<usize> = self
+            .board
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| !task.archived)
+            .map(|(index, _)| index)
+            .collect();
+        let Some(position) = visible
+            .iter()
+            .position(|&index| self.board.tasks[index].id == task_id)
+        else {
+            return;
+        };
+        let neighbor = if up {
+            position.checked_sub(1)
+        } else {
+            (position + 1 < visible.len()).then_some(position + 1)
+        };
+        let Some(neighbor) = neighbor else {
+            return;
+        };
+        self.board.tasks.swap(visible[position], visible[neighbor]);
+        self.board_changed(cx);
+    }
+
+    fn archive_task(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
+        if let Ok(task) = self.board.task_mut(task_id) {
+            task.archived = true;
+        }
+        self.board_changed(cx);
+    }
+
+    fn assign_arena_to_task(&mut self, arena_index: usize, task_id: Uuid, cx: &mut Context<Self>) {
+        let Some(path) = self.arena_canonical_path(arena_index, cx) else {
+            return;
+        };
+        self.board
+            .apply(board::TaskCommand::AddArena { task_id, path })
+            .log_err();
+        self.board_changed(cx);
+    }
+
+    fn remove_arena_from_tasks(&mut self, arena_index: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.arena_canonical_path(arena_index, cx) else {
+            return;
+        };
+        for task in &mut self.board.tasks {
+            task.worktrees.retain(|worktree| {
+                std::fs::canonicalize(worktree)
+                    .unwrap_or_else(|_| worktree.clone())
+                    != path
+            });
+        }
+        self.board_changed(cx);
+    }
+
+    fn remove_issue_from_task(
+        &mut self,
+        task_id: Uuid,
+        reference: &board::IssueRef,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(task) = self.board.task_mut(task_id) {
+            task.issues.retain(|issue| issue.reference != *reference);
+        }
+        self.board_changed(cx);
+    }
+
+    fn remove_worktree_from_task(
+        &mut self,
+        task_id: Uuid,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(task) = self.board.task_mut(task_id) {
+            task.worktrees.retain(|worktree| worktree != path);
+        }
+        self.board_changed(cx);
+    }
+
+    /// Tasks the given arena is currently assigned to (by canonical path).
+    fn tasks_containing_arena(&self, arena_index: usize, cx: &App) -> Vec<Uuid> {
+        let Some(path) = self.arena_canonical_path(arena_index, cx) else {
+            return Vec::new();
+        };
+        self.board
+            .active_tasks()
+            .filter(|task| {
+                task.worktrees.iter().any(|worktree| {
+                    std::fs::canonicalize(worktree)
+                        .unwrap_or_else(|_| worktree.clone())
+                        == path
+                })
+            })
+            .map(|task| task.id)
+            .collect()
+    }
+
+    fn deploy_task_context_menu(
+        &mut self,
+        task_id: Uuid,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            menu.entry(
+                "Rename…",
+                None,
+                window.handler_for(&this, move |this, window, cx| {
+                    this.start_rename_task(task_id, window, cx);
+                }),
+            )
+            .entry(
+                "Add Issue…",
+                None,
+                window.handler_for(&this, move |this, window, cx| {
+                    this.start_add_issue(task_id, window, cx);
+                }),
+            )
+            .entry(
+                "Move Up",
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    this.move_task(task_id, true, cx);
+                }),
+            )
+            .entry(
+                "Move Down",
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    this.move_task(task_id, false, cx);
+                }),
+            )
+            .separator()
+            .entry(
+                "Archive",
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    this.archive_task(task_id, cx);
+                }),
+            )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn deploy_issue_context_menu(
+        &mut self,
+        task_id: Uuid,
+        reference: board::IssueRef,
+        url: Option<String>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            let menu = if let Some(url) = url {
+                menu.entry(
+                    "Open in Browser",
+                    None,
+                    window.handler_for(&this, move |_this, _window, cx| {
+                        cx.open_url(&url);
+                    }),
+                )
+            } else {
+                menu
+            };
+            menu.entry(
+                "Remove from Task",
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    this.remove_issue_from_task(task_id, &reference, cx);
+                }),
+            )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn deploy_worktree_context_menu(
+        &mut self,
+        task_id: Uuid,
+        path: PathBuf,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            menu.entry(
+                "Remove from Task",
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    this.remove_worktree_from_task(task_id, &path, cx);
+                }),
+            )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Fetch title/state/url for board issues via `gh` / `bee`. With
+    /// `refresh_all`, already-cached entries are refreshed too (used at
+    /// startup so cached states don't go stale forever); otherwise only
+    /// unfetched issues are looked up.
+    fn fetch_issue_metadata(&mut self, refresh_all: bool, cx: &mut Context<Self>) {
+        let mut pending: Vec<board::IssueRef> = Vec::new();
+        for task in self.board.tasks.iter().filter(|task| !task.archived) {
+            for issue in &task.issues {
+                let provider_available = match issue.reference {
+                    board::IssueRef::GitHub { .. } => self.gh_available,
+                    board::IssueRef::Backlog { .. } => self.bee_available,
+                };
+                if !provider_available {
+                    continue;
+                }
+                if !refresh_all && issue.title.is_some() && issue.url.is_some() {
+                    continue;
+                }
+                if !pending.contains(&issue.reference) {
+                    pending.push(issue.reference.clone());
+                }
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        self._issue_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    futures::future::join_all(pending.into_iter().map(|reference| async {
+                        let metadata = fetch_issue_metadata_for(&reference).await;
+                        (reference, metadata)
+                    }))
+                    .await
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let mut changed = false;
+                for (reference, metadata) in results {
+                    let metadata = match metadata {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            log::warn!(
+                                "failed to fetch metadata for {}: {error:#}",
+                                reference.short_label()
+                            );
+                            continue;
+                        }
+                    };
+                    for task in &mut this.board.tasks {
+                        for issue in &mut task.issues {
+                            if issue.reference != reference {
+                                continue;
+                            }
+                            if metadata.title.is_some() && issue.title != metadata.title {
+                                issue.title = metadata.title.clone();
+                                changed = true;
+                            }
+                            if metadata.state.is_some() && issue.state != metadata.state {
+                                issue.state = metadata.state.clone();
+                                changed = true;
+                            }
+                            if issue.url.is_none() && metadata.url.is_some() {
+                                issue.url = metadata.url.clone();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    this.persist_board(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
         }));
     }
 
@@ -2558,16 +3186,989 @@ async fn fetch_ci_status(
     }))
 }
 
+async fn version_check_succeeds(program: &str) -> bool {
+    smol::process::Command::new(program)
+        .args(&["--version"])
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+struct IssueMetadata {
+    title: Option<String>,
+    state: Option<String>,
+    url: Option<String>,
+}
+
+async fn fetch_issue_metadata_for(reference: &board::IssueRef) -> anyhow::Result<IssueMetadata> {
+    match reference {
+        board::IssueRef::GitHub { repo, number } => fetch_github_issue(repo, *number).await,
+        board::IssueRef::Backlog { issue_key } => fetch_backlog_issue(issue_key).await,
+    }
+}
+
+async fn fetch_github_issue(repo: &str, number: u64) -> anyhow::Result<IssueMetadata> {
+    let output = smol::process::Command::new("gh")
+        .args(&[
+            "issue",
+            "view",
+            &number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "title,state,url",
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "gh issue view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GhIssue {
+        title: String,
+        state: String,
+        url: String,
+    }
+    let issue: GhIssue = serde_json::from_slice(&output.stdout)?;
+    Ok(IssueMetadata {
+        title: Some(issue.title),
+        state: Some(issue.state.to_lowercase()),
+        url: Some(issue.url),
+    })
+}
+
+async fn fetch_backlog_issue(issue_key: &str) -> anyhow::Result<IssueMetadata> {
+    let output = smol::process::Command::new("bee")
+        .args(&["issue", "view", issue_key, "--json"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "bee issue view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // bee's --json field names are undocumented; extract defensively.
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let title = json["summary"].as_str().map(String::from);
+    let state = json["status"]["name"].as_str().map(String::from);
+
+    // `-n` prints the issue URL instead of opening a browser.
+    let url_output = smol::process::Command::new("bee")
+        .args(&["issue", "view", issue_key, "-n"])
+        .output()
+        .await?;
+    let url = if url_output.status.success() {
+        let url = String::from_utf8_lossy(&url_output.stdout)
+            .trim()
+            .to_string();
+        url.starts_with("http").then_some(url)
+    } else {
+        None
+    };
+
+    Ok(IssueMetadata { title, state, url })
+}
+
 impl Focusable for AgentiumApp {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for AgentiumApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl AgentiumApp {
+    fn render_arena_row(&mut self, i: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(arena_entity) = self.arenas.get(i).cloned() else {
+            return div().into_any_element();
+        };
+        let arena_entity = &arena_entity;
         let colors = cx.theme().colors();
         let active_index = self.active_arena_index;
+                            let arena = arena_entity.read(cx);
+                            let is_active = Some(i) == active_index;
+                            let status_colors = cx.theme().status();
+
+                            let effective_path = arena.working_directory.clone().or_else(|| {
+                                self.project
+                                    .read(cx)
+                                    .worktrees(cx)
+                                    .next()
+                                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+                            });
+
+                            let display_path = effective_path.as_ref().and_then(|path| {
+                                path.file_name().map(|name| name.to_string_lossy().to_string())
+                            });
+
+                            let git_info = effective_path.as_ref().and_then(|working_dir| {
+                                let git_store = self.project.read(cx).git_store().read(cx);
+                                git_store.repositories().values()
+                                    .filter_map(|repo| {
+                                        let repo = repo.read(cx);
+                                        let repo_path = &repo.work_directory_abs_path;
+                                        if working_dir.starts_with(repo_path.as_ref()) {
+                                            let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
+                                            let head_sha = repo.head_commit.as_ref().map(|c| c.sha.clone());
+                                            let head_tags = repo.head_tags.clone();
+                                            let browser_url = repo.remote_origin_url.as_deref()
+                                                .and_then(remote_url_to_browser_url);
+                                            let (lines_added, lines_deleted) = repo.cached_status()
+                                                .fold((0u32, 0u32), |(added, deleted), entry| {
+                                                    if let Some(stat) = &entry.diff_stat {
+                                                        (added + stat.added, deleted + stat.deleted)
+                                                    } else {
+                                                        (added, deleted)
+                                                    }
+                                                });
+                                            Some((repo_path.clone(), branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .max_by_key(|(repo_path, _, _, _, _, _, _)| repo_path.clone())
+                                    .map(|(_, branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted)| (branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
+                            });
+
+                            let entity_id = arena_entity.entity_id();
+                            let prs = self.pr_info.get(&entity_id);
+                            let multiple_prs = prs.map_or(false, |prs| prs.len() > 1);
+                            let tooltip_branch = git_info.as_ref()
+                                .and_then(|(branch, _, _, _, _, _)| branch.clone());
+
+                            let mut pr_rows: Vec<(AnyElement, Option<AnyElement>)> = Vec::new();
+                            for pr in prs.map(|prs| prs.as_slice()).unwrap_or_default() {
+                                let is_pr_merged = matches!(pr.status, PrStatus::Merged);
+
+                                let ci_info = self.ci_status.get(&(entity_id, pr.number));
+                                let ci_icon_element = if is_pr_merged {
+                                    None
+                                } else {
+                                    ci_info.map(|ci| {
+                                        let (icon, color) = match &ci.status {
+                                            CiStatus::AllPassed => (IconName::Check, status_colors.success),
+                                            CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
+                                            CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
+                                            CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
+                                        };
+                                        Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
+                                    })
+                                };
+
+                                let tooltip_pr = pr.clone();
+                                let tooltip_ci = ci_info.cloned();
+                                let tooltip_branch = tooltip_branch.clone();
+
+                                let pr_color = match pr.status {
+                                    PrStatus::Draft => colors.text_muted,
+                                    PrStatus::Open => status_colors.success,
+                                    // No semantic purple in StatusColors; matches GitHub's merge color
+                                    PrStatus::Merged => hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
+                                    PrStatus::Closed => status_colors.error,
+                                    PrStatus::Conflicted => status_colors.warning,
+                                };
+                                let pr_icon = match pr.status {
+                                    PrStatus::Draft | PrStatus::Open => IconName::GitPullRequest,
+                                    PrStatus::Merged => IconName::GitGraph,
+                                    PrStatus::Closed => IconName::GitPullRequestClosed,
+                                    PrStatus::Conflicted => IconName::GitMergeConflict,
+                                };
+                                let url = pr.html_url.clone();
+                                let pr_el = h_flex()
+                                    .id(SharedString::from(format!(
+                                        "arena-pr-{}-{}",
+                                        arena.id, pr.number
+                                    )))
+                                    .gap_1()
+                                    .items_center()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .when(is_active, |d| {
+                                        d.cursor_pointer()
+                                            .hover(|d| d.bg(colors.element_hover))
+                                    })
+                                    .child(
+                                        Icon::new(pr_icon)
+                                            .size(IconSize::Small)
+                                            .color(Color::Custom(pr_color)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(colors.text_muted)
+                                            .child(format!("#{}", pr.number)),
+                                    )
+                                    .when_some(ci_icon_element, |d, icon| d.child(icon))
+                                    .when(multiple_prs, |d| {
+                                        d.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(colors.text_muted)
+                                                .max_w_20()
+                                                .truncate()
+                                                .child(pr.base_ref.clone()),
+                                        )
+                                    })
+                                    .tooltip(Tooltip::element({
+                                        move |_window, cx| {
+                                            render_pr_tooltip(
+                                                &tooltip_pr,
+                                                tooltip_ci.as_ref(),
+                                                tooltip_branch.as_deref(),
+                                                cx,
+                                            )
+                                        }
+                                    }))
+                                    .when(is_active, |d| {
+                                        d.on_click(cx.listener({
+                                            let url = url.clone();
+                                            move |_this, _event: &ClickEvent, _window, cx| {
+                                                cx.stop_propagation();
+                                                cx.open_url(&url);
+                                            }
+                                        }))
+                                    })
+                                    .into_any_element();
+
+                                let review_el = if is_pr_merged {
+                                    None
+                                } else {
+                                    match &pr.review_decision {
+                                        Some(ReviewDecision::Approved) => {
+                                            Some((IconName::Check, status_colors.success, None))
+                                        }
+                                        Some(ReviewDecision::ChangesRequested) => {
+                                            Some((IconName::Circle, status_colors.error, None))
+                                        }
+                                        Some(ReviewDecision::ReviewRequired) => {
+                                            Some((IconName::Circle, status_colors.warning, None))
+                                        }
+                                        None if pr.review_count > 0 => {
+                                            Some((IconName::Eye, colors.text_muted, Some(pr.review_count.to_string())))
+                                        }
+                                        None => None,
+                                    }
+                                    .map(|(review_icon, review_color, review_label)| {
+                                        let tooltip_reviews = pr.reviews.clone();
+                                        let tooltip_head_sha = pr.head_sha.clone();
+                                        h_flex()
+                                            .id(SharedString::from(format!(
+                                                "arena-review-{}-{}",
+                                                arena.id, pr.number
+                                            )))
+                                            .gap_0p5()
+                                            .items_center()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .when(is_active, |d| {
+                                                d.cursor_pointer()
+                                                    .hover(|d| d.bg(colors.element_hover))
+                                            })
+                                            .child(
+                                                Icon::new(review_icon)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Custom(review_color)),
+                                            )
+                                            .when_some(review_label, |d, label| {
+                                                d.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(colors.text_muted)
+                                                        .child(label),
+                                                )
+                                            })
+                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                render_review_tooltip(
+                                                    &tooltip_reviews,
+                                                    &tooltip_head_sha,
+                                                    cx,
+                                                )
+                                            }))
+                                            .when(is_active, |d| {
+                                                d.on_click(cx.listener(
+                                                    move |_this, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        cx.open_url(&url);
+                                                    },
+                                                ))
+                                            })
+                                            .into_any_element()
+                                    })
+                                };
+
+                                pr_rows.push((pr_el, review_el));
+                            }
+                            let mut pr_rows = pr_rows.into_iter();
+                            let first_pr_row = pr_rows.next();
+                            let extra_pr_rows: Vec<_> = pr_rows.collect();
+
+                            let project_url = git_info.as_ref()
+                                .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
+
+                            div()
+                                .id(("arena", arena.id))
+                                .px_2()
+                                .py_1()
+                                .mx_1()
+                                .my_px()
+                                .rounded_md()
+                                .text_color(colors.text)
+                                .cursor_pointer()
+                                .when(is_active, |d| d.bg(colors.element_selected))
+                                .when(!is_active, |d: Stateful<Div>| {
+                                    d.hover(|d| d.bg(colors.element_hover))
+                                })
+                                .child({
+                                    let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
+                                    let permission_infos = self.collect_permission_terminal_infos(arena_entity, cx);
+                                    let running_infos = self.collect_running_terminal_infos(arena_entity, cx);
+                                    let ready_infos = self.collect_ready_terminal_infos(arena_entity, cx);
+                                    let busy_infos = self.collect_busy_terminal_infos(arena_entity, cx);
+                                    let has_pills = !permission_infos.is_empty()
+                                        || !running_infos.is_empty()
+                                        || !ready_infos.is_empty()
+                                        || !busy_infos.is_empty();
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .text_size(rems(0.9375))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .when(is_renaming, |d| d.child(self.rename_editor.clone()))
+                                        .when(!is_renaming, |d| {
+                                            if is_active {
+                                                let arena_for_rename = arena_entity.clone();
+                                                d.child(
+                                                    div()
+                                                        .id(("arena-name", arena.id))
+                                                        .cursor_pointer()
+                                                        .rounded_sm()
+                                                        .hover(|d| d.bg(colors.element_hover))
+                                                        .child(arena.name.clone())
+                                                        .on_click(cx.listener(
+                                                            move |this, _event: &ClickEvent, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.start_rename_arena(
+                                                                    arena_for_rename.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                )
+                                            } else {
+                                                d.child(arena.name.clone())
+                                            }
+                                        })
+                                        .when(has_pills, |d| {
+                                            d.child(
+                                                h_flex()
+                                                    .gap_0p5()
+                                                    .when(!permission_infos.is_empty(), |d| {
+                                                        let entries = permission_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-permission-badge", arena.id),
+                                                                entries.len(),
+                                                                status_colors.warning,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!running_infos.is_empty(), |d| {
+                                                        let entries = running_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-running-badge", arena.id),
+                                                                entries.len(),
+                                                                status_colors.success,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!ready_infos.is_empty(), |d| {
+                                                        let entries = ready_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-ready-badge", arena.id),
+                                                                entries.len(),
+                                                                colors.text_accent,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!busy_infos.is_empty(), |d| {
+                                                        let entries = busy_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-busy-badge", arena.id),
+                                                                entries.len(),
+                                                                colors.text,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                            )
+                                        })
+                                })
+                                // Row 2: branch/tag/sha (left) + diff stats (right)
+                                .child({
+                                    let (ref_icon, ref_label): (Option<IconName>, SharedString) =
+                                        if let Some((Some(branch), _, _, _, _, _)) = git_info.as_ref() {
+                                            (Some(IconName::GitBranch), branch.clone().into())
+                                        } else if let Some((None, _, head_tags, _, _, _)) = git_info.as_ref() {
+                                            if let Some(tag) = head_tags.first() {
+                                                (Some(IconName::Tag), tag.clone().into())
+                                            } else if let Some((_, Some(sha), _, _, _, _)) = git_info.as_ref() {
+                                                (None, sha.chars().take(8).collect::<String>().into())
+                                            } else {
+                                                (None, SharedString::default())
+                                            }
+                                        } else {
+                                            (None, SharedString::default())
+                                        };
+                                    let diff_stats = git_info.as_ref()
+                                        .map(|(_, _, _, _, added, deleted)| (*added, *deleted));
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_xs()
+                                        .min_h(px(16.0))
+                                        .when(!ref_label.is_empty(), |d| {
+                                            d.child(
+                                                h_flex()
+                                                    .min_w_0()
+                                                    .flex_shrink()
+                                                    .items_center()
+                                                    .gap_0p5()
+                                                    .text_color(colors.text_muted)
+                                                    .when_some(ref_icon, |d, icon| {
+                                                        d.child(
+                                                            Icon::new(icon)
+                                                                .size(IconSize::XSmall)
+                                                                .color(Color::Muted),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        div().min_w_0().truncate().child(ref_label),
+                                                    ),
+                                            )
+                                        })
+                                        .child(div().flex_grow())
+                                        .when_some(diff_stats, |d, (added, deleted)| {
+                                            d.child(
+                                                h_flex()
+                                                    .flex_shrink_0()
+                                                    .gap_1()
+                                                    .when(added > 0, |d| {
+                                                        d.child(
+                                                            div()
+                                                                .text_color(status_colors.created)
+                                                                .child(format!("+{added}")),
+                                                        )
+                                                    })
+                                                    .when(deleted > 0, |d| {
+                                                        d.child(
+                                                            div()
+                                                                .text_color(status_colors.deleted)
+                                                                .child(format!("-{deleted}")),
+                                                        )
+                                                    }),
+                                            )
+                                        })
+                                })
+                                // Row 3: directory name (if different from arena name) + PR element (right)
+                                .child({
+                                    let show_dir = display_path.as_ref()
+                                        .map_or(false, |path| path != &arena.name);
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_xs()
+                                        .min_h(px(16.0))
+                                        .when(show_dir, |d| {
+                                            let path = display_path.as_ref().cloned().unwrap_or_default();
+                                            d.child(
+                                                Icon::new(IconName::Folder)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(colors.text_muted)
+                                                    .child(path),
+                                            )
+                                        })
+                                        .when(first_pr_row.is_some(), |d| {
+                                            d.child(div().flex_grow())
+                                        })
+                                        .when_some(first_pr_row, |d, (pr_el, review_el)| {
+                                            d.child(pr_el).children(review_el)
+                                        })
+                                })
+                                // Rows 4..N: one row per additional PR when the
+                                // branch has several (e.g. develop + master bases).
+                                .children(extra_pr_rows.into_iter().map(|(pr_el, review_el)| {
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_xs()
+                                        .min_h(px(16.0))
+                                        .child(div().flex_grow())
+                                        .child(pr_el)
+                                        .children(review_el)
+                                }))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.switch_arena(i, window, cx)
+                                    },
+                                ))
+                                .on_mouse_down(MouseButton::Right, {
+                                    let arena_entity = arena_entity.clone();
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        this.deploy_arena_context_menu(
+                                            arena_entity.clone(),
+                                            project_url.clone(),
+                                            event.position,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                })
+            .into_any_element()
+    }
+
+    fn render_sidebar_tab_button(
+        &self,
+        label: &'static str,
+        tab: SidebarTab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let is_active = self.sidebar_tab == tab;
+        h_flex()
+            .id(label)
+            .flex_1()
+            .justify_center()
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .text_sm()
+            .cursor_pointer()
+            .when(is_active, |d| {
+                d.bg(colors.element_selected)
+                    .font_weight(FontWeight::SEMIBOLD)
+            })
+            .when(!is_active, |d| {
+                d.text_color(colors.text_muted)
+                    .hover(|d| d.bg(colors.element_hover))
+            })
+            .child(label)
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.sidebar_tab = tab;
+                cx.notify();
+            }))
+    }
+
+    fn render_task_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+
+        struct TaskData {
+            id: Uuid,
+            title: String,
+            issues: Vec<board::IssueLink>,
+            worktrees: Vec<WorktreeRow>,
+            collapsed: bool,
+        }
+        let tasks: Vec<TaskData> = self
+            .board
+            .active_tasks()
+            .map(|task| TaskData {
+                id: task.id,
+                title: task.title.clone(),
+                issues: task.issues.clone(),
+                worktrees: self
+                    .board_cache
+                    .task_worktrees
+                    .get(&task.id)
+                    .cloned()
+                    .unwrap_or_default(),
+                collapsed: self.collapsed_tasks.contains(&task.id),
+            })
+            .collect();
+        let unassigned = self.board_cache.unassigned_arenas.clone();
+
+        let mut list = div().id("task-list").flex_1().overflow_y_scroll();
+
+        if tasks.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .child("No tasks yet"),
+            );
+        }
+
+        for task in tasks {
+            let task_id = task.id;
+            let is_renaming = self.renaming_task == Some(task_id);
+            let header = h_flex()
+                .id(SharedString::from(format!("task-header-{task_id}")))
+                .px_2()
+                .py_1()
+                .gap_1()
+                .items_center()
+                .cursor_pointer()
+                .hover(|d| d.bg(colors.element_hover))
+                .child(
+                    Icon::new(if task.collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(if is_renaming {
+                    div()
+                        .flex_1()
+                        .child(self.task_rename_editor.clone())
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(task.title.clone())
+                        .into_any_element()
+                })
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if this.renaming_task == Some(task_id) {
+                        return;
+                    }
+                    if !this.collapsed_tasks.remove(&task_id) {
+                        this.collapsed_tasks.insert(task_id);
+                    }
+                    cx.notify();
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.deploy_task_context_menu(task_id, event.position, window, cx);
+                    }),
+                );
+
+            let mut section = div()
+                .id(SharedString::from(format!("task-section-{task_id}")))
+                .mb_1()
+                .child(header);
+
+            if !task.collapsed {
+                if self.adding_issue_to_task == Some(task_id) {
+                    section = section.child(
+                        div()
+                            .pl_5()
+                            .pr_2()
+                            .py_0p5()
+                            .text_xs()
+                            .child(self.issue_input_editor.clone()),
+                    );
+                    if let Some(error) = self.issue_input_error.clone() {
+                        section = section.child(
+                            div()
+                                .pl_5()
+                                .pr_2()
+                                .text_xs()
+                                .text_color(cx.theme().status().error)
+                                .child(error),
+                        );
+                    }
+                }
+                for issue in &task.issues {
+                    section = section.child(self.render_issue_row(task_id, issue, &colors, cx));
+                }
+                for row in &task.worktrees {
+                    section = match row {
+                        WorktreeRow::Live { arena_index } => {
+                            section.child(self.render_arena_row(*arena_index, cx))
+                        }
+                        WorktreeRow::Closed { path } => section.child(
+                            self.render_closed_worktree_row(
+                                task_id,
+                                path.clone(),
+                                false,
+                                &colors,
+                                cx,
+                            ),
+                        ),
+                        WorktreeRow::Missing { path } => section.child(
+                            self.render_closed_worktree_row(
+                                task_id,
+                                path.clone(),
+                                true,
+                                &colors,
+                                cx,
+                            ),
+                        ),
+                    };
+                }
+            }
+            list = list.child(section);
+        }
+
+        if !unassigned.is_empty() {
+            let mut section = div().id("unassigned-section").mt_1().child(
+                h_flex()
+                    .px_2()
+                    .pt_1()
+                    .pb_0p5()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .child("Unassigned"),
+                    )
+                    .child(div().flex_1().h_px().bg(colors.border)),
+            );
+            for arena_index in unassigned {
+                section = section.child(self.render_arena_row(arena_index, cx));
+            }
+            list = list.child(section);
+        }
+
+        list.into_any_element()
+    }
+
+    fn render_issue_row(
+        &self,
+        task_id: Uuid,
+        issue: &board::IssueLink,
+        colors: &theme::ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reference = issue.reference.clone();
+        let label = reference.short_label();
+        let url_for_click = issue.url.clone();
+        let url_for_menu = issue.url.clone();
+
+        let provider_badge: AnyElement = match &issue.reference {
+            board::IssueRef::GitHub { .. } => Icon::new(IconName::Github)
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+            board::IssueRef::Backlog { .. } => h_flex()
+                .flex_shrink_0()
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded_sm()
+                // Backlog brand green
+                .bg(hsla(160.0 / 360.0, 0.55, 0.42, 1.0))
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(gpui::white())
+                .child("b")
+                .into_any_element(),
+        };
+
+        let tooltip_text = issue.title.as_ref().map(|title| match &issue.state {
+            Some(state) => format!("{title} ({state})"),
+            None => title.clone(),
+        });
+
+        h_flex()
+            .id(SharedString::from(format!("task-issue-{task_id}-{label}")))
+            .pl_5()
+            .pr_2()
+            .py_0p5()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .when(url_for_click.is_some(), |d| {
+                d.cursor_pointer().hover(|d| d.bg(colors.element_hover))
+            })
+            .when_some(tooltip_text, |d, text| d.tooltip(Tooltip::text(text)))
+            .child(provider_badge)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(colors.text_muted)
+                    .child(label),
+            )
+            .when_some(issue.title.clone(), |d, title| {
+                d.child(div().min_w_0().flex_shrink().truncate().child(title))
+            })
+            .child(div().flex_grow())
+            .when_some(issue.state.clone(), |d, state| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(colors.text_muted)
+                        .child(state),
+                )
+            })
+            .when_some(url_for_click, |d, url| {
+                d.on_click(cx.listener(move |_this, _, _window, cx| {
+                    cx.stop_propagation();
+                    cx.open_url(&url);
+                }))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_issue_context_menu(
+                        task_id,
+                        reference.clone(),
+                        url_for_menu.clone(),
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_closed_worktree_row(
+        &self,
+        task_id: Uuid,
+        path: PathBuf,
+        missing: bool,
+        colors: &theme::ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let element_id = SharedString::from(format!("task-worktree-{task_id}-{}", path.display()));
+        let path_for_open = path.clone();
+        let path_for_menu = path;
+
+        h_flex()
+            .id(element_id)
+            .pl_5()
+            .pr_2()
+            .py_0p5()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .child(
+                Icon::new(IconName::Folder)
+                    .size(IconSize::XSmall)
+                    .color(if missing { Color::Warning } else { Color::Muted }),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.text_muted)
+                    .child(name),
+            )
+            .when(missing, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(colors.text_muted)
+                        .child("(missing)"),
+                )
+            })
+            .when(!missing, |d| {
+                d.cursor_pointer()
+                    .hover(|d| d.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.add_arena_with_path(path_for_open.clone(), window, cx);
+                    }))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_worktree_context_menu(
+                        task_id,
+                        path_for_menu.clone(),
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for AgentiumApp {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Owned so that closures needing `&mut cx` (e.g. the per-arena row
+        // renderer) can run while colors are still in scope.
+        let colors = cx.theme().colors().clone();
 
         div()
             .key_context("Agentium")
@@ -2590,6 +4191,28 @@ impl Render for AgentiumApp {
                     .bg(colors.panel_background)
                     .border_r_1()
                     .border_color(colors.border)
+                    // Single dispatcher for both rename editors: arena rows are
+                    // also rendered under the Tasks tab, so their editor can be
+                    // focused outside #arena-list; actions stop at the first
+                    // matching handler, so exactly one handler must exist here.
+                    .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
+                        if this.adding_issue_to_task.is_some() {
+                            this.finish_add_issue(true, cx);
+                        } else if this.renaming_task.is_some() {
+                            this.finish_rename_task(true, cx);
+                        } else {
+                            this.finish_rename_arena(true, cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| {
+                        if this.adding_issue_to_task.is_some() {
+                            this.finish_add_issue(false, cx);
+                        } else if this.renaming_task.is_some() {
+                            this.finish_rename_task(false, cx);
+                        } else {
+                            this.finish_rename_arena(false, cx);
+                        }
+                    }))
                     .child(
                         div()
                             .id("agentium-title")
@@ -2624,549 +4247,67 @@ impl Render for AgentiumApp {
                             }),
                     )
                     .child(
+                        h_flex()
+                            .px_2()
+                            .pb_1()
+                            .gap_1()
+                            .child(self.render_sidebar_tab_button(
+                                "Repositories",
+                                SidebarTab::Repositories,
+                                cx,
+                            ))
+                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, cx)),
+                    )
+                    .child(if self.sidebar_tab == SidebarTab::Repositories {
                         div()
                             .id("arena-list")
                             .flex_1()
                             .overflow_y_scroll()
-                            .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
-                                this.finish_rename_arena(true, cx);
-                            }))
-                            .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| {
-                                this.finish_rename_arena(false, cx);
-                            }))
-                            .children(self.arenas.iter().enumerate().map(
-                                |(i, arena_entity)| {
-                                    let arena = arena_entity.read(cx);
-                                    let is_active = Some(i) == active_index;
-                                    let status_colors = cx.theme().status();
-
-                                    let effective_path = arena.working_directory.clone().or_else(|| {
-                                        self.project
-                                            .read(cx)
-                                            .worktrees(cx)
-                                            .next()
-                                            .map(|wt| wt.read(cx).abs_path().to_path_buf())
-                                    });
-
-                                    let display_path = effective_path.as_ref().and_then(|path| {
-                                        path.file_name().map(|name| name.to_string_lossy().to_string())
-                                    });
-
-                                    let git_info = effective_path.as_ref().and_then(|working_dir| {
-                                        let git_store = self.project.read(cx).git_store().read(cx);
-                                        git_store.repositories().values()
-                                            .filter_map(|repo| {
-                                                let repo = repo.read(cx);
-                                                let repo_path = &repo.work_directory_abs_path;
-                                                if working_dir.starts_with(repo_path.as_ref()) {
-                                                    let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
-                                                    let head_sha = repo.head_commit.as_ref().map(|c| c.sha.clone());
-                                                    let head_tags = repo.head_tags.clone();
-                                                    let browser_url = repo.remote_origin_url.as_deref()
-                                                        .and_then(remote_url_to_browser_url);
-                                                    let (lines_added, lines_deleted) = repo.cached_status()
-                                                        .fold((0u32, 0u32), |(added, deleted), entry| {
-                                                            if let Some(stat) = &entry.diff_stat {
-                                                                (added + stat.added, deleted + stat.deleted)
-                                                            } else {
-                                                                (added, deleted)
-                                                            }
-                                                        });
-                                                    Some((repo_path.clone(), branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .max_by_key(|(repo_path, _, _, _, _, _, _)| repo_path.clone())
-                                            .map(|(_, branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted)| (branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
-                                    });
-
-                                    let entity_id = arena_entity.entity_id();
-                                    let prs = self.pr_info.get(&entity_id);
-                                    let multiple_prs = prs.map_or(false, |prs| prs.len() > 1);
-                                    let tooltip_branch = git_info.as_ref()
-                                        .and_then(|(branch, _, _, _, _, _)| branch.clone());
-
-                                    let mut pr_rows: Vec<(AnyElement, Option<AnyElement>)> = Vec::new();
-                                    for pr in prs.map(|prs| prs.as_slice()).unwrap_or_default() {
-                                        let is_pr_merged = matches!(pr.status, PrStatus::Merged);
-
-                                        let ci_info = self.ci_status.get(&(entity_id, pr.number));
-                                        let ci_icon_element = if is_pr_merged {
-                                            None
-                                        } else {
-                                            ci_info.map(|ci| {
-                                                let (icon, color) = match &ci.status {
-                                                    CiStatus::AllPassed => (IconName::Check, status_colors.success),
-                                                    CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
-                                                    CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
-                                                    CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
-                                                };
-                                                Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
-                                            })
-                                        };
-
-                                        let tooltip_pr = pr.clone();
-                                        let tooltip_ci = ci_info.cloned();
-                                        let tooltip_branch = tooltip_branch.clone();
-
-                                        let pr_color = match pr.status {
-                                            PrStatus::Draft => colors.text_muted,
-                                            PrStatus::Open => status_colors.success,
-                                            // No semantic purple in StatusColors; matches GitHub's merge color
-                                            PrStatus::Merged => hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
-                                            PrStatus::Closed => status_colors.error,
-                                            PrStatus::Conflicted => status_colors.warning,
-                                        };
-                                        let pr_icon = match pr.status {
-                                            PrStatus::Draft | PrStatus::Open => IconName::GitPullRequest,
-                                            PrStatus::Merged => IconName::GitGraph,
-                                            PrStatus::Closed => IconName::GitPullRequestClosed,
-                                            PrStatus::Conflicted => IconName::GitMergeConflict,
-                                        };
-                                        let url = pr.html_url.clone();
-                                        let pr_el = h_flex()
-                                            .id(SharedString::from(format!(
-                                                "arena-pr-{}-{}",
-                                                arena.id, pr.number
-                                            )))
-                                            .gap_1()
-                                            .items_center()
-                                            .px_1()
-                                            .rounded_sm()
-                                            .when(is_active, |d| {
-                                                d.cursor_pointer()
-                                                    .hover(|d| d.bg(colors.element_hover))
-                                            })
-                                            .child(
-                                                Icon::new(pr_icon)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Custom(pr_color)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(colors.text_muted)
-                                                    .child(format!("#{}", pr.number)),
-                                            )
-                                            .when_some(ci_icon_element, |d, icon| d.child(icon))
-                                            .when(multiple_prs, |d| {
-                                                d.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(colors.text_muted)
-                                                        .max_w_20()
-                                                        .truncate()
-                                                        .child(pr.base_ref.clone()),
-                                                )
-                                            })
-                                            .tooltip(Tooltip::element({
-                                                move |_window, cx| {
-                                                    render_pr_tooltip(
-                                                        &tooltip_pr,
-                                                        tooltip_ci.as_ref(),
-                                                        tooltip_branch.as_deref(),
-                                                        cx,
-                                                    )
-                                                }
-                                            }))
-                                            .when(is_active, |d| {
-                                                d.on_click(cx.listener({
-                                                    let url = url.clone();
-                                                    move |_this, _event: &ClickEvent, _window, cx| {
-                                                        cx.stop_propagation();
-                                                        cx.open_url(&url);
-                                                    }
-                                                }))
-                                            })
-                                            .into_any_element();
-
-                                        let review_el = if is_pr_merged {
-                                            None
-                                        } else {
-                                            match &pr.review_decision {
-                                                Some(ReviewDecision::Approved) => {
-                                                    Some((IconName::Check, status_colors.success, None))
-                                                }
-                                                Some(ReviewDecision::ChangesRequested) => {
-                                                    Some((IconName::Circle, status_colors.error, None))
-                                                }
-                                                Some(ReviewDecision::ReviewRequired) => {
-                                                    Some((IconName::Circle, status_colors.warning, None))
-                                                }
-                                                None if pr.review_count > 0 => {
-                                                    Some((IconName::Eye, colors.text_muted, Some(pr.review_count.to_string())))
-                                                }
-                                                None => None,
-                                            }
-                                            .map(|(review_icon, review_color, review_label)| {
-                                                let tooltip_reviews = pr.reviews.clone();
-                                                let tooltip_head_sha = pr.head_sha.clone();
-                                                h_flex()
-                                                    .id(SharedString::from(format!(
-                                                        "arena-review-{}-{}",
-                                                        arena.id, pr.number
-                                                    )))
-                                                    .gap_0p5()
-                                                    .items_center()
-                                                    .px_1()
-                                                    .rounded_sm()
-                                                    .when(is_active, |d| {
-                                                        d.cursor_pointer()
-                                                            .hover(|d| d.bg(colors.element_hover))
-                                                    })
-                                                    .child(
-                                                        Icon::new(review_icon)
-                                                            .size(IconSize::Small)
-                                                            .color(Color::Custom(review_color)),
-                                                    )
-                                                    .when_some(review_label, |d, label| {
-                                                        d.child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(colors.text_muted)
-                                                                .child(label),
-                                                        )
-                                                    })
-                                                    .tooltip(Tooltip::element(move |_window, cx| {
-                                                        render_review_tooltip(
-                                                            &tooltip_reviews,
-                                                            &tooltip_head_sha,
-                                                            cx,
-                                                        )
-                                                    }))
-                                                    .when(is_active, |d| {
-                                                        d.on_click(cx.listener(
-                                                            move |_this, _event: &ClickEvent, _window, cx| {
-                                                                cx.stop_propagation();
-                                                                cx.open_url(&url);
-                                                            },
-                                                        ))
-                                                    })
-                                                    .into_any_element()
-                                            })
-                                        };
-
-                                        pr_rows.push((pr_el, review_el));
-                                    }
-                                    let mut pr_rows = pr_rows.into_iter();
-                                    let first_pr_row = pr_rows.next();
-                                    let extra_pr_rows: Vec<_> = pr_rows.collect();
-
-                                    let project_url = git_info.as_ref()
-                                        .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
-
-                                    div()
-                                        .id(("arena", arena.id))
-                                        .px_2()
-                                        .py_1()
-                                        .mx_1()
-                                        .my_px()
-                                        .rounded_md()
-                                        .text_color(colors.text)
-                                        .cursor_pointer()
-                                        .when(is_active, |d| d.bg(colors.element_selected))
-                                        .when(!is_active, |d: Stateful<Div>| {
-                                            d.hover(|d| d.bg(colors.element_hover))
-                                        })
-                                        .child({
-                                            let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
-                                            let permission_infos = self.collect_permission_terminal_infos(arena_entity, cx);
-                                            let running_infos = self.collect_running_terminal_infos(arena_entity, cx);
-                                            let ready_infos = self.collect_ready_terminal_infos(arena_entity, cx);
-                                            let busy_infos = self.collect_busy_terminal_infos(arena_entity, cx);
-                                            let has_pills = !permission_infos.is_empty()
-                                                || !running_infos.is_empty()
-                                                || !ready_infos.is_empty()
-                                                || !busy_infos.is_empty();
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .justify_between()
-                                                .text_size(rems(0.9375))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .when(is_renaming, |d| d.child(self.rename_editor.clone()))
-                                                .when(!is_renaming, |d| {
-                                                    if is_active {
-                                                        let arena_for_rename = arena_entity.clone();
-                                                        d.child(
-                                                            div()
-                                                                .id(("arena-name", arena.id))
-                                                                .cursor_pointer()
-                                                                .rounded_sm()
-                                                                .hover(|d| d.bg(colors.element_hover))
-                                                                .child(arena.name.clone())
-                                                                .on_click(cx.listener(
-                                                                    move |this, _event: &ClickEvent, window, cx| {
-                                                                        cx.stop_propagation();
-                                                                        this.start_rename_arena(
-                                                                            arena_for_rename.clone(),
-                                                                            window,
-                                                                            cx,
-                                                                        );
-                                                                    },
-                                                                ))
-                                                        )
-                                                    } else {
-                                                        d.child(arena.name.clone())
-                                                    }
-                                                })
-                                                .when(has_pills, |d| {
-                                                    d.child(
-                                                        h_flex()
-                                                            .gap_0p5()
-                                                            .when(!permission_infos.is_empty(), |d| {
-                                                                let entries = permission_infos.clone();
-                                                                let tooltip_entries = entries.clone();
-                                                                d.child(
-                                                                    render_arena_pill(
-                                                                        ("arena-permission-badge", arena.id),
-                                                                        entries.len(),
-                                                                        status_colors.warning,
-                                                                        colors.surface_background,
-                                                                    )
-                                                                    .cursor_pointer()
-                                                                    .tooltip(Tooltip::element(move |_window, cx| {
-                                                                        render_badge_tooltip(&tooltip_entries, cx)
-                                                                    }))
-                                                                    .on_click(cx.listener(
-                                                                        move |this, event: &ClickEvent, window, cx| {
-                                                                            cx.stop_propagation();
-                                                                            this.switch_arena(i, window, cx);
-                                                                            this.deploy_badge_menu(
-                                                                                i, entries.clone(), event.position(), window, cx,
-                                                                            );
-                                                                        },
-                                                                    ))
-                                                                )
-                                                            })
-                                                            .when(!running_infos.is_empty(), |d| {
-                                                                let entries = running_infos.clone();
-                                                                let tooltip_entries = entries.clone();
-                                                                d.child(
-                                                                    render_arena_pill(
-                                                                        ("arena-running-badge", arena.id),
-                                                                        entries.len(),
-                                                                        status_colors.success,
-                                                                        colors.surface_background,
-                                                                    )
-                                                                    .cursor_pointer()
-                                                                    .tooltip(Tooltip::element(move |_window, cx| {
-                                                                        render_badge_tooltip(&tooltip_entries, cx)
-                                                                    }))
-                                                                    .on_click(cx.listener(
-                                                                        move |this, event: &ClickEvent, window, cx| {
-                                                                            cx.stop_propagation();
-                                                                            this.switch_arena(i, window, cx);
-                                                                            this.deploy_badge_menu(
-                                                                                i, entries.clone(), event.position(), window, cx,
-                                                                            );
-                                                                        },
-                                                                    ))
-                                                                )
-                                                            })
-                                                            .when(!ready_infos.is_empty(), |d| {
-                                                                let entries = ready_infos.clone();
-                                                                let tooltip_entries = entries.clone();
-                                                                d.child(
-                                                                    render_arena_pill(
-                                                                        ("arena-ready-badge", arena.id),
-                                                                        entries.len(),
-                                                                        colors.text_accent,
-                                                                        colors.surface_background,
-                                                                    )
-                                                                    .cursor_pointer()
-                                                                    .tooltip(Tooltip::element(move |_window, cx| {
-                                                                        render_badge_tooltip(&tooltip_entries, cx)
-                                                                    }))
-                                                                    .on_click(cx.listener(
-                                                                        move |this, event: &ClickEvent, window, cx| {
-                                                                            cx.stop_propagation();
-                                                                            this.switch_arena(i, window, cx);
-                                                                            this.deploy_badge_menu(
-                                                                                i, entries.clone(), event.position(), window, cx,
-                                                                            );
-                                                                        },
-                                                                    ))
-                                                                )
-                                                            })
-                                                            .when(!busy_infos.is_empty(), |d| {
-                                                                let entries = busy_infos.clone();
-                                                                let tooltip_entries = entries.clone();
-                                                                d.child(
-                                                                    render_arena_pill(
-                                                                        ("arena-busy-badge", arena.id),
-                                                                        entries.len(),
-                                                                        colors.text,
-                                                                        colors.surface_background,
-                                                                    )
-                                                                    .cursor_pointer()
-                                                                    .tooltip(Tooltip::element(move |_window, cx| {
-                                                                        render_badge_tooltip(&tooltip_entries, cx)
-                                                                    }))
-                                                                    .on_click(cx.listener(
-                                                                        move |this, event: &ClickEvent, window, cx| {
-                                                                            cx.stop_propagation();
-                                                                            this.switch_arena(i, window, cx);
-                                                                            this.deploy_badge_menu(
-                                                                                i, entries.clone(), event.position(), window, cx,
-                                                                            );
-                                                                        },
-                                                                    ))
-                                                                )
-                                                            })
-                                                    )
-                                                })
-                                        })
-                                        // Row 2: branch/tag/sha (left) + diff stats (right)
-                                        .child({
-                                            let (ref_icon, ref_label): (Option<IconName>, SharedString) =
-                                                if let Some((Some(branch), _, _, _, _, _)) = git_info.as_ref() {
-                                                    (Some(IconName::GitBranch), branch.clone().into())
-                                                } else if let Some((None, _, head_tags, _, _, _)) = git_info.as_ref() {
-                                                    if let Some(tag) = head_tags.first() {
-                                                        (Some(IconName::Tag), tag.clone().into())
-                                                    } else if let Some((_, Some(sha), _, _, _, _)) = git_info.as_ref() {
-                                                        (None, sha.chars().take(8).collect::<String>().into())
-                                                    } else {
-                                                        (None, SharedString::default())
-                                                    }
-                                                } else {
-                                                    (None, SharedString::default())
-                                                };
-                                            let diff_stats = git_info.as_ref()
-                                                .map(|(_, _, _, _, added, deleted)| (*added, *deleted));
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .text_xs()
-                                                .min_h(px(16.0))
-                                                .when(!ref_label.is_empty(), |d| {
-                                                    d.child(
-                                                        h_flex()
-                                                            .min_w_0()
-                                                            .flex_shrink()
-                                                            .items_center()
-                                                            .gap_0p5()
-                                                            .text_color(colors.text_muted)
-                                                            .when_some(ref_icon, |d, icon| {
-                                                                d.child(
-                                                                    Icon::new(icon)
-                                                                        .size(IconSize::XSmall)
-                                                                        .color(Color::Muted),
-                                                                )
-                                                            })
-                                                            .child(
-                                                                div().min_w_0().truncate().child(ref_label),
-                                                            ),
-                                                    )
-                                                })
-                                                .child(div().flex_grow())
-                                                .when_some(diff_stats, |d, (added, deleted)| {
-                                                    d.child(
-                                                        h_flex()
-                                                            .flex_shrink_0()
-                                                            .gap_1()
-                                                            .when(added > 0, |d| {
-                                                                d.child(
-                                                                    div()
-                                                                        .text_color(status_colors.created)
-                                                                        .child(format!("+{added}")),
-                                                                )
-                                                            })
-                                                            .when(deleted > 0, |d| {
-                                                                d.child(
-                                                                    div()
-                                                                        .text_color(status_colors.deleted)
-                                                                        .child(format!("-{deleted}")),
-                                                                )
-                                                            }),
-                                                    )
-                                                })
-                                        })
-                                        // Row 3: directory name (if different from arena name) + PR element (right)
-                                        .child({
-                                            let show_dir = display_path.as_ref()
-                                                .map_or(false, |path| path != &arena.name);
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .text_xs()
-                                                .min_h(px(16.0))
-                                                .when(show_dir, |d| {
-                                                    let path = display_path.as_ref().cloned().unwrap_or_default();
-                                                    d.child(
-                                                        Icon::new(IconName::Folder)
-                                                            .size(IconSize::XSmall)
-                                                            .color(Color::Muted),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_color(colors.text_muted)
-                                                            .child(path),
-                                                    )
-                                                })
-                                                .when(first_pr_row.is_some(), |d| {
-                                                    d.child(div().flex_grow())
-                                                })
-                                                .when_some(first_pr_row, |d, (pr_el, review_el)| {
-                                                    d.child(pr_el).children(review_el)
-                                                })
-                                        })
-                                        // Rows 4..N: one row per additional PR when the
-                                        // branch has several (e.g. develop + master bases).
-                                        .children(extra_pr_rows.into_iter().map(|(pr_el, review_el)| {
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .text_xs()
-                                                .min_h(px(16.0))
-                                                .child(div().flex_grow())
-                                                .child(pr_el)
-                                                .children(review_el)
-                                        }))
-                                        .on_click(cx.listener(
-                                            move |this, _, window, cx| {
-                                                this.switch_arena(i, window, cx)
-                                            },
-                                        ))
-                                        .on_mouse_down(MouseButton::Right, {
-                                            let arena_entity = arena_entity.clone();
-                                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                                this.deploy_arena_context_menu(
-                                                    arena_entity.clone(),
-                                                    project_url.clone(),
-                                                    event.position,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })
-                                        })
-                                },
-                            )),
-                    )
-                    .child(div().p_2().child({
-                        let agentium_weak = cx.entity().downgrade();
-                        let fs = self.app_state.fs.clone();
-                        PopoverMenu::new("new-arena-menu")
-                            .menu(move |window, cx| {
-                                Some(cx.new(|cx| {
-                                    AgentiumRecentProjects::new(
-                                        agentium_weak.clone(),
-                                        fs.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                }))
-                            })
-                            .trigger(
-                                Button::new("add-workspace", "+ New Arena")
-                                    .full_width()
-                                    .style(ButtonStyle::Subtle),
+                            .children(
+                                (0..self.arenas.len()).map(|i| self.render_arena_row(i, cx)),
                             )
-                            .anchor(Anchor::BottomLeft)
-                    }))
+                            .into_any_element()
+                    } else {
+                        self.render_task_list(cx)
+                    })
+                    .child(if self.sidebar_tab == SidebarTab::Repositories {
+                        div()
+                            .p_2()
+                            .child({
+                                let agentium_weak = cx.entity().downgrade();
+                                let fs = self.app_state.fs.clone();
+                                PopoverMenu::new("new-arena-menu")
+                                    .menu(move |window, cx| {
+                                        Some(cx.new(|cx| {
+                                            AgentiumRecentProjects::new(
+                                                agentium_weak.clone(),
+                                                fs.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        }))
+                                    })
+                                    .trigger(
+                                        Button::new("add-workspace", "+ New Arena")
+                                            .full_width()
+                                            .style(ButtonStyle::Subtle),
+                                    )
+                                    .anchor(Anchor::BottomLeft)
+                            })
+                            .into_any_element()
+                    } else {
+                        div()
+                            .p_2()
+                            .child(
+                                Button::new("new-task", "+ New Task")
+                                    .full_width()
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_task(None, window, cx);
+                                    })),
+                            )
+                            .into_any_element()
+                    })
                     .when_some(self.rate_limits.as_ref(), |sidebar, rate_limits| {
                         let is_stale =
                             rate_limits.received_at.elapsed() > Duration::from_secs(3600);
