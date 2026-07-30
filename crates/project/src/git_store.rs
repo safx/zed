@@ -12025,14 +12025,13 @@ async fn compute_snapshot(
     let head_commit_future = {
         let backend = backend.clone();
         async move {
-            // `has_head` is derived from the HEAD sha rather than from `head_commit`, because
-            // `show` can fail (leaving `head_commit` as None) while HEAD does exist. Diff
-            // stats are still computable in that case.
-            let head_sha = backend.head_sha().await;
-            let has_head = head_sha.is_some();
-            let head_commit = match head_sha {
-                Some(sha) => backend.show(sha).await.ok(),
-                None => None,
+            let head_commit = backend.show("HEAD".to_string()).await.ok();
+            // `show` can fail while HEAD does exist, and diff stats are still computable in
+            // that case, so fall back to resolving the sha instead of treating a missing
+            // `head_commit` as a missing HEAD.
+            let has_head = match &head_commit {
+                Some(_) => true,
+                None => backend.head_sha().await.is_some(),
             };
             (head_commit, has_head)
         }
