@@ -258,6 +258,7 @@ pkg-config = "0.3.22"
 
 [dev-dependencies]
 call = { workspace = true, features = ["test-support"] }
+db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["input-latency-histogram", "test-support"] }
 image_viewer = { workspace = true, features = ["test-support"] }
