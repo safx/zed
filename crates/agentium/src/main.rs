@@ -1550,6 +1550,13 @@ fn main() {
                         KeyBinding::new("j", workspace::SplitDown::default(), Some("AgentiumSplitMenu")),
                         KeyBinding::new("k", workspace::SplitUp::default(), Some("AgentiumSplitMenu")),
                         KeyBinding::new("l", workspace::SplitRight::default(), Some("AgentiumSplitMenu")),
+                        // These live here rather than in assets/keymaps/default-macos.json
+                        // because Zed loads that keymap strictly and would fail on actions
+                        // that only exist in this binary.
+                        KeyBinding::new("left", agentium::file_browser_view::CollapseSelectedEntry, Some("FileBrowser")),
+                        KeyBinding::new("right", agentium::file_browser_view::ExpandSelectedEntry, Some("FileBrowser")),
+                        KeyBinding::new("enter", agentium::file_browser_view::ConfirmEntry, Some("FileBrowser")),
+                        KeyBinding::new("tab", agentium::file_browser_view::SwitchPane, Some("FileBrowser")),
                     ]);
 
                     let worktree_path = initial_workspace_path;
