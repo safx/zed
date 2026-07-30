@@ -724,7 +724,7 @@ impl FileBrowserView {
         };
 
         let mut candidate = dest_dir.clone();
-        candidate.push(RelPath::unix(file_name).ok()?);
+        candidate.push(RelPath::from_unix_str(file_name).ok()?);
 
         if worktree.entry_for_path(&candidate).is_none() {
             return Some(Arc::from(candidate.as_ref()));
@@ -741,7 +741,7 @@ impl FileBrowserView {
                 new_name.push_str(ext);
             }
             candidate = dest_dir.clone();
-            candidate.push(RelPath::unix(&new_name).ok()?);
+            candidate.push(RelPath::from_unix_str(&new_name).ok()?);
             if worktree.entry_for_path(&candidate).is_none() {
                 return Some(Arc::from(candidate.as_ref()));
             }
@@ -774,9 +774,10 @@ impl FileBrowserView {
                 return;
             }
             this.update(cx, |this, cx| {
-                if let Some(task) = this.project.update(cx, |project, cx| {
-                    project.delete_entry(entry_id, true, cx)
-                }) {
+                if let Some(task) = this
+                    .project
+                    .update(cx, |project, cx| project.trash_entry(entry_id, cx))
+                {
                     task.detach_and_log_err(cx);
                 }
             })
