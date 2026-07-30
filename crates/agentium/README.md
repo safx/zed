@@ -14,11 +14,11 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **File browser** — navigate project files with expand/collapse, open files for editing
 - **Git graph** — visualize git commit history
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
-- **GitHub PR tracking** — display every PR of the arena's branch (e.g. one to `develop` and one to `master`) with status icons (draft/open/merged/closed/conflicted) and base branch names, clickable to open in browser. Requires `gh` CLI.
-- **CI status** — poll GitHub Actions check status per PR with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
+- **PR tracking** — display every PR of the arena's branch (e.g. one to `develop` and one to `master`) with status icons (draft/open/merged/closed/conflicted) and base branch names, clickable to open in browser. GitHub repositories require the `gh` CLI. Backlog Git repositories (detected from the origin remote) require the [`bee`](https://nulab.github.io/bee/) CLI; their PRs are discovered through Backlog issues — the issue key in the branch name (e.g. `PROJ-123/fix-thing`) or issues registered on a task containing the arena — and show open/merged/closed states (Backlog has no draft, review, or CI data)
+- **CI status** — poll GitHub Actions check status per PR (GitHub PRs only) with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
 - **Task board** — a Tasks sidebar tab with a priority-ordered task list; each task bundles issues (GitHub and Backlog) and arenas (worktrees), so multi-repository work is grouped under one task. Persisted to `~/Library/Application Support/Agentium/board.json`; closed worktrees reopen as arenas with one click. Issue titles/states are fetched via the `gh` and [`bee`](https://nulab.github.io/bee/) CLIs (both optional)
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
-- **Claude Code session ↔ PR tracking** — persist a many-to-many mapping between Claude Code session IDs and GitHub PR numbers per project (`~/Library/Application Support/Agentium/pr.json`), queryable via CLI
+- **Claude Code session ↔ PR tracking** — persist a many-to-many mapping between Claude Code session IDs and PR numbers per project (`~/Library/Application Support/Agentium/pr.json`), queryable via CLI. PR numbers are GitHub or Backlog depending on the project's origin remote
 - **Running-command badge** — sidebar pill (theme-inverted white/black) shows the count of terminals in each arena currently running a non-Claude command (e.g. `cargo build`, `sleep 30`)
 
 ## Keyboard Shortcuts
@@ -128,7 +128,7 @@ Claude Code statusline pass-through. Reads JSON from stdin, writes it back to st
 
 ### `agentium claude sessions`
 
-List Claude Code sessions linked to GitHub PRs for the current project. The project is detected via `git rev-parse --show-toplevel` (canonicalized).
+List Claude Code sessions linked to PRs for the current project (GitHub or Backlog Git, per the project's origin remote). The project is detected via `git rev-parse --show-toplevel` (canonicalized).
 
 ```
 agentium claude sessions [--pr <NUMBER>] [--all-worktrees|-a]
