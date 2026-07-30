@@ -169,6 +169,12 @@ struct ReviewEntry {
     submitted_at: SharedString,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PrProvider {
+    GitHub,
+    Backlog,
+}
+
 #[derive(Clone, Debug)]
 struct PrInfo {
     number: u32,
@@ -180,6 +186,7 @@ struct PrInfo {
     head_sha: SharedString,
     reviews: Vec<ReviewEntry>,
     base_ref: SharedString,
+    provider: PrProvider,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -269,6 +276,13 @@ pub struct AgentiumApp {
     board: board::Board,
     _board_write_task: Option<Task<()>>,
     bee_available: bool,
+    // Backlog issue key -> numeric issue id, needed by `bee pr list --issue`.
+    // Ids are immutable, so entries are never invalidated.
+    backlog_issue_ids: HashMap<String, u64>,
+    // Keys that Backlog reported as nonexistent (deleted issues, false-positive
+    // branch segments like FIX-123); skipped on later polls to avoid re-resolving
+    // every cycle. Transient failures are NOT recorded here and retry naturally.
+    failed_backlog_issue_keys: HashSet<String>,
     _issue_fetch_task: Option<Task<()>>,
     sidebar_tab: SidebarTab,
     collapsed_tasks: HashSet<Uuid>,
@@ -312,7 +326,7 @@ impl AgentiumApp {
 
                     this.pr_info.remove(&entity_id);
                     this.ci_status.retain(|(id, _), _| *id != entity_id);
-                    if this.gh_available {
+                    if this.gh_available || this.bee_available {
                         this.fetch_pr_for_arena(entity_id, cx);
                     }
                 }
@@ -348,7 +362,7 @@ impl AgentiumApp {
         let window_activation_subscription =
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    if this.gh_available
+                    if (this.gh_available || this.bee_available)
                         && this._pr_poll_task.is_none()
                         && !this.pr_polling_timed_out
                     {
@@ -391,12 +405,12 @@ impl AgentiumApp {
             this.update(cx, |this, cx| {
                 this.gh_available = gh_available;
                 this.bee_available = bee_available;
-                if gh_available {
-                    this.start_pr_polling(cx);
-                    this.start_ci_polling(cx);
-                }
                 if gh_available || bee_available {
+                    this.start_pr_polling(cx);
                     this.fetch_issue_metadata(true, cx);
+                }
+                if gh_available {
+                    this.start_ci_polling(cx);
                 }
             })
             .ok();
@@ -583,6 +597,8 @@ impl AgentiumApp {
             board: board::load_board(),
             _board_write_task: None,
             bee_available: false,
+            backlog_issue_ids: HashMap::new(),
+            failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
             sidebar_tab: SidebarTab::Repositories,
             collapsed_tasks: HashSet::new(),
@@ -665,7 +681,7 @@ impl AgentiumApp {
         arena_entity.update(cx, |arena, cx| {
             arena.activate_context(cx);
         });
-        if self.gh_available {
+        if self.gh_available || self.bee_available {
             self.fetch_pr_for_arena(arena_entity.entity_id(), cx);
         }
         self.rebuild_board_cache(cx);
@@ -680,7 +696,7 @@ impl AgentiumApp {
             self.arenas[index].update(cx, |arena, cx| {
                 arena.activate_context(cx);
             });
-            if self.gh_available {
+            if self.gh_available || self.bee_available {
                 let entity_id = self.arenas[index].entity_id();
                 let pr_stale = self
                     .pr_last_checked
@@ -695,9 +711,11 @@ impl AgentiumApp {
                     .map(|prs| {
                         prs.iter()
                             .filter(|pr| {
-                                self.ci_last_checked
-                                    .get(&(entity_id, pr.number))
-                                    .map_or(true, |t| t.elapsed() > Duration::from_secs(60))
+                                pr.provider == PrProvider::GitHub
+                                    && self
+                                        .ci_last_checked
+                                        .get(&(entity_id, pr.number))
+                                        .map_or(true, |t| t.elapsed() > Duration::from_secs(60))
                             })
                             .map(|pr| pr.number)
                             .collect()
@@ -726,17 +744,18 @@ impl AgentiumApp {
                         this.active_arena().and_then(|arena| {
                             let arena_ref = arena.read(cx);
                             let working_dir = arena_ref.working_directory.clone()?;
-                            Some((arena.entity_id(), working_dir))
+                            let entity_id = arena.entity_id();
+                            Some((entity_id, working_dir, this.pr_fetch_context(entity_id, cx)))
                         })
                     })
                     .ok()
                     .flatten();
 
-                if let Some((entity_id, working_dir)) = fetch_info {
+                if let Some((entity_id, working_dir, context)) = fetch_info {
                     let start = Instant::now();
                     let result = cx
                         .background_executor()
-                        .spawn(async move { fetch_pr_list(&working_dir).await })
+                        .spawn(async move { fetch_pr_list(&working_dir, context).await })
                         .await;
                     let elapsed = start.elapsed();
 
@@ -768,6 +787,40 @@ impl AgentiumApp {
         }));
     }
 
+    /// Snapshot the inputs `fetch_pr_list` needs so the background fetch never
+    /// touches app state.
+    fn pr_fetch_context(&self, entity_id: EntityId, cx: &App) -> PrFetchContext {
+        let mut task_issue_keys: Vec<String> = Vec::new();
+        if self.bee_available {
+            if let Some(index) = self
+                .arenas
+                .iter()
+                .position(|arena| arena.entity_id() == entity_id)
+            {
+                for task_id in self.tasks_containing_arena(index, cx) {
+                    let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id)
+                    else {
+                        continue;
+                    };
+                    for issue in &task.issues {
+                        if let board::IssueRef::Backlog { issue_key } = &issue.reference {
+                            if !task_issue_keys.contains(issue_key) {
+                                task_issue_keys.push(issue_key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        PrFetchContext {
+            gh_available: self.gh_available,
+            bee_available: self.bee_available,
+            task_issue_keys,
+            known_issue_ids: self.backlog_issue_ids.clone(),
+            failed_issue_keys: self.failed_backlog_issue_keys.clone(),
+        }
+    }
+
     fn fetch_pr_for_arena(&mut self, entity_id: EntityId, cx: &mut Context<Self>) {
         let working_dir = self
             .arenas
@@ -777,11 +830,12 @@ impl AgentiumApp {
         let Some(working_dir) = working_dir else {
             return;
         };
+        let context = self.pr_fetch_context(entity_id, cx);
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_pr_list(&working_dir).await })
+                .spawn(async move { fetch_pr_list(&working_dir, context).await })
                 .await;
             this.update(cx, |this, cx| {
                 this.apply_pr_fetch_result(entity_id, result, cx);
@@ -794,35 +848,45 @@ impl AgentiumApp {
     fn apply_pr_fetch_result(
         &mut self,
         entity_id: EntityId,
-        result: anyhow::Result<Vec<PrInfo>>,
+        result: anyhow::Result<PrFetchOutcome>,
         cx: &mut Context<Self>,
     ) {
         self.pr_last_checked.insert(entity_id, Instant::now());
         match result {
-            Ok(list) if !list.is_empty() => {
-                let existing: HashSet<u32> = self
-                    .pr_info
-                    .get(&entity_id)
-                    .map(|prs| prs.iter().map(|pr| pr.number).collect())
-                    .unwrap_or_default();
-                let new_numbers: Vec<u32> = list
-                    .iter()
-                    .map(|pr| pr.number)
-                    .filter(|number| !existing.contains(number))
-                    .collect();
-                self.pr_info.insert(entity_id, list);
-                // Chain a CI fetch for PRs that just appeared so their status
-                // shows up immediately instead of on the next CI polling cycle.
-                if !self.ci_polling_timed_out {
-                    for number in new_numbers {
-                        self.fetch_ci_for_arena(entity_id, number, cx);
+            Ok(outcome) => {
+                self.backlog_issue_ids.extend(outcome.resolved_backlog_ids);
+                self.failed_backlog_issue_keys
+                    .extend(outcome.failed_backlog_keys);
+                if outcome.prs.is_empty() {
+                    self.pr_info.remove(&entity_id);
+                } else {
+                    let existing: HashSet<u32> = self
+                        .pr_info
+                        .get(&entity_id)
+                        .map(|prs| prs.iter().map(|pr| pr.number).collect())
+                        .unwrap_or_default();
+                    // Chain a CI fetch for PRs that just appeared so their status
+                    // shows up immediately instead of on the next CI polling cycle.
+                    // Backlog has no CI API, so only GitHub PRs are chained.
+                    let new_numbers: Vec<u32> = outcome
+                        .prs
+                        .iter()
+                        .filter(|pr| pr.provider == PrProvider::GitHub)
+                        .map(|pr| pr.number)
+                        .filter(|number| !existing.contains(number))
+                        .collect();
+                    self.pr_info.insert(entity_id, outcome.prs);
+                    if !self.ci_polling_timed_out {
+                        for number in new_numbers {
+                            self.fetch_ci_for_arena(entity_id, number, cx);
+                        }
+                    }
+                    if self.pr_dirty.contains(&entity_id) {
+                        self.save_pr_session_mapping(entity_id, cx);
                     }
                 }
-                if self.pr_dirty.contains(&entity_id) {
-                    self.save_pr_session_mapping(entity_id, cx);
-                }
             }
-            Ok(_) | Err(_) => {
+            Err(_) => {
                 self.pr_info.remove(&entity_id);
             }
         }
@@ -842,7 +906,10 @@ impl AgentiumApp {
                             };
                             let interval = this.compute_ci_poll_interval(entity_id, cx);
                             for pr in prs {
-                                if matches!(pr.status, PrStatus::Merged) {
+                                // Backlog has no CI API.
+                                if pr.provider != PrProvider::GitHub
+                                    || matches!(pr.status, PrStatus::Merged)
+                                {
                                     continue;
                                 }
                                 let pr_number = pr.number;
@@ -916,7 +983,10 @@ impl AgentiumApp {
                             };
                             let interval = this.compute_ci_poll_interval(entity_id, cx);
                             for pr in prs {
-                                if matches!(pr.status, PrStatus::Merged) {
+                                // Backlog has no CI API.
+                                if pr.provider != PrProvider::GitHub
+                                    || matches!(pr.status, PrStatus::Merged)
+                                {
                                     continue;
                                 }
                                 let elapsed = this
@@ -1343,7 +1413,7 @@ impl AgentiumApp {
         self.sync_session_derived_state();
         self.notify_all_panes(cx);
 
-        if self.gh_available {
+        if self.gh_available || self.bee_available {
             if let Some(entity_id) = self.find_arena_entity_id_for_pids(&pids, cx) {
                 self.fetch_pr_for_arena(entity_id, cx);
             }
@@ -2080,6 +2150,12 @@ impl AgentiumApp {
                             continue;
                         }
                     };
+                    if let (board::IssueRef::Backlog { issue_key }, Some(id)) =
+                        (&reference, metadata.backlog_id)
+                    {
+                        this.backlog_issue_ids.insert(issue_key.clone(), id);
+                        this.failed_backlog_issue_keys.remove(issue_key);
+                    }
                     for task in &mut this.board.tasks {
                         for issue in &mut task.issues {
                             if issue.reference != reference {
@@ -2901,7 +2977,125 @@ fn write_pr_session_db(
     Ok(())
 }
 
-async fn fetch_pr_list(working_dir: &std::path::Path) -> anyhow::Result<Vec<PrInfo>> {
+/// Per-fetch inputs snapshotted on the main thread so the background fetch
+/// never touches app state.
+struct PrFetchContext {
+    gh_available: bool,
+    bee_available: bool,
+    // Backlog issue keys registered on tasks containing this arena.
+    task_issue_keys: Vec<String>,
+    known_issue_ids: HashMap<String, u64>,
+    failed_issue_keys: HashSet<String>,
+}
+
+#[derive(Default)]
+struct PrFetchOutcome {
+    prs: Vec<PrInfo>,
+    // Issue key -> id pairs resolved during this fetch, for the app-level cache.
+    resolved_backlog_ids: Vec<(String, u64)>,
+    // Keys Backlog reported as nonexistent, for the negative cache.
+    failed_backlog_keys: Vec<String>,
+}
+
+struct BacklogRemote {
+    web_host: String,
+    project: String,
+    repo: String,
+}
+
+fn parse_backlog_remote(url: &str) -> Option<BacklogRemote> {
+    let url = url.trim();
+    let (host, path) = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        let (host, path) = rest.split_once('/')?;
+        (host, path.strip_prefix("git/")?)
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        let (host, path) = rest.split_once('/')?;
+        let host = host.rsplit_once('@').map(|(_, host)| host).unwrap_or(host);
+        (host, path)
+    } else if let Some((user_host, path)) = url.split_once(':') {
+        // scp-like syntax: nulab@nulab.git.backlog.jp:/PROJ/repo.git
+        let host = user_host
+            .rsplit_once('@')
+            .map(|(_, host)| host)
+            .unwrap_or(user_host);
+        (host, path.trim_start_matches('/'))
+    } else {
+        return None;
+    };
+
+    if !host.ends_with(".backlog.jp") && !host.ends_with(".backlog.com") {
+        return None;
+    }
+    // SSH remotes use a dedicated git host (nulab.git.backlog.jp); web URLs
+    // live on the space host (nulab.backlog.jp).
+    let web_host = host.replace(".git.backlog.", ".backlog.");
+
+    let mut segments = path.split('/');
+    let project = segments.next()?;
+    let repo = segments.next()?;
+    if project.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    Some(BacklogRemote {
+        web_host,
+        project: project.to_string(),
+        repo: repo.to_string(),
+    })
+}
+
+fn backlog_issue_keys_in_branch(branch: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for segment in branch.split('/') {
+        if board::is_backlog_issue_key(segment) && !keys.iter().any(|key| key == segment) {
+            keys.push(segment.to_string());
+        }
+    }
+    keys
+}
+
+async fn git_remote_url(working_dir: &std::path::Path) -> Option<String> {
+    let get_url = |remote: String| async move {
+        let output = smol::process::Command::new("git")
+            .current_dir(working_dir)
+            .args(&["remote", "get-url", &remote])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!url.is_empty()).then_some(url)
+    };
+
+    if let Some(url) = get_url("origin".to_string()).await {
+        return Some(url);
+    }
+    let output = smol::process::Command::new("git")
+        .current_dir(working_dir)
+        .args(&["remote"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let first = stdout.lines().next()?.trim().to_string();
+    if first.is_empty() {
+        return None;
+    }
+    get_url(first).await
+}
+
+async fn fetch_pr_list(
+    working_dir: &std::path::Path,
+    context: PrFetchContext,
+) -> anyhow::Result<PrFetchOutcome> {
     #[derive(serde::Deserialize)]
     struct GhPr {
         number: u32,
@@ -2936,6 +3130,20 @@ async fn fetch_pr_list(working_dir: &std::path::Path) -> anyhow::Result<Vec<PrIn
     } else {
         None
     };
+
+    if let Some(remote) = git_remote_url(working_dir)
+        .await
+        .as_deref()
+        .and_then(parse_backlog_remote)
+    {
+        if !context.bee_available {
+            return Ok(PrFetchOutcome::default());
+        }
+        return fetch_backlog_pr_list(branch, remote, context).await;
+    }
+    if !context.gh_available {
+        return Ok(PrFetchOutcome::default());
+    }
 
     let mut gh_prs: Vec<GhPr> = Vec::new();
     if let Some(branch) = branch {
@@ -2978,7 +3186,7 @@ async fn fetch_pr_list(working_dir: &std::path::Path) -> anyhow::Result<Vec<PrIn
             if !stderr.contains("no pull requests found") {
                 log::warn!("gh pr view failed: {stderr}");
             }
-            return Ok(Vec::new());
+            return Ok(PrFetchOutcome::default());
         }
         gh_prs = vec![serde_json::from_slice(&output.stdout)?];
     }
@@ -2995,7 +3203,7 @@ async fn fetch_pr_list(working_dir: &std::path::Path) -> anyhow::Result<Vec<PrIn
     )
     .await;
 
-    Ok(gh_prs
+    let prs = gh_prs
         .into_iter()
         .zip(reviews_per_pr)
         .map(|(pr, reviews)| {
@@ -3042,9 +3250,184 @@ async fn fetch_pr_list(working_dir: &std::path::Path) -> anyhow::Result<Vec<PrIn
                 head_sha: pr.head_ref_oid.into(),
                 reviews,
                 base_ref: pr.base_ref_name.into(),
+                provider: PrProvider::GitHub,
             }
         })
-        .collect())
+        .collect();
+    Ok(PrFetchOutcome {
+        prs,
+        ..PrFetchOutcome::default()
+    })
+}
+
+enum BacklogIssueIdError {
+    NoSuchIssue(String),
+    Other(anyhow::Error),
+}
+
+async fn resolve_backlog_issue_id(
+    issue_key: &str,
+    space_host: &str,
+) -> Result<u64, BacklogIssueIdError> {
+    // `-s` pins the space to the remote's host; bee's default space could
+    // otherwise resolve a same-named key from a different space.
+    let output = smol::process::Command::new("bee")
+        .args(&["issue", "view", issue_key, "--json", "id", "-s", space_host])
+        .output()
+        .await
+        .map_err(|error| BacklogIssueIdError::Other(error.into()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Nonexistent issues fail with `{"errors":[{"message":"No such issue. ..."}]}`
+        // on stderr; only those go to the negative cache so that transient
+        // failures (network, auth) retry on the next poll.
+        if stderr.contains("No such issue") || stderr.contains("No such project") {
+            return Err(BacklogIssueIdError::NoSuchIssue(stderr));
+        }
+        return Err(BacklogIssueIdError::Other(anyhow::anyhow!(
+            "bee issue view failed: {stderr}"
+        )));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| BacklogIssueIdError::Other(error.into()))?;
+    json["id"]
+        .as_u64()
+        .ok_or_else(|| BacklogIssueIdError::Other(anyhow::anyhow!("bee issue view returned no id")))
+}
+
+async fn fetch_backlog_pr_list(
+    branch: Option<String>,
+    remote: BacklogRemote,
+    context: PrFetchContext,
+) -> anyhow::Result<PrFetchOutcome> {
+    // Detached HEAD: Backlog has no equivalent of `gh pr view`'s branch resolution.
+    let Some(branch) = branch else {
+        return Ok(PrFetchOutcome::default());
+    };
+
+    let mut issue_keys = backlog_issue_keys_in_branch(&branch);
+    for key in &context.task_issue_keys {
+        if !issue_keys.contains(key) {
+            issue_keys.push(key.clone());
+        }
+    }
+
+    let mut issue_ids: Vec<u64> = Vec::new();
+    let mut unknown_keys: Vec<String> = Vec::new();
+    for key in issue_keys {
+        if let Some(id) = context.known_issue_ids.get(&key) {
+            issue_ids.push(*id);
+        } else if !context.failed_issue_keys.contains(&key) {
+            unknown_keys.push(key);
+        }
+    }
+
+    let resolutions = futures::future::join_all(
+        unknown_keys
+            .iter()
+            .map(|key| resolve_backlog_issue_id(key, &remote.web_host)),
+    )
+    .await;
+    let mut outcome = PrFetchOutcome::default();
+    for (key, resolution) in unknown_keys.into_iter().zip(resolutions) {
+        match resolution {
+            Ok(id) => {
+                issue_ids.push(id);
+                outcome.resolved_backlog_ids.push((key, id));
+            }
+            Err(BacklogIssueIdError::NoSuchIssue(message)) => {
+                log::warn!("backlog issue {key} does not exist, skipping: {message}");
+                outcome.failed_backlog_keys.push(key);
+            }
+            Err(BacklogIssueIdError::Other(error)) => {
+                log::warn!("failed to resolve backlog issue id for {key}: {error:#}");
+            }
+        }
+    }
+
+    if issue_ids.is_empty() {
+        return Ok(outcome);
+    }
+
+    // `bee pr list` returns PRs oldest-first and Backlog caps a page at 100
+    // entries, so an unfiltered listing would miss recent PRs in large repos.
+    // Filtering by issue id server-side keeps the result set complete; only an
+    // issue with more than 100 linked PRs could lose its newest ones.
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "list".into(),
+        "-p".into(),
+        remote.project.clone(),
+        "-R".into(),
+        remote.repo.clone(),
+        "-s".into(),
+        remote.web_host.clone(),
+        "--json".into(),
+        "number,summary,base,branch,status".into(),
+        "-L".into(),
+        "100".into(),
+    ];
+    for id in &issue_ids {
+        args.push("--issue".into());
+        args.push(id.to_string());
+    }
+
+    let output = smol::process::Command::new("bee").args(&args).output().await?;
+    if !output.status.success() {
+        log::warn!(
+            "bee pr list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(outcome);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BeePrStatus {
+        name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct BeePr {
+        number: u32,
+        summary: String,
+        base: String,
+        branch: String,
+        status: BeePrStatus,
+    }
+
+    let bee_prs: Vec<BeePr> = serde_json::from_slice(&output.stdout)?;
+    outcome.prs = bee_prs
+        .into_iter()
+        .filter(|pr| pr.branch == branch)
+        .map(|pr| {
+            let status = match pr.status.name.as_str() {
+                "Merged" => PrStatus::Merged,
+                "Closed" => PrStatus::Closed,
+                "Open" => PrStatus::Open,
+                other => {
+                    log::warn!("unknown backlog PR status {other:?}, treating as open");
+                    PrStatus::Open
+                }
+            };
+            PrInfo {
+                number: pr.number,
+                title: pr.summary.into(),
+                status,
+                html_url: format!(
+                    "https://{}/git/{}/{}/pullRequests/{}",
+                    remote.web_host, remote.project, remote.repo, pr.number
+                )
+                .into(),
+                review_decision: None,
+                review_count: 0,
+                head_sha: "".into(),
+                reviews: Vec::new(),
+                base_ref: pr.base.into(),
+                provider: PrProvider::Backlog,
+            }
+        })
+        .collect();
+    outcome.prs.sort_by_key(|pr| pr.number);
+    Ok(outcome)
 }
 
 /// Fetch per-reviewer data via the REST API (`gh api repos/{owner}/{repo}/pulls/{number}/reviews`).
@@ -3199,6 +3582,8 @@ struct IssueMetadata {
     title: Option<String>,
     state: Option<String>,
     url: Option<String>,
+    // Numeric Backlog issue id, needed by `bee pr list --issue`. None for GitHub.
+    backlog_id: Option<u64>,
 }
 
 async fn fetch_issue_metadata_for(reference: &board::IssueRef) -> anyhow::Result<IssueMetadata> {
@@ -3239,6 +3624,7 @@ async fn fetch_github_issue(repo: &str, number: u64) -> anyhow::Result<IssueMeta
         title: Some(issue.title),
         state: Some(issue.state.to_lowercase()),
         url: Some(issue.url),
+        backlog_id: None,
     })
 }
 
@@ -3257,6 +3643,7 @@ async fn fetch_backlog_issue(issue_key: &str) -> anyhow::Result<IssueMetadata> {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let title = json["summary"].as_str().map(String::from);
     let state = json["status"]["name"].as_str().map(String::from);
+    let backlog_id = json["id"].as_u64();
 
     // `-n` prints the issue URL instead of opening a browser.
     let url_output = smol::process::Command::new("bee")
@@ -3272,7 +3659,12 @@ async fn fetch_backlog_issue(issue_key: &str) -> anyhow::Result<IssueMetadata> {
         None
     };
 
-    Ok(IssueMetadata { title, state, url })
+    Ok(IssueMetadata {
+        title,
+        state,
+        url,
+        backlog_id,
+    })
 }
 
 impl Focusable for AgentiumApp {
@@ -4790,5 +5182,70 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
                 )
                 .into_any(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: that would pull gpui's `test` attribute macro into
+    // scope and make `#[test]` expand recursively.
+    use super::{backlog_issue_keys_in_branch, parse_backlog_remote};
+
+    #[test]
+    fn parse_backlog_remote_accepts_known_url_forms() {
+        let https = parse_backlog_remote("https://nulab.backlog.jp/git/BLG_AI/repo-name.git")
+            .expect("https form");
+        assert_eq!(https.web_host, "nulab.backlog.jp");
+        assert_eq!(https.project, "BLG_AI");
+        assert_eq!(https.repo, "repo-name");
+
+        let scp = parse_backlog_remote("nulab@nulab.git.backlog.jp:/BLG_AI/repo-name.git")
+            .expect("scp-like form");
+        assert_eq!(scp.web_host, "nulab.backlog.jp");
+        assert_eq!(scp.project, "BLG_AI");
+        assert_eq!(scp.repo, "repo-name");
+
+        let ssh = parse_backlog_remote("ssh://nulab@nulab.git.backlog.jp/BLG_AI/repo.git")
+            .expect("ssh form");
+        assert_eq!(ssh.web_host, "nulab.backlog.jp");
+        assert_eq!(ssh.project, "BLG_AI");
+        assert_eq!(ssh.repo, "repo");
+
+        let without_git_suffix =
+            parse_backlog_remote("https://example.backlog.com/git/PROJ/repo").expect("no .git");
+        assert_eq!(without_git_suffix.web_host, "example.backlog.com");
+        assert_eq!(without_git_suffix.repo, "repo");
+    }
+
+    #[test]
+    fn parse_backlog_remote_rejects_non_backlog_urls() {
+        assert!(parse_backlog_remote("https://github.com/safx/zed.git").is_none());
+        assert!(parse_backlog_remote("git@github.com:safx/zed.git").is_none());
+        // A Backlog host without the /git/ prefix is not a git remote.
+        assert!(parse_backlog_remote("https://nulab.backlog.jp/view/PROJ-1").is_none());
+        assert!(parse_backlog_remote("").is_none());
+        assert!(parse_backlog_remote("https://nulab.backlog.jp/git/PROJ").is_none());
+    }
+
+    #[test]
+    fn backlog_issue_keys_in_branch_extracts_key_segments() {
+        assert_eq!(
+            backlog_issue_keys_in_branch("BLG_AI-517/real-usage-queries"),
+            vec!["BLG_AI-517".to_string()]
+        );
+        assert_eq!(
+            backlog_issue_keys_in_branch("PROJ-1"),
+            vec!["PROJ-1".to_string()]
+        );
+        assert!(backlog_issue_keys_in_branch("feature/add-thing").is_empty());
+        assert!(backlog_issue_keys_in_branch("main").is_empty());
+        // Lowercase project prefixes are not Backlog keys.
+        assert!(backlog_issue_keys_in_branch("fix-123/things").is_empty());
+        // Uppercase segments that look like keys are accepted (false positives
+        // are handled by the negative cache at resolution time).
+        assert_eq!(
+            backlog_issue_keys_in_branch("FIX-123/things"),
+            vec!["FIX-123".to_string()]
+        );
     }
 }
