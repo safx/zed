@@ -2742,7 +2742,7 @@ fn render_pr_tooltip(
                     d.child(
                         div()
                             .min_w_0()
-                            .flex_shrink()
+                            .flex_shrink_1()
                             .truncate()
                             .text_xs()
                             .text_color(colors.text_muted)
@@ -4091,7 +4091,7 @@ impl AgentiumApp {
                                             d.child(
                                                 h_flex()
                                                     .min_w_0()
-                                                    .flex_shrink()
+                                                    .flex_shrink_1()
                                                     .items_center()
                                                     .gap_0p5()
                                                     .text_color(colors.text_muted)
@@ -4107,7 +4107,7 @@ impl AgentiumApp {
                                                     ),
                                             )
                                         })
-                                        .child(div().flex_grow())
+                                        .child(div().flex_grow_1())
                                         .when_some(diff_stats, |d, (added, deleted)| {
                                             d.child(
                                                 h_flex()
@@ -4153,7 +4153,7 @@ impl AgentiumApp {
                                             )
                                         })
                                         .when(first_pr_row.is_some(), |d| {
-                                            d.child(div().flex_grow())
+                                            d.child(div().flex_grow_1())
                                         })
                                         .when_some(first_pr_row, |d, (pr_el, review_el)| {
                                             d.child(pr_el).children(review_el)
@@ -4167,7 +4167,7 @@ impl AgentiumApp {
                                         .gap_1()
                                         .text_xs()
                                         .min_h(px(16.0))
-                                        .child(div().flex_grow())
+                                        .child(div().flex_grow_1())
                                         .child(pr_el)
                                         .children(review_el)
                                 }))
@@ -4467,9 +4467,9 @@ impl AgentiumApp {
                     .child(label),
             )
             .when_some(issue.title.clone(), |d, title| {
-                d.child(div().min_w_0().flex_shrink().truncate().child(title))
+                d.child(div().min_w_0().flex_shrink_1().truncate().child(title))
             })
-            .child(div().flex_grow())
+            .child(div().flex_grow_1())
             .when_some(issue.state.clone(), |d, state| {
                 d.child(
                     div()
@@ -4941,6 +4941,10 @@ impl EventEmitter<DismissEvent> for AgentiumRecentProjectsDelegate {}
 impl PickerDelegate for AgentiumRecentProjectsDelegate {
     type ListItem = AnyElement;
 
+    fn name() -> &'static str {
+        "agentium recent projects"
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Search projects…".into()
     }
@@ -4950,15 +4954,17 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
         editor: &Arc<dyn ErasedEditor>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
-    ) -> Div {
-        h_flex()
-            .flex_none()
-            .h_9()
-            .px_2p5()
-            .justify_between()
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(editor.render(window, cx))
+    ) -> Option<Div> {
+        Some(
+            h_flex()
+                .flex_none()
+                .h_9()
+                .px_2p5()
+                .justify_between()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(editor.render(window, cx)),
+        )
     }
 
     fn match_count(&self) -> usize {
@@ -5126,8 +5132,10 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
                 .child(
                     h_flex()
                         .gap_3()
-                        .flex_grow()
-                        .child(highlighted.render(window, cx)),
+                        .flex_grow_1()
+                        // Disambiguated because gpui's blanket `View` impl also
+                        // provides a `render` for this type via the glob import.
+                        .child(RenderOnce::render(highlighted, window, cx)),
                 )
                 .tooltip(Tooltip::text(tooltip_path))
                 .map(|el| {

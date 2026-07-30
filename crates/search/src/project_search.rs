@@ -353,6 +353,7 @@ impl ProjectSearch {
             search_history_cursor: Default::default(),
             search_included_history_cursor: Default::default(),
             search_excluded_history_cursor: Default::default(),
+            project_search_turning_into_text_finder: Arc::new(AtomicBool::new(false)),
             _excerpts_subscription: subscription,
         }
     }

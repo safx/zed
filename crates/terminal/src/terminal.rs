@@ -1258,14 +1258,6 @@ impl TerminalBuilder {
 
                 let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
 
-                #[cfg(unix)]
-                let active_terminal_registration = Some(active_terminals::register(
-                    pty_info.pid_getter().pty_fd(),
-                    pty_info.pid_getter().fallback_pid().as_u32(),
-                ));
-                #[cfg(not(unix))]
-                let active_terminal_registration: Option<active_terminals::Registration> = None;
-
                 //And connect them together
                 let pty_tx =
                     spawn_event_loop(term.clone(), events_tx, pty, pty_options.drain_on_exit)?;
@@ -1278,6 +1270,19 @@ impl TerminalBuilder {
                     None,
                 )
             };
+
+            // Only PTY terminals have a foreground process group to signal, so the
+            // panic hook's registry only tracks those.
+            #[cfg(unix)]
+            let active_terminal_registration = match &terminal_type {
+                TerminalType::Pty { info, .. } => Some(active_terminals::register(
+                    info.pid_getter().pty_fd(),
+                    info.pid_getter().fallback_pid().as_u32(),
+                )),
+                TerminalType::DisplayOnly => None,
+            };
+            #[cfg(not(unix))]
+            let active_terminal_registration: Option<active_terminals::Registration> = None;
 
             let no_task = task.is_none();
             let terminal = Terminal {

@@ -9054,15 +9054,17 @@ async fn search_in_worktree(
     worktree_id: WorktreeId,
     cx: &mut gpui::TestAppContext,
 ) -> Result<HashMap<String, Vec<Range<usize>>>> {
-    let search_rx =
-        project.update(cx, |project, cx| project.search_in_worktree(query, worktree_id, cx));
+    let search_rx = project.update(cx, |project, cx| {
+        project.search_in_worktree(query, worktree_id, cx)
+    });
     let mut results = HashMap::default();
     while let Ok(search_result) = search_rx.rx.recv().await {
         match search_result {
             SearchResult::Buffer { buffer, ranges } => {
                 results.entry(buffer).or_insert(ranges);
             }
-            SearchResult::LimitReached => {}
+            SearchResult::LimitReached | SearchResult::WaitingForScan | SearchResult::Searching => {
+            }
         }
     }
     Ok(results

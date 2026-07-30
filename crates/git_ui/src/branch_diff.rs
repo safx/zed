@@ -245,7 +245,10 @@ impl BranchDiff {
             .detach_and_notify_err(workspace_weak, window, cx);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Opens a diff against the repository's default branch without placing the
+    /// item anywhere, so callers that manage their own panes (Agentium's arena)
+    /// can decide where it goes, unlike the action handler above which always
+    /// targets the workspace's active pane.
     pub fn new_with_default_branch(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
