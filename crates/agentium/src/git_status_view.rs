@@ -266,18 +266,18 @@ impl Render for GitStatusView {
                                                 .child(
                                                     div()
                                                         .min_w_0()
-                                                        .flex_shrink()
+                                                        .flex_shrink_1()
                                                         .truncate()
                                                         .child(SharedString::from(
                                                             status_entry
                                                                 .repo_path
                                                                 .display(
-                                                                    util::paths::PathStyle::Posix,
+                                                                    util::paths::PathStyle::Unix,
                                                                 )
                                                                 .to_string(),
                                                         )),
                                                 )
-                                                .child(div().flex_grow())
+                                                .child(div().flex_grow_1())
                                                 .when_some(
                                                     status_entry.diff_stat,
                                                     |d, stat| {

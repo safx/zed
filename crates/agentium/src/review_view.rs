@@ -273,7 +273,7 @@ impl project::ProjectItem for ReviewItem {
             let plans: Vec<PathPlan> = repo.read_with(cx, |repo, cx| {
                 let mut plans: Vec<PathPlan> = Vec::new();
                 for path_str in &unique_paths {
-                    let rel_path = match RelPath::unix(path_str) {
+                    let rel_path = match RelPath::from_unix_str(path_str) {
                         Ok(p) => p.into_arc(),
                         Err(err) => {
                             log::warn!("review: skipping {path_str}: invalid path: {err}");
@@ -919,7 +919,7 @@ fn build_splittable_for_group(
                 continue;
             };
             mb.add_diff(diff.clone(), cx);
-            let rel_path = match RelPath::unix(path_str) {
+            let rel_path = match RelPath::from_unix_str(path_str) {
                 Ok(p) => p.into_arc(),
                 Err(err) => {
                     log::warn!("review: skipping {path_str}: invalid path: {err}");
