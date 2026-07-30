@@ -1017,15 +1017,6 @@
     },
   },
   {
-    "context": "FileBrowser",
-    "bindings": {
-      "left": "file_browser::CollapseSelectedEntry",
-      "right": "file_browser::ExpandSelectedEntry",
-      "enter": "file_browser::ConfirmEntry",
-      "tab": "file_browser::SwitchPane"
-    }
-  },
-  {
     "context": "ProjectPanel",
     "use_key_equivalents": true,
     "bindings": {
