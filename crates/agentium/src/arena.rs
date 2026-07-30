@@ -203,11 +203,11 @@ impl Arena {
         cx: &mut Context<Self>,
     ) {
         let project = self.project.clone();
-        let pane = self.active_pane.downgrade();
+        let pane = self.active_pane.clone();
         let item = self.active_pane.read(cx).active_item();
         cx.spawn_in(window, async move |_this, cx| {
             if let Some(item) = item {
-                Pane::save_item(project, &pane, item.as_ref(), save_intent, cx)
+                Pane::save_item(project, pane, item.as_ref(), save_intent, cx)
                     .await
                     .map(|_| ())?;
             }
@@ -239,7 +239,7 @@ impl Arena {
         cx.spawn_in(window, async move |_this, cx| {
             let project_diff = cx
                 .update(|window, cx| {
-                    git_ui::project_diff::ProjectDiff::new_with_default_branch(
+                    git_ui::branch_diff::BranchDiff::new_with_default_branch(
                         project, workspace, window, cx,
                     )
                 })?
@@ -352,7 +352,14 @@ impl Arena {
         };
         let git_store = self.project.read(cx).git_store().clone();
         let view = cx.new(|cx| {
-            git_graph::GitGraph::new(repo_id, git_store, self.workspace.clone(), None, window, cx)
+            git_ui::git_graph::GitGraph::new(
+                repo_id,
+                git_store,
+                self.workspace.clone(),
+                None,
+                window,
+                cx,
+            )
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
@@ -497,7 +504,7 @@ impl Arena {
                 };
                 let git_store = self.project.read(cx).git_store().clone();
                 let item = cx.new(|cx| {
-                    git_graph::GitGraph::new(
+                    git_ui::git_graph::GitGraph::new(
                         repo_id,
                         git_store,
                         self.workspace.clone(),
@@ -613,7 +620,7 @@ impl Arena {
         cx.spawn_in(window, async move |this, cx| {
             let project_diff = cx
                 .update(|window, cx| {
-                    git_ui::project_diff::ProjectDiff::new_with_default_branch(
+                    git_ui::branch_diff::BranchDiff::new_with_default_branch(
                         project.clone(),
                         workspace,
                         window,
@@ -986,7 +993,7 @@ impl Render for Arena {
                     .size_full()
                     .child(
                         self.center
-                            .render(self.zoomed_pane.as_ref(), &decorator, window, cx),
+                            .render(self.zoomed_pane.as_ref(), None, &decorator, window, cx),
                     )
                     .children(self.zoomed_pane.as_ref().and_then(|view| {
                         let zoomed_view = view.upgrade()?;
@@ -1037,6 +1044,7 @@ impl Render for Arena {
                                 file_finder::FileFinder::open(
                                     workspace,
                                     action.separate_history,
+                                    None,
                                     window,
                                     cx,
                                 )
