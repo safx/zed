@@ -330,7 +330,7 @@ pub fn parse_issue_ref(input: &str) -> anyhow::Result<IssueLink> {
     );
 }
 
-fn is_backlog_issue_key(input: &str) -> bool {
+pub(crate) fn is_backlog_issue_key(input: &str) -> bool {
     let Some((project, number)) = input.rsplit_once('-') else {
         return false;
     };

@@ -103,11 +103,13 @@ Agentium creates its `Workspace` entity with `Workspace::new(None, ...)`, so `da
 
 Any feature that needs data in `WorkspaceDb` (e.g. recent projects list) must write to the DB explicitly using `WorkspaceDb::global(cx)` methods like `save_local_workspace_paths()`. Do not rely on Zed's event-driven serialization (`WorktreeAdded` → `serialize_workspace()`) — it is a no-op in Agentium.
 
-## GitHub PR and CI polling requires `gh` CLI and chains data dependencies
+## PR and CI polling shells out to `gh`/`bee` and chains data dependencies
 
-PR and CI status polling uses the `gh` CLI. If unavailable, all PR/CI features are disabled (`gh_available = false`).
+The PR provider is chosen per arena from its origin remote: Backlog hosts (`*.backlog.jp` / `*.backlog.com`, parsed by `parse_backlog_remote`) use the `bee` CLI, everything else uses `gh`. PR polling runs when **either** CLI is available; inside a fetch, the path whose CLI is missing returns empty. CI polling stays GitHub-only — Backlog has no CI API — enforced by `PrInfo.provider` filters at the CI target-collection sites, not by the polling gate.
 
 An arena's branch can have **multiple PRs** (same head, different bases like develop/master). `fetch_pr_list` runs `gh pr list --head <branch> --state all` and falls back to `gh pr view` (detached HEAD, cross-fork PRs). `pr_info` holds `Vec<PrInfo>` per arena — never an empty Vec, the key is removed instead, so `contains_key` stays meaningful. CI state is keyed by `(EntityId, pr_number)`.
+
+Backlog PR discovery must filter server-side with `--issue`: `bee pr list` returns PRs **oldest-first** with a 100-entry page cap, so an unfiltered listing would silently miss recent PRs in large repos. Issue keys come from branch-name segments and from Backlog issues registered on tasks containing the arena; keys resolve to numeric ids via `bee issue view` (with `-s` pinned to the remote's space host, so bee's default space cannot resolve a same-named key from another space). Resolved ids are cached in `backlog_issue_ids`; keys Backlog reports as nonexistent (`No such issue` on stderr) go to the `failed_backlog_issue_keys` negative cache so they are not re-resolved every poll — transient failures (network, auth) are deliberately not cached and retry on the next cycle.
 
 Data flows in a chain: PR info must exist before CI polling can run. When a fetch inserts **newly-appeared PR numbers** (incoming minus existing), it immediately triggers `fetch_ci_for_arena` for each. Without this chain, CI data would be delayed until the next CI polling cycle (up to 60 seconds).
 
