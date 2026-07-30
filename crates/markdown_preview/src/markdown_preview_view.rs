@@ -3655,6 +3655,10 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            // Without a per-App database, `AppDatabase::global` falls back to a
+            // process-wide connection, so tests running concurrently in the same binary
+            // share serialized workspace and preview rows.
+            cx.set_global(db::AppDatabase::test_new());
             let state = AppState::test(cx);
             editor::init(cx);
             crate::init(cx);
