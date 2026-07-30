@@ -1,6 +1,6 @@
 mod arena;
 pub mod board;
-mod file_browser_view;
+pub mod file_browser_view;
 mod git_status_view;
 mod review_view;
 
