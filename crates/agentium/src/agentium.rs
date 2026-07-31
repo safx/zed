@@ -4800,6 +4800,12 @@ impl Render for AgentiumApp {
     }
 }
 
+// The picker draws its own elevated background, but sizes its results list from
+// its own shape rather than the parent. If this width and the wrapper's disagree,
+// the list overflows the background and the excess renders with no surface behind
+// it.
+const RECENT_PROJECTS_WIDTH: f32 = 235.0;
+
 struct AgentiumRecentProjects {
     picker: Entity<Picker<AgentiumRecentProjectsDelegate>>,
     _subscription: Subscription,
@@ -4825,6 +4831,8 @@ impl AgentiumRecentProjects {
             Picker::list(delegate, window, cx)
                 .list_measure_all()
                 .show_scrollbar(true)
+                .initial_width(rems_from_px(RECENT_PROJECTS_WIDTH))
+                .popover()
         });
 
         let picker_focus_handle = picker.focus_handle(cx);
@@ -4873,7 +4881,7 @@ impl Render for AgentiumRecentProjects {
     fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("AgentiumRecentProjects")
-            .w(px(235.0))
+            .w(px(RECENT_PROJECTS_WIDTH))
             .child(self.picker.clone())
     }
 }
