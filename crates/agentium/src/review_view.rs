@@ -24,8 +24,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use ui::{
-    ActiveTheme, Button, ButtonCommon, ButtonStyle, Clickable, Color, ContextMenu, FluentBuilder,
-    Icon, IconName, LabelSize, Tooltip, h_flex, v_flex,
+    ActiveTheme, Button, ButtonCommon, ButtonStyle, Clickable, Color, ContextMenu, Disableable,
+    FluentBuilder, Icon, IconName, LabelSize, Toggleable, Tooltip, h_flex, v_flex,
 };
 use util::ResultExt as _;
 use util::rel_path::RelPath;
@@ -36,7 +36,14 @@ use workspace::searchable::SearchableItemHandle;
 
 use crate::AgentiumWorkspaceHandle;
 
-actions!(agentium_review_view, [CopyComment, RevealComment]);
+actions!(
+    agentium_review_view,
+    [CopyComment, RevealComment, ToggleReading]
+);
+
+// prism's unified=3 display window: every hunk is shown with this many
+// context lines on each side unless a reading plan narrows it.
+const READING_CONTEXT_LINES: u32 = 3;
 
 #[derive(Clone)]
 struct CommentTarget {
@@ -52,7 +59,7 @@ struct ReviewDocument {
     #[serde(default)]
     groups: Vec<ReviewGroup>,
     #[serde(default)]
-    review: Option<ReviewSection>,
+    code_review: Option<CodeReview>,
 }
 
 #[derive(serde::Deserialize)]
@@ -66,110 +73,94 @@ struct ReviewGroup {
     #[serde(default)]
     hunks: Vec<ReviewHunk>,
     #[serde(default)]
-    review: Option<ReviewSection>,
-    #[serde(default)]
     review_focus: Vec<String>,
+    // prism drops the key entirely when a group has no findings.
+    #[serde(default)]
+    findings: Vec<Finding>,
+    #[serde(default)]
+    reading: Option<Reading>,
 }
 
-#[derive(serde::Deserialize, Clone)]
+#[derive(serde::Deserialize, Clone, PartialEq, Eq, Debug)]
 struct ReviewHunk {
     path: String,
     new_start: u32,
     new_lines: u32,
 }
 
-#[derive(serde::Deserialize, Default, Clone)]
-struct ReviewSection {
+#[derive(serde::Deserialize, Clone)]
+struct Finding {
+    file: String,
+    line: u32,
+    summary: String,
     #[serde(default)]
-    comments: Vec<ReviewComment>,
+    failure_scenario: Option<String>,
     #[serde(default)]
-    focus: Vec<ReviewFocus>,
+    verdict: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
 }
 
-#[derive(serde::Deserialize, Default, Clone)]
-struct ReviewFocus {
+#[derive(serde::Deserialize, Default)]
+struct CodeReview {
     #[serde(default)]
-    desc: String,
+    level: Option<String>,
     #[serde(default)]
-    result: String,
-    #[serde(default)]
-    reason: String,
+    unassigned: Vec<Finding>,
 }
 
 #[derive(serde::Deserialize, Clone)]
-struct ReviewComment {
-    path: String,
-    line: u32,
+struct Reading {
     #[serde(default)]
-    severity: String,
-    body: String,
+    summary: Option<String>,
     #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    duplicate_of: Option<DuplicateOf>,
-    #[serde(skip)]
-    overall: bool,
+    override_hunks: Vec<OverrideHunk>,
 }
 
 #[derive(serde::Deserialize, Clone)]
-#[allow(dead_code)]
-struct DuplicateOf {
-    #[serde(default)]
+struct OverrideHunk {
     path: String,
+    new_start: u32,
+    new_lines: u32,
     #[serde(default)]
-    line: u32,
+    hide: bool,
     #[serde(default)]
-    reason: String,
+    show: Vec<ShowBlock>,
+}
+
+// Line numbers are absolute, 1-based, new-file side, inclusive on both ends.
+#[derive(serde::Deserialize, Clone)]
+struct ShowBlock {
+    lines: [u32; 2],
+    #[serde(default)]
+    omit: Vec<[u32; 2]>,
 }
 
 #[derive(Copy, Clone)]
-enum Severity {
-    Critical,
-    Normal,
-    Nit,
+enum Verdict {
+    Confirmed,
+    Plausible,
+    Unlabeled,
 }
 
-fn parse_severity(s: &str) -> Severity {
-    match s {
-        "critical" => Severity::Critical,
-        "nit" => Severity::Nit,
-        _ => Severity::Normal,
+fn parse_verdict(verdict: Option<&str>) -> Verdict {
+    match verdict {
+        Some("CONFIRMED") => Verdict::Confirmed,
+        Some("PLAUSIBLE") => Verdict::Plausible,
+        _ => Verdict::Unlabeled,
     }
-}
-
-#[derive(Copy, Clone)]
-enum FocusResult {
-    Pass,
-    Fail,
-    Unsure,
-    Pending,
-    Other,
-}
-
-fn parse_focus_result(s: &str) -> FocusResult {
-    match s {
-        "pass" => FocusResult::Pass,
-        "fail" => FocusResult::Fail,
-        "unsure" => FocusResult::Unsure,
-        _ => FocusResult::Other,
-    }
-}
-
-#[derive(Clone)]
-struct ResolvedFocus {
-    desc: SharedString,
-    result: FocusResult,
-    reason: SharedString,
 }
 
 #[derive(Clone)]
 struct GroupData {
-    number: usize,
+    tab_label: SharedString,
     title: SharedString,
     summary: Option<SharedString>,
-    focus: Vec<ResolvedFocus>,
+    reading_summary: Option<SharedString>,
+    review_focus: Vec<SharedString>,
     hunks: Vec<ReviewHunk>,
-    comments: Vec<ReviewComment>,
+    reading: Option<Vec<OverrideHunk>>,
+    findings: Vec<Finding>,
 }
 
 pub struct ReviewItem {
@@ -178,7 +169,7 @@ pub struct ReviewItem {
     workspace_entity: Entity<Workspace>,
     path_to_loaded: HashMap<String, (Entity<Buffer>, Entity<BufferDiff>)>,
     groups: Vec<GroupData>,
-    overall_comments: Vec<ReviewComment>,
+    review_level: Option<SharedString>,
 }
 
 impl project::ProjectItem for ReviewItem {
@@ -201,250 +192,223 @@ impl project::ProjectItem for ReviewItem {
         let project = project.clone();
         Some(cx.spawn(async move |cx| {
             let result: anyhow::Result<Entity<Self>> = async {
-            let workspace_entity = cx.update(|cx| -> anyhow::Result<Entity<Workspace>> {
-                let handle = cx
-                    .try_global::<AgentiumWorkspaceHandle>()
-                    .context("AgentiumWorkspaceHandle not registered as global")?;
-                Ok(handle.0.clone())
-            })?;
+                let workspace_entity = cx.update(|cx| -> anyhow::Result<Entity<Workspace>> {
+                    let handle = cx
+                        .try_global::<AgentiumWorkspaceHandle>()
+                        .context("AgentiumWorkspaceHandle not registered as global")?;
+                    Ok(handle.0.clone())
+                })?;
 
-            let (fs, abs_path, entry_id, repo) = project.read_with(cx, |project, cx| {
-                (
-                    project.fs().clone(),
-                    project.absolute_path(&path, cx),
-                    project.entry_for_path(&path, cx).map(|entry| entry.id),
-                    project.git_store().read(cx).active_repository(),
-                )
-            });
-            let abs_path = abs_path.context("no absolute path for review file")?;
-            let content = fs
-                .load(&abs_path)
-                .await
-                .with_context(|| format!("reading {}", abs_path.display()))?;
-            let document: ReviewDocument = serde_json::from_str(&content)
-                .with_context(|| format!("parsing {} as review JSON", abs_path.display()))?;
-            anyhow::ensure!(
-                !document.groups.is_empty(),
-                "review.json {} has no groups",
-                abs_path.display(),
-            );
-
-            let repo = repo.ok_or_else(|| anyhow!("no active git repository"))?;
-            let head_sha = repo.read_with(cx, |r, _| {
-                r.head_commit.as_ref().map(|c| c.sha.to_string())
-            });
-            let head_sha = head_sha.ok_or_else(|| anyhow!("repository has no HEAD commit"))?;
-            if head_sha != document.target {
-                anyhow::bail!(
-                    "target {} does not match HEAD {}; checkout target first",
-                    document.target,
-                    head_sha,
+                let (fs, abs_path, entry_id, repo) = project.read_with(cx, |project, cx| {
+                    (
+                        project.fs().clone(),
+                        project.absolute_path(&path, cx),
+                        project.entry_for_path(&path, cx).map(|entry| entry.id),
+                        project.git_store().read(cx).active_repository(),
+                    )
+                });
+                let abs_path = abs_path.context("no absolute path for review file")?;
+                let content = fs
+                    .load(&abs_path)
+                    .await
+                    .with_context(|| format!("reading {}", abs_path.display()))?;
+                let document: ReviewDocument = serde_json::from_str(&content)
+                    .with_context(|| format!("parsing {} as review JSON", abs_path.display()))?;
+                anyhow::ensure!(
+                    !document.groups.is_empty(),
+                    "review.json {} has no groups",
+                    abs_path.display(),
                 );
-            }
 
-            let worktree_id = path.worktree_id;
-            let mut unique_paths: Vec<String> = Vec::new();
-            for group in &document.groups {
-                for hunk in &group.hunks {
-                    if !unique_paths.iter().any(|p| p == &hunk.path) {
-                        unique_paths.push(hunk.path.clone());
+                let repo = repo.ok_or_else(|| anyhow!("no active git repository"))?;
+                let head_sha =
+                    repo.read_with(cx, |r, _| r.head_commit.as_ref().map(|c| c.sha.to_string()));
+                let head_sha = head_sha.ok_or_else(|| anyhow!("repository has no HEAD commit"))?;
+                if head_sha != document.target {
+                    anyhow::bail!(
+                        "target {} does not match HEAD {}; checkout target first",
+                        document.target,
+                        head_sha,
+                    );
+                }
+
+                let unassigned: Vec<Finding> = document
+                    .code_review
+                    .as_ref()
+                    .map(|review| review.unassigned.clone())
+                    .unwrap_or_default();
+                let worktree_id = path.worktree_id;
+                let mut unique_paths: Vec<String> = Vec::new();
+                let hunk_paths = document
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.hunks.iter().map(|hunk| hunk.path.as_str()));
+                let unassigned_paths = unassigned.iter().map(|finding| finding.file.as_str());
+                for path_str in hunk_paths.chain(unassigned_paths) {
+                    if !unique_paths.iter().any(|p| p == path_str) {
+                        unique_paths.push(path_str.to_string());
                     }
                 }
-            }
 
-            let tree_diff_recv = repo.update(cx, |r, cx| {
-                r.diff_tree(
-                    DiffTreeType::Since {
-                        base: document.base.clone().into(),
-                        head: document.target.clone().into(),
-                    },
-                    cx,
-                )
-            });
-            let tree_diff = tree_diff_recv
-                .await
-                .context("diff_tree task canceled")??;
+                let tree_diff_recv = repo.update(cx, |r, cx| {
+                    r.diff_tree(
+                        DiffTreeType::Since {
+                            base: document.base.clone().into(),
+                            head: document.target.clone().into(),
+                        },
+                        cx,
+                    )
+                });
+                let tree_diff = tree_diff_recv.await.context("diff_tree task canceled")??;
 
-            struct PathPlan {
-                path_str: String,
-                project_path: ProjectPath,
-                old_oid: Option<Oid>,
-            }
-            let plans: Vec<PathPlan> = repo.read_with(cx, |repo, cx| {
-                let mut plans: Vec<PathPlan> = Vec::new();
-                for path_str in &unique_paths {
-                    let rel_path = match RelPath::from_unix_str(path_str) {
-                        Ok(p) => p.into_arc(),
-                        Err(err) => {
-                            log::warn!("review: skipping {path_str}: invalid path: {err}");
+                struct PathPlan {
+                    path_str: String,
+                    project_path: ProjectPath,
+                    old_oid: Option<Oid>,
+                }
+                let plans: Vec<PathPlan> = repo.read_with(cx, |repo, cx| {
+                    let mut plans: Vec<PathPlan> = Vec::new();
+                    for path_str in &unique_paths {
+                        let rel_path = match RelPath::from_unix_str(path_str) {
+                            Ok(p) => p.into_arc(),
+                            Err(err) => {
+                                log::warn!("review: skipping {path_str}: invalid path: {err}");
+                                continue;
+                            }
+                        };
+                        let project_path = ProjectPath {
+                            worktree_id,
+                            path: rel_path,
+                        };
+                        let Some(repo_path) = repo.project_path_to_repo_path(&project_path, cx)
+                        else {
+                            log::warn!("review: skipping {path_str}: not found in active repo");
                             continue;
+                        };
+                        let old_oid = match tree_diff.entries.get(&repo_path) {
+                            Some(TreeDiffStatus::Modified { old }) => Some(*old),
+                            Some(TreeDiffStatus::Deleted { .. }) => {
+                                log::warn!("review: skipping {path_str}: deleted in target");
+                                continue;
+                            }
+                            Some(TreeDiffStatus::Added) | None => None,
+                        };
+                        plans.push(PathPlan {
+                            path_str: path_str.clone(),
+                            project_path,
+                            old_oid,
+                        });
+                    }
+                    plans
+                });
+
+                let mut tasks = Vec::with_capacity(plans.len());
+                for plan in plans {
+                    let project = project.clone();
+                    let repo = repo.clone();
+                    tasks.push(cx.spawn(async move |cx| {
+                        let log_path = plan.path_str.clone();
+                        let result: anyhow::Result<(String, Entity<Buffer>, Entity<BufferDiff>)> =
+                            async {
+                                let buffer_task = project.update(cx, |project, cx| {
+                                    project.open_buffer(plan.project_path.clone(), cx)
+                                });
+                                let buffer = buffer_task
+                                    .await
+                                    .with_context(|| format!("opening buffer {log_path}"))?;
+                                let diff_task = project.update(cx, |project, cx| {
+                                    project.git_store().update(cx, |git_store, cx| {
+                                        git_store.open_diff_since(
+                                            plan.old_oid,
+                                            buffer.clone(),
+                                            repo.clone(),
+                                            cx,
+                                        )
+                                    })
+                                });
+                                let diff = diff_task
+                                    .await
+                                    .with_context(|| format!("loading diff for {log_path}"))?;
+                                Ok((plan.path_str, buffer, diff))
+                            }
+                            .await;
+                        match result {
+                            Ok(loaded) => Some(loaded),
+                            Err(err) => {
+                                log::warn!("review: skipping {log_path}: {err:?}");
+                                None
+                            }
                         }
+                    }));
+                }
+                let loaded: Vec<(String, Entity<Buffer>, Entity<BufferDiff>)> =
+                    futures::future::join_all(tasks)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
+
+                let path_to_loaded: HashMap<String, (Entity<Buffer>, Entity<BufferDiff>)> =
+                    loaded.into_iter().map(|(p, b, d)| (p, (b, d))).collect();
+
+                let mut groups: Vec<GroupData> = Vec::with_capacity(document.groups.len() + 1);
+                for (gi, group) in document.groups.iter().enumerate() {
+                    let number = gi + 1;
+                    let title = match &group.phase {
+                        Some(phase) => format!("{}. [{}] {}", number, phase, group.title),
+                        None => format!("{}. {}", number, group.title),
                     };
-                    let project_path = ProjectPath {
-                        worktree_id,
-                        path: rel_path,
-                    };
-                    let Some(repo_path) = repo.project_path_to_repo_path(&project_path, cx) else {
-                        log::warn!("review: skipping {path_str}: not found in active repo");
-                        continue;
-                    };
-                    let old_oid = match tree_diff.entries.get(&repo_path) {
-                        Some(TreeDiffStatus::Modified { old }) => Some(*old),
-                        Some(TreeDiffStatus::Deleted { .. }) => {
-                            log::warn!("review: skipping {path_str}: deleted in target");
-                            continue;
-                        }
-                        Some(TreeDiffStatus::Added) | None => None,
-                    };
-                    plans.push(PathPlan {
-                        path_str: path_str.clone(),
-                        project_path,
-                        old_oid,
+                    groups.push(GroupData {
+                        tab_label: SharedString::from(number.to_string()),
+                        title: SharedString::from(title),
+                        summary: group.summary.clone().map(SharedString::from),
+                        reading_summary: group
+                            .reading
+                            .as_ref()
+                            .and_then(|reading| reading.summary.clone())
+                            .map(SharedString::from),
+                        review_focus: group
+                            .review_focus
+                            .iter()
+                            .cloned()
+                            .map(SharedString::from)
+                            .collect(),
+                        hunks: group.hunks.clone(),
+                        reading: group
+                            .reading
+                            .as_ref()
+                            .map(|reading| reading.override_hunks.clone()),
+                        findings: group.findings.clone(),
                     });
                 }
-                plans
-            });
-
-            let mut tasks = Vec::with_capacity(plans.len());
-            for plan in plans {
-                let project = project.clone();
-                let repo = repo.clone();
-                tasks.push(cx.spawn(async move |cx| {
-                    let log_path = plan.path_str.clone();
-                    let result: anyhow::Result<(String, Entity<Buffer>, Entity<BufferDiff>)> = async {
-                        let buffer_task = project.update(cx, |project, cx| {
-                            project.open_buffer(plan.project_path.clone(), cx)
-                        });
-                        let buffer = buffer_task
-                            .await
-                            .with_context(|| format!("opening buffer {log_path}"))?;
-                        let diff_task = project.update(cx, |project, cx| {
-                            project.git_store().update(cx, |git_store, cx| {
-                                git_store.open_diff_since(
-                                    plan.old_oid,
-                                    buffer.clone(),
-                                    repo.clone(),
-                                    cx,
-                                )
-                            })
-                        });
-                        let diff = diff_task
-                            .await
-                            .with_context(|| format!("loading diff for {log_path}"))?;
-                        Ok((plan.path_str, buffer, diff))
-                    }
-                    .await;
-                    match result {
-                        Ok(loaded) => Some(loaded),
-                        Err(err) => {
-                            log::warn!("review: skipping {log_path}: {err:?}");
-                            None
-                        }
-                    }
-                }));
-            }
-            let loaded: Vec<(String, Entity<Buffer>, Entity<BufferDiff>)> =
-                futures::future::join_all(tasks)
-                    .await
-                    .into_iter()
-                    .flatten()
-                    .collect();
-
-            let path_to_loaded: HashMap<String, (Entity<Buffer>, Entity<BufferDiff>)> = loaded
-                .into_iter()
-                .map(|(p, b, d)| (p, (b, d)))
-                .collect();
-
-            // Spec (strict 3-way): if review.focus is non-empty use it; otherwise
-            // fall back to review_focus as Pending rows; otherwise empty.
-            // length mismatch is silent-dropped with a log::warn.
-            let resolve_focus = |gi: usize, g: &ReviewGroup| -> Vec<ResolvedFocus> {
-                let post: &[ReviewFocus] = g
-                    .review
-                    .as_ref()
-                    .map(|s| s.focus.as_slice())
-                    .unwrap_or(&[]);
-                let pre: &[String] = &g.review_focus;
-                if !post.is_empty() {
-                    if pre.len() > post.len() {
-                        log::warn!(
-                            "review: group {gi}: review_focus ({}) > review.focus ({}), {} dropped",
-                            pre.len(),
-                            post.len(),
-                            pre.len() - post.len(),
-                        );
-                    }
-                    post.iter()
-                        .map(|f| ResolvedFocus {
-                            desc: SharedString::from(f.desc.clone()),
-                            result: parse_focus_result(&f.result),
-                            reason: SharedString::from(f.reason.clone()),
-                        })
-                        .collect()
-                } else {
-                    pre.iter()
-                        .map(|desc| ResolvedFocus {
-                            desc: SharedString::from(desc.clone()),
-                            result: FocusResult::Pending,
-                            reason: SharedString::default(),
-                        })
-                        .collect()
+                if !unassigned.is_empty() {
+                    groups.push(unassigned_group(unassigned));
                 }
-            };
+                let review_level = document
+                    .code_review
+                    .as_ref()
+                    .and_then(|review| review.level.clone())
+                    .map(SharedString::from);
 
-            let mut groups: Vec<GroupData> = Vec::with_capacity(document.groups.len());
-            for (gi, group) in document.groups.iter().enumerate() {
-                let number = gi + 1;
-                let title = match &group.phase {
-                    Some(phase) => format!("{}. [{}] {}", number, phase, group.title),
-                    None => format!("{}. {}", number, group.title),
-                };
-                let comments: Vec<ReviewComment> = group
-                    .review
-                    .iter()
-                    .flat_map(|r| r.comments.iter().cloned())
-                    .collect();
-                groups.push(GroupData {
-                    number,
-                    title: SharedString::from(title),
-                    summary: group.summary.clone().map(SharedString::from),
-                    focus: resolve_focus(gi, group),
-                    hunks: group.hunks.clone(),
-                    comments,
-                });
+                log::info!(
+                    "review: opened {} (base={}, target={}, {} groups, {} unique files)",
+                    abs_path.display(),
+                    document.base,
+                    document.target,
+                    document.groups.len(),
+                    path_to_loaded.len(),
+                );
+
+                Ok(cx.new(|_| ReviewItem {
+                    project_path: path,
+                    entry_id,
+                    workspace_entity,
+                    path_to_loaded,
+                    groups,
+                    review_level,
+                }))
             }
-
-            let overall_comments: Vec<ReviewComment> =
-                document.review.as_ref().map_or_else(Vec::new, |overall| {
-                    overall
-                        .comments
-                        .iter()
-                        .map(|c| {
-                            let mut c = c.clone();
-                            c.overall = true;
-                            c
-                        })
-                        .collect()
-                });
-
-            log::info!(
-                "review: opened {} (base={}, target={}, {} groups, {} unique files)",
-                abs_path.display(),
-                document.base,
-                document.target,
-                document.groups.len(),
-                path_to_loaded.len(),
-            );
-
-            Ok(cx.new(|_| ReviewItem {
-                project_path: path,
-                entry_id,
-                workspace_entity,
-                path_to_loaded,
-                groups,
-                overall_comments,
-            }))
-            }.await;
+            .await;
             if let Err(ref err) = result {
                 log::error!("review: try_open failed for {log_path}: {err:#}");
             }
@@ -465,9 +429,35 @@ impl project::ProjectItem for ReviewItem {
     }
 }
 
+// Findings prism could not map to a group get a synthetic tab whose
+// hunks are windows around each finding line.
+fn unassigned_group(findings: Vec<Finding>) -> GroupData {
+    let hunks = findings
+        .iter()
+        .map(|finding| ReviewHunk {
+            path: finding.file.clone(),
+            new_start: finding.line.saturating_sub(READING_CONTEXT_LINES).max(1),
+            new_lines: READING_CONTEXT_LINES * 2 + 1,
+        })
+        .collect();
+    GroupData {
+        tab_label: SharedString::from("U"),
+        title: SharedString::from("Unassigned findings"),
+        summary: Some(SharedString::from(
+            "Findings prism could not map to any group.",
+        )),
+        reading_summary: None,
+        review_focus: Vec::new(),
+        hunks,
+        reading: None,
+        findings,
+    }
+}
+
 pub struct ReviewView {
     item: Entity<ReviewItem>,
     active_group: usize,
+    show_reading: bool,
     splittable: Entity<SplittableEditor>,
     project: Entity<Project>,
     language_registry: Arc<LanguageRegistry>,
@@ -558,21 +548,34 @@ impl ReviewView {
         .detach();
     }
 
-    fn set_active_group(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_active_group(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index == self.active_group || index >= self.item.read(cx).groups.len() {
             return;
         }
         self.active_group = index;
+        self.rebuild_splittable(window, cx);
+    }
 
+    fn toggle_reading(&mut self, _: &ToggleReading, window: &mut Window, cx: &mut Context<Self>) {
+        let has_reading = self
+            .item
+            .read(cx)
+            .groups
+            .get(self.active_group)
+            .is_some_and(|group| group.reading.is_some());
+        if !has_reading {
+            return;
+        }
+        self.show_reading = !self.show_reading;
+        self.rebuild_splittable(window, cx);
+    }
+
+    fn rebuild_splittable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let weak_review = cx.entity().downgrade();
         let (splittable, sub) = build_splittable_for_group(
             &self.item,
-            index,
+            self.active_group,
+            self.show_reading,
             &self.project,
             &self.language_registry,
             weak_review,
@@ -605,13 +608,8 @@ impl ReviewView {
         cx.notify();
     }
 
-    fn render_group_header(
-        &self,
-        group: &GroupData,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    fn render_group_header(&self, group: &GroupData, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let status = cx.theme().status();
         let mut content = v_flex().w_full().px_3().py_2().gap_0p5();
         content = content.child(
             div()
@@ -620,7 +618,13 @@ impl ReviewView {
                 .text_color(colors.text)
                 .child(group.title.clone()),
         );
-        if let Some(summary) = group.summary.as_ref() {
+        let reading_active = self.show_reading && group.reading.is_some();
+        let summary = if reading_active {
+            group.reading_summary.as_ref().or(group.summary.as_ref())
+        } else {
+            group.summary.as_ref()
+        };
+        if let Some(summary) = summary {
             content = content.child(
                 div()
                     .text_xs()
@@ -628,44 +632,30 @@ impl ReviewView {
                     .child(summary.clone()),
             );
         }
-        for (focus_idx, item) in group.focus.iter().enumerate() {
-            let (icon, color) = match item.result {
-                FocusResult::Pass => ("✓", status.success),
-                FocusResult::Fail => ("✗", status.error),
-                FocusResult::Unsure => ("?", status.warning),
-                FocusResult::Pending | FocusResult::Other => ("·", colors.text_muted),
-            };
-            let row = h_flex()
-                .id(SharedString::from(format!(
-                    "group-focus-{}-{focus_idx}",
-                    group.number
-                )))
-                .gap_2()
-                .items_center()
-                .text_xs()
-                .child(
-                    div()
-                        .w_4()
-                        .flex()
-                        .justify_center()
-                        .text_color(color)
-                        .font_weight(FontWeight::BOLD)
-                        .child(icon),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(colors.text)
-                        .child(item.desc.clone()),
-                );
-            let row = if !item.reason.is_empty() {
-                row.tooltip(Tooltip::text(item.reason.clone()))
-            } else {
-                row
-            };
-            content = content.child(row);
+        for focus in &group.review_focus {
+            content = content.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .child(
+                        div()
+                            .w_4()
+                            .flex()
+                            .justify_center()
+                            .text_color(colors.text_muted)
+                            .font_weight(FontWeight::BOLD)
+                            .child("·"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(colors.text)
+                            .child(focus.clone()),
+                    ),
+            );
         }
         div()
             .w_full()
@@ -675,13 +665,14 @@ impl ReviewView {
             .child(content)
     }
 
-    fn render_tab_strip(
-        &self,
-        groups: &[GroupData],
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    fn render_tab_strip(&self, groups: &[GroupData], cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let active = self.active_group;
+        let has_reading = groups
+            .get(active)
+            .is_some_and(|group| group.reading.is_some());
+        let reading_active = self.show_reading && has_reading;
+        let level = self.item.read(cx).review_level.clone();
         h_flex()
             .w_full()
             .gap_1()
@@ -692,20 +683,41 @@ impl ReviewView {
             .border_color(colors.border)
             .children(groups.iter().enumerate().map(|(i, group)| {
                 let is_active = i == active;
-                Button::new(
-                    ("review-group-tab", i),
-                    group.number.to_string(),
-                )
-                .label_size(LabelSize::Small)
-                .style(if is_active {
-                    ButtonStyle::Filled
-                } else {
-                    ButtonStyle::Subtle
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_active_group(i, window, cx);
-                }))
+                Button::new(("review-group-tab", i), group.tab_label.clone())
+                    .label_size(LabelSize::Small)
+                    .style(if is_active {
+                        ButtonStyle::Filled
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_active_group(i, window, cx);
+                    }))
             }))
+            .child(div().flex_1())
+            .when_some(level, |this, level| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child(format!("review: {level}")),
+                )
+            })
+            .child(
+                Button::new("review-reading-toggle", "Reading")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .toggle_state(reading_active)
+                    .disabled(!has_reading)
+                    .tooltip(Tooltip::text(if has_reading {
+                        "Toggle prism reading plan vs. raw diff"
+                    } else {
+                        "This group has no reading plan"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_reading(&ToggleReading, window, cx);
+                    })),
+            )
     }
 }
 
@@ -725,6 +737,7 @@ impl Render for ReviewView {
             .key_context("AgentiumReviewView")
             .on_action(cx.listener(Self::copy_comment))
             .on_action(cx.listener(Self::reveal_comment))
+            .on_action(cx.listener(Self::toggle_reading))
             .when_some(tabs, |this, t| this.child(t))
             .when_some(header, |this, h| this.child(h))
             .child(self.splittable.clone())
@@ -846,6 +859,7 @@ impl ProjectItem for ReviewView {
         let (splittable, split_subscription) = build_splittable_for_group(
             &item,
             0,
+            true,
             &project,
             &language_registry,
             weak_review,
@@ -856,6 +870,7 @@ impl ProjectItem for ReviewView {
         Self {
             item,
             active_group: 0,
+            show_reading: true,
             splittable,
             project,
             language_registry,
@@ -867,9 +882,92 @@ impl ProjectItem for ReviewView {
     }
 }
 
+// Per-file aggregation of a group's hunks. Vec preserves first-occurrence
+// order so PathKey sort_prefix tracks the path's first appearance within
+// the group (tab-local; not comparable across groups).
+type PathRanges = Vec<(String, Vec<Range<Point>>)>;
+
+fn push_range(path_to_ranges: &mut PathRanges, path: &str, range: Range<Point>) {
+    if let Some(idx) = path_to_ranges.iter().position(|(p, _)| p == path) {
+        path_to_ranges[idx].1.push(range);
+    } else {
+        path_to_ranges.push((path.to_string(), vec![range]));
+    }
+}
+
+fn raw_ranges(hunks: &[ReviewHunk]) -> PathRanges {
+    let mut path_to_ranges = PathRanges::new();
+    for hunk in hunks {
+        let start_row = hunk.new_start.saturating_sub(1);
+        let end_row = start_row.saturating_add(hunk.new_lines);
+        let range = Point::new(start_row, 0)..Point::new(end_row, 0);
+        push_range(&mut path_to_ranges, &hunk.path, range);
+    }
+    path_to_ranges
+}
+
+// Inclusive 1-based line span to a row range. `build_excerpt_ranges` extends
+// the end point to the end of its row, so the last line is fully included.
+fn line_span(first_line: u32, last_line: u32) -> Option<Range<Point>> {
+    if first_line == 0 || last_line < first_line {
+        return None;
+    }
+    Some(Point::new(first_line - 1, 0)..Point::new(last_line - 1, 0))
+}
+
+// Excerpts for prism's reading plan. Must be fed to the multibuffer with
+// zero context lines: `set_excerpts_for_path` merges adjacent excerpts, so
+// any context would close the gaps that `omit` opens. Hunks sharing a file
+// naturally union per row through that same merge, matching prism.
+fn reading_ranges(hunks: &[ReviewHunk], overrides: &[OverrideHunk]) -> PathRanges {
+    let mut path_to_ranges = PathRanges::new();
+    for hunk in hunks {
+        let policy = overrides.iter().find(|entry| {
+            entry.path == hunk.path
+                && entry.new_start == hunk.new_start
+                && entry.new_lines == hunk.new_lines
+        });
+        match policy {
+            Some(entry) if entry.hide => {}
+            Some(entry) if !entry.show.is_empty() => {
+                for block in &entry.show {
+                    let [first, last] = block.lines;
+                    let mut omits = block.omit.clone();
+                    omits.sort_by_key(|omit| omit[0]);
+                    let mut cursor = first;
+                    for [omit_first, omit_last] in omits {
+                        if omit_first > cursor {
+                            let visible_last = omit_first.saturating_sub(1).min(last);
+                            if let Some(range) = line_span(cursor, visible_last) {
+                                push_range(&mut path_to_ranges, &hunk.path, range);
+                            }
+                        }
+                        cursor = cursor.max(omit_last.saturating_add(1));
+                    }
+                    if let Some(range) = line_span(cursor, last) {
+                        push_range(&mut path_to_ranges, &hunk.path, range);
+                    }
+                }
+            }
+            _ => {
+                let first = hunk.new_start.saturating_sub(READING_CONTEXT_LINES).max(1);
+                let last = hunk
+                    .new_start
+                    .saturating_add(hunk.new_lines)
+                    .saturating_add(READING_CONTEXT_LINES);
+                if let Some(range) = line_span(first, last) {
+                    push_range(&mut path_to_ranges, &hunk.path, range);
+                }
+            }
+        }
+    }
+    path_to_ranges
+}
+
 fn build_splittable_for_group(
     item: &Entity<ReviewItem>,
     group_index: usize,
+    show_reading: bool,
     project: &Entity<Project>,
     language_registry: &Arc<LanguageRegistry>,
     weak_review: WeakEntity<ReviewView>,
@@ -878,33 +976,21 @@ fn build_splittable_for_group(
 ) -> (Entity<SplittableEditor>, Option<Subscription>) {
     let style = EditorSettings::get_global(cx).diff_view_style;
 
-    let (workspace_entity, path_to_loaded, group_hunks, comments_for_tab) = {
+    let (workspace_entity, path_to_loaded, path_to_ranges, context_lines, findings_for_tab) = {
         let item_ref = item.read(cx);
         let group = &item_ref.groups[group_index];
-        let mut comments: Vec<ReviewComment> = group.comments.clone();
-        comments.extend(item_ref.overall_comments.iter().cloned());
+        let (path_to_ranges, context_lines) = match group.reading.as_ref() {
+            Some(overrides) if show_reading => (reading_ranges(&group.hunks, overrides), 0),
+            _ => (raw_ranges(&group.hunks), multibuffer_context_lines(cx)),
+        };
         (
             item_ref.workspace_entity.clone(),
             item_ref.path_to_loaded.clone(),
-            group.hunks.clone(),
-            comments,
+            path_to_ranges,
+            context_lines,
+            group.findings.clone(),
         )
     };
-
-    // Per-file aggregation of this group's hunks. Vec preserves first-occurrence
-    // order so PathKey sort_prefix tracks the path's first appearance within
-    // this group (tab-local; not comparable across groups).
-    let mut path_to_ranges: Vec<(String, Vec<Range<Point>>)> = Vec::new();
-    for hunk in &group_hunks {
-        let start_row = hunk.new_start.saturating_sub(1);
-        let end_row = start_row.saturating_add(hunk.new_lines);
-        let range = Point::new(start_row, 0)..Point::new(end_row, 0);
-        if let Some(idx) = path_to_ranges.iter().position(|(p, _)| p == &hunk.path) {
-            path_to_ranges[idx].1.push(range);
-        } else {
-            path_to_ranges.push((hunk.path.clone(), vec![range]));
-        }
-    }
 
     let rhs_multibuffer = cx.new(|cx| {
         let mut mb = MultiBuffer::new(Capability::ReadOnly);
@@ -912,7 +998,6 @@ fn build_splittable_for_group(
         mb
     });
 
-    let context_lines = multibuffer_context_lines(cx);
     rhs_multibuffer.update(cx, |mb, cx| {
         for (prefix, (path_str, ranges)) in path_to_ranges.iter().enumerate() {
             let Some((buffer, diff)) = path_to_loaded.get(path_str) else {
@@ -958,7 +1043,7 @@ fn build_splittable_for_group(
             &splittable,
             &rhs_multibuffer,
             &path_to_loaded,
-            &comments_for_tab,
+            &findings_for_tab,
             language_registry,
             weak_review,
             cx,
@@ -967,26 +1052,24 @@ fn build_splittable_for_group(
     } else {
         let language_registry = language_registry.clone();
         let inserted = Rc::new(Cell::new(false));
-        Some(
-            cx.observe(&splittable, move |_this, splittable, cx| {
-                if inserted.get() {
-                    return;
-                }
-                if splittable.read(cx).lhs_editor().is_none() {
-                    return;
-                }
-                inserted.set(true);
-                insert_review_blocks(
-                    &splittable,
-                    &rhs_multibuffer,
-                    &path_to_loaded,
-                    &comments_for_tab,
-                    &language_registry,
-                    weak_review.clone(),
-                    cx,
-                );
-            }),
-        )
+        Some(cx.observe(&splittable, move |_this, splittable, cx| {
+            if inserted.get() {
+                return;
+            }
+            if splittable.read(cx).lhs_editor().is_none() {
+                return;
+            }
+            inserted.set(true);
+            insert_review_blocks(
+                &splittable,
+                &rhs_multibuffer,
+                &path_to_loaded,
+                &findings_for_tab,
+                &language_registry,
+                weak_review.clone(),
+                cx,
+            );
+        }))
     };
 
     (splittable, split_subscription)
@@ -996,7 +1079,7 @@ fn insert_review_blocks(
     splittable: &Entity<SplittableEditor>,
     rhs_multibuffer: &Entity<MultiBuffer>,
     path_to_loaded: &HashMap<String, (Entity<Buffer>, Entity<BufferDiff>)>,
-    comments: &[ReviewComment],
+    findings: &[Finding],
     language_registry: &Arc<LanguageRegistry>,
     weak_review: WeakEntity<ReviewView>,
     cx: &mut Context<ReviewView>,
@@ -1005,32 +1088,31 @@ fn insert_review_blocks(
     let mut blocks: Vec<BlockProperties<multi_buffer::Anchor>> = Vec::new();
 
     let mut path_to_snapshot: HashMap<&str, BufferSnapshot> = HashMap::new();
-    for comment in comments {
-        let is_duplicate = comment.duplicate_of.is_some();
-        let Some((buffer, _)) = path_to_loaded.get(comment.path.as_str()) else {
+    for finding in findings {
+        let Some((buffer, _)) = path_to_loaded.get(finding.file.as_str()) else {
             log::warn!(
-                "review: skipping comment {}:{}: path not in any group's hunks",
-                comment.path,
-                comment.line,
+                "review: skipping finding {}:{}: path not loaded",
+                finding.file,
+                finding.line,
             );
             continue;
         };
-        let Some(line_index) = comment.line.checked_sub(1) else {
+        let Some(line_index) = finding.line.checked_sub(1) else {
             log::warn!(
-                "review: skipping comment {}:0: line must be 1-based",
-                comment.path,
+                "review: skipping finding {}:0: line must be 1-based",
+                finding.file,
             );
             continue;
         };
         let buffer_snapshot = path_to_snapshot
-            .entry(comment.path.as_str())
+            .entry(finding.file.as_str())
             .or_insert_with(|| buffer.read(cx).snapshot());
         let max_row = buffer_snapshot.max_point().row;
         if line_index > max_row {
             log::warn!(
-                "review: skipping comment {}:{}: past EOF (max row {})",
-                comment.path,
-                comment.line,
+                "review: skipping finding {}:{}: past EOF (max row {})",
+                finding.file,
+                finding.line,
                 max_row,
             );
             continue;
@@ -1038,36 +1120,31 @@ fn insert_review_blocks(
         let text_anchor = buffer_snapshot.anchor_after(Point::new(line_index, 0));
         let Some(mb_anchor) = mb_snapshot.anchor_in_excerpt(text_anchor) else {
             log::warn!(
-                "review: skipping comment {}:{}: line not in any excerpt",
-                comment.path,
-                comment.line,
+                "review: skipping finding {}:{}: line not in any excerpt",
+                finding.file,
+                finding.line,
             );
             continue;
         };
 
+        let body = finding_body(finding);
         let markdown = cx.new(|cx| {
             Markdown::new(
-                comment.body.clone().into(),
+                body.clone().into(),
                 Some(language_registry.clone()),
                 None,
                 cx,
             )
         });
-        let model = match (comment.model.as_deref(), comment.overall) {
-            (Some(m), true) => Some(SharedString::from(format!("{m} (overall)"))),
-            (Some(m), false) => Some(SharedString::from(m.to_string())),
-            (None, true) => Some(SharedString::from("(overall)")),
-            (None, false) => None,
-        };
-        let severity = parse_severity(&comment.severity);
-        let body_lines = comment.body.lines().count() as u32;
-        let height = body_lines.saturating_add(2).clamp(3, 24);
+        let verdict = parse_verdict(finding.verdict.as_deref());
+        let category = finding.category.clone().map(SharedString::from);
+        let height = estimate_block_height(&body);
 
         let markdown_for_render = markdown.clone();
         let target = CommentTarget {
-            path: comment.path.clone(),
-            line: comment.line,
-            body: comment.body.clone(),
+            path: finding.file.clone(),
+            line: finding.line,
+            body,
         };
         let weak_review = weak_review.clone();
         blocks.push(BlockProperties {
@@ -1077,10 +1154,9 @@ fn insert_review_blocks(
             priority: 1,
             render: Arc::new(move |bcx: &mut BlockContext| {
                 render_review_comment(
-                    severity,
-                    model.clone(),
+                    verdict,
+                    category.clone(),
                     markdown_for_render.clone(),
-                    is_duplicate,
                     weak_review.clone(),
                     target.clone(),
                     bcx,
@@ -1099,19 +1175,39 @@ fn insert_review_blocks(
     });
 }
 
-fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "CRITICAL",
-        Severity::Normal => "NORMAL",
-        Severity::Nit => "NIT",
+fn finding_body(finding: &Finding) -> String {
+    match finding
+        .failure_scenario
+        .as_deref()
+        .filter(|scenario| !scenario.trim().is_empty())
+    {
+        Some(scenario) => format!("{}\n\n**Failure scenario:** {}", finding.summary, scenario),
+        None => finding.summary.clone(),
+    }
+}
+
+// Findings are long wrapped paragraphs, so count wrapped rows, not just newlines.
+fn estimate_block_height(body: &str) -> u32 {
+    const CHARS_PER_ROW: usize = 110;
+    let rows: usize = body
+        .lines()
+        .map(|line| line.chars().count() / CHARS_PER_ROW + 1)
+        .sum();
+    (rows as u32).saturating_add(2).clamp(3, 24)
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Confirmed => "CONFIRMED",
+        Verdict::Plausible => "PLAUSIBLE",
+        Verdict::Unlabeled => "FINDING",
     }
 }
 
 fn render_review_comment(
-    severity: Severity,
-    model: Option<SharedString>,
+    verdict: Verdict,
+    category: Option<SharedString>,
     markdown: Entity<Markdown>,
-    is_duplicate: bool,
     weak_review: WeakEntity<ReviewView>,
     target: CommentTarget,
     bcx: &mut BlockContext,
@@ -1119,63 +1215,29 @@ fn render_review_comment(
     let cx = &*bcx.app;
     let status = cx.theme().status();
     let colors = cx.theme().colors();
-    let severity_color = match severity {
-        Severity::Critical => status.error,
-        Severity::Normal => status.warning,
-        Severity::Nit => status.hint,
+    let (verdict_color, bg) = match verdict {
+        Verdict::Confirmed => (status.error, status.error_background),
+        Verdict::Plausible => (status.warning, status.warning_background),
+        Verdict::Unlabeled => (status.info, status.info_background),
     };
-    let (bg, border) = if is_duplicate {
-        (colors.element_background, colors.border_variant)
-    } else {
-        let bg = match severity {
-            Severity::Critical => status.error_background,
-            Severity::Normal => status.warning_background,
-            Severity::Nit => status.hint_background,
-        };
-        (bg, severity_color)
-    };
-    let mut style = diagnostics_markdown_style(bcx.window, cx);
-    if is_duplicate {
-        // The MarkdownElement uses its own MarkdownStyle for body text — a parent
-        // div's `text_color` does not propagate. Override the style's base color
-        // (and inline-code/link colors) directly so the body actually appears muted.
-        let muted = colors.text_muted;
-        style.base_text_style.color = muted;
-        style.inline_code.color = Some(muted);
-        style.link.color = Some(muted);
-        if let Some(underline) = style.link.underline.as_mut() {
-            underline.color = Some(muted);
-        }
-    }
+    let style = diagnostics_markdown_style(bcx.window, cx);
 
     let mut header_row = h_flex().gap_2().items_center().child(
         div()
             .px_1p5()
             .rounded_sm()
-            .bg(severity_color)
+            .bg(verdict_color)
             .text_color(colors.background)
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .child(severity_label(severity)),
+            .child(verdict_label(verdict)),
     );
-    if is_duplicate {
-        header_row = header_row.child(
-            div()
-                .px_1p5()
-                .rounded_sm()
-                .bg(colors.element_disabled)
-                .text_color(colors.text_muted)
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("DUP"),
-        );
-    }
-    if let Some(model) = model {
+    if let Some(category) = category {
         header_row = header_row.child(
             div()
                 .text_xs()
                 .text_color(colors.text_muted)
-                .child(model),
+                .child(category),
         );
     }
 
@@ -1185,7 +1247,7 @@ fn render_review_comment(
         .py_1()
         .border_l_2()
         .bg(bg)
-        .border_color(border)
+        .border_color(verdict_color)
         // Stops propagation so the editor's window-level right-click handler
         // (mouse_context_menu::deploy_context_menu in editor::element) does not
         // fire. Depends on block elements being painted after
@@ -1202,15 +1264,166 @@ fn render_review_comment(
                 .log_err();
         })
         .child(header_row)
-        .child(
-            MarkdownElement::new(markdown, style).code_block_renderer(
-                CodeBlockRenderer::Default {
-                    copy_button_visibility: CopyButtonVisibility::Hidden,
-                    wrap_button_visibility: WrapButtonVisibility::Hidden,
-                    border: false,
-                },
-            ),
-        )
+        .child(MarkdownElement::new(markdown, style).code_block_renderer(
+            CodeBlockRenderer::Default {
+                copy_button_visibility: CopyButtonVisibility::Hidden,
+                wrap_button_visibility: WrapButtonVisibility::Hidden,
+                border: false,
+            },
+        ))
         .into_any_element()
 }
 
+#[cfg(test)]
+mod tests {
+    // No `use super::*`: it would pull in `gpui::test` and shadow `#[test]`.
+    use super::{
+        Finding, OverrideHunk, PathRanges, ReviewDocument, ReviewHunk, ShowBlock, finding_body,
+        raw_ranges, reading_ranges,
+    };
+    use anyhow::Context as _;
+
+    fn hunk(path: &str, new_start: u32, new_lines: u32) -> ReviewHunk {
+        ReviewHunk {
+            path: path.to_string(),
+            new_start,
+            new_lines,
+        }
+    }
+
+    fn rows(ranges: &PathRanges, path: &str) -> Vec<(u32, u32)> {
+        ranges
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, ranges)| {
+                ranges
+                    .iter()
+                    .map(|range| (range.start.row, range.end.row))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    const ENVELOPE: &str = r#"{
+      "base": "8360ba1f", "target": "e083707f", "lang": "ja",
+      "groups": [
+        {
+          "phase": "foundation", "title": "Store", "summary": "S",
+          "review_focus": ["a", "b"], "review_priority": 2,
+          "hunks": [{"path": "a.ts", "new_start": 1, "new_lines": 211}],
+          "findings": [
+            {"file": "a.ts", "line": 41, "summary": "dup", "failure_scenario": "lost"},
+            {"file": "a.ts", "line": 118, "summary": "race", "verdict": "CONFIRMED", "category": "correctness"}
+          ],
+          "reading": {
+            "summary": "R",
+            "override_hunks": [
+              {"path": "a.ts", "new_start": 1, "new_lines": 211,
+               "show": [{"lines": [3, 39], "omit": [[31, 38]]}, {"lines": [41, 87]}]}
+            ]
+          }
+        },
+        {
+          "phase": "integration", "title": "Flag", "review_priority": 1,
+          "hunks": [{"path": "b.ts", "new_start": 59, "new_lines": 1}]
+        }
+      ],
+      "code_review": {
+        "level": "high",
+        "unassigned": [{"file": "z.ts", "line": 5, "summary": "orphan"}],
+        "tally": {"total": 3, "by_verdict": {"CONFIRMED": 1, "PLAUSIBLE": 0, "UNLABELED": 2}, "by_category": {}, "unassigned": 1}
+      }
+    }"#;
+
+    #[test]
+    fn parses_current_envelope() -> anyhow::Result<()> {
+        let document: ReviewDocument = serde_json::from_str(ENVELOPE)?;
+        assert_eq!(document.groups.len(), 2);
+        let store = &document.groups[0];
+        assert_eq!(store.findings.len(), 2);
+        assert_eq!(store.findings[0].verdict, None);
+        assert_eq!(store.findings[1].category.as_deref(), Some("correctness"));
+        let reading = store.reading.as_ref().context("reading missing")?;
+        assert_eq!(reading.summary.as_deref(), Some("R"));
+        assert_eq!(reading.override_hunks[0].show.len(), 2);
+        assert!(!reading.override_hunks[0].hide);
+        let flag = &document.groups[1];
+        assert!(flag.findings.is_empty());
+        assert!(flag.reading.is_none());
+        let review = document.code_review.context("code_review missing")?;
+        assert_eq!(review.level.as_deref(), Some("high"));
+        assert_eq!(review.unassigned.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn finding_body_appends_scenario() {
+        let finding = Finding {
+            file: "a.ts".into(),
+            line: 1,
+            summary: "s".into(),
+            failure_scenario: Some("f".into()),
+            verdict: None,
+            category: None,
+        };
+        assert_eq!(finding_body(&finding), "s\n\n**Failure scenario:** f");
+        let bare = Finding {
+            failure_scenario: Some("  ".into()),
+            ..finding
+        };
+        assert_eq!(finding_body(&bare), "s");
+    }
+
+    #[test]
+    fn reading_ranges_split_on_omit() -> anyhow::Result<()> {
+        let document: ReviewDocument = serde_json::from_str(ENVELOPE)?;
+        let group = &document.groups[0];
+        let overrides = &group.reading.as_ref().context("reading")?.override_hunks;
+        let ranges = reading_ranges(&group.hunks, overrides);
+        assert_eq!(rows(&ranges, "a.ts"), vec![(2, 29), (38, 38), (40, 86)]);
+        Ok(())
+    }
+
+    #[test]
+    fn reading_ranges_hide_and_default_window() {
+        let hunks = vec![
+            hunk("b.ts", 59, 1),
+            hunk("c.ts", 119, 12),
+            hunk("d.ts", 10, 0),
+        ];
+        let overrides = vec![OverrideHunk {
+            path: "b.ts".into(),
+            new_start: 59,
+            new_lines: 1,
+            hide: true,
+            show: Vec::new(),
+        }];
+        let ranges = reading_ranges(&hunks, &overrides);
+        assert!(rows(&ranges, "b.ts").is_empty());
+        assert_eq!(rows(&ranges, "c.ts"), vec![(115, 133)]);
+        assert_eq!(rows(&ranges, "d.ts"), vec![(6, 12)]);
+    }
+
+    #[test]
+    fn reading_ranges_multiple_omits() {
+        let hunks = vec![hunk("a.ts", 1, 211)];
+        let overrides = vec![OverrideHunk {
+            path: "a.ts".into(),
+            new_start: 1,
+            new_lines: 211,
+            hide: false,
+            show: vec![ShowBlock {
+                lines: [41, 87],
+                omit: vec![[70, 75], [52, 56]],
+            }],
+        }];
+        let ranges = reading_ranges(&hunks, &overrides);
+        assert_eq!(rows(&ranges, "a.ts"), vec![(40, 50), (56, 68), (75, 86)]);
+    }
+
+    #[test]
+    fn raw_ranges_keep_hunk_rows() {
+        let ranges = raw_ranges(&[hunk("a.ts", 119, 12), hunk("a.ts", 10, 0)]);
+        assert_eq!(rows(&ranges, "a.ts"), vec![(118, 130), (9, 9)]);
+    }
+}
