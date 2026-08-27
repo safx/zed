@@ -1458,6 +1458,11 @@ fn main() {
                                 .active_pane_modifiers
                                 .get_or_insert_with(ActivePaneModifiers::default);
                             modifiers.inactive_opacity = Some(InactiveOpacity(0.65));
+                            // The client points at a dummy server URL.
+                            if let Some(telemetry) = content.telemetry.as_mut() {
+                                telemetry.metrics = Some(false);
+                                telemetry.diagnostics = Some(false);
+                            }
                             if let Some(name) = theme_name_for_defaults {
                                 content.theme.theme =
                                     Some(ThemeSelection::Static(ThemeName(name.into())));
