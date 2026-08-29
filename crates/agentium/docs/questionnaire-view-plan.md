@@ -512,3 +512,11 @@ Kent Beck 流 TDD (Red → Green → Refactor) で `crates/agentium/src/question
   `APPROVE_PLAN_RE` / `summaryConfirmationAnswer` が文言を要求し、文字だけでは承認と認識されないため。
   選択中の選択肢は bold、質問右上の回答表示は回答済みなら緑 (`Color::Success`)。
   回答モデルは `Answer { choices: Vec<usize>, other: Option<String> }` に置き換えた (§3.2 の `ParsedAnswer` 列挙は廃止)。
+- フォントサイズ (2026-08-29): Markdown preview と同じ `zed_actions::{Increase,Decrease,Reset}BufferFontSize`
+  (cmd-+ / cmd-- / cmd-0) をビューの root で受け、`markdown_preview_font_size` を増減する
+  (`persist` なら settings ファイルへ書く)。preview 用 `MarkdownStyle` の本文は `rems(1.0)` なので、
+  preview と同じく本文コンテナを `ui::utils::WithRemSize::new(font_size)` で包んで rem 基準を変える。
+  見出し・選択肢・状態表示も `Label` ではなく `div().text_size(rems(..))` で描き、Markdown 本文・
+  余白・Checkbox を含む配下全体が一律に拡大縮小する (px 指定だとラベルだけが変わり Markdown 本文が
+  取り残される。実機で確認済み)。GPUI テスト `font_size_actions_follow_markdown_preview` で
+  action → 設定値の変化を固定。
