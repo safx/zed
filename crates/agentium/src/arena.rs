@@ -30,7 +30,9 @@ use workspace::{
 use crate::{
     NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
     NewProjectSearch, OpenNewItemMenu, OpenSplitMenu, PaneContentType,
-    file_browser_view::FileBrowserView, git_status_view::GitStatusView,
+    file_browser_view::FileBrowserView,
+    git_status_view::GitStatusView,
+    questionnaire_view::{OpenAsText, QuestionnaireView},
 };
 
 pub(crate) enum ArenaEvent {
@@ -892,27 +894,9 @@ impl Arena {
         }
 
         let target_pane = if side {
-            let right_pane = self
-                .center
-                .find_pane_in_direction(&self.active_pane, SplitDirection::Right, cx)
-                .cloned();
-            match right_pane {
-                Some(pane) => pane,
-                None => {
-                    let new_pane = new_agentium_pane(
-                        self.workspace.clone(),
-                        self.project.clone(),
-                        self.session_state.clone(),
-                        window,
-                        cx,
-                    );
-                    self.center
-                        .split(&active_pane, &new_pane, SplitDirection::Right, cx);
-                    new_pane
-                }
-            }
+            self.pane_to_the_right(window, cx)
         } else {
-            active_pane.clone()
+            active_pane
         };
 
         let existing_preview_idx = MarkdownPreviewView::find_existing_independent_preview_item_idx(
@@ -948,6 +932,55 @@ impl Arena {
         if side {
             editor.focus_handle(cx).focus(window, cx);
         }
+    }
+
+    fn pane_to_the_right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+        if let Some(pane) = self
+            .center
+            .find_pane_in_direction(&self.active_pane, SplitDirection::Right, cx)
+            .cloned()
+        {
+            return pane;
+        }
+        let new_pane = new_agentium_pane(
+            self.workspace.clone(),
+            self.project.clone(),
+            self.session_state.clone(),
+            window,
+            cx,
+        );
+        self.center
+            .split(&self.active_pane, &new_pane, SplitDirection::Right, cx);
+        new_pane
+    }
+
+    // Same-pane is impossible: panes dedupe items by entry id.
+    fn open_questionnaire_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace_entity) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(view) = self
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.act_as::<QuestionnaireView>(cx))
+        else {
+            return;
+        };
+        let buffer = view.read(cx).buffer(cx);
+        let target_pane = self.pane_to_the_right(window, cx);
+        workspace_entity.update(cx, |workspace, cx| {
+            workspace.open_project_item::<editor::Editor>(
+                target_pane,
+                buffer,
+                true,
+                true,
+                false,
+                false,
+                window,
+                cx,
+            );
+        });
     }
 
     fn move_pane_to_border(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -1071,6 +1104,9 @@ impl Render for Arena {
                     }))
                     .on_action(cx.listener(|this, _: &OpenPreviewToTheSide, window, cx| {
                         this.open_markdown_preview(true, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &OpenAsText, window, cx| {
+                        this.open_questionnaire_as_text(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &NewClaudeCode, window, cx| {
                         this.add_claude_code(window, cx);

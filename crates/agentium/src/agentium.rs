@@ -2,8 +2,10 @@ mod arena;
 pub mod board;
 pub mod file_browser_view;
 mod git_status_view;
+pub mod questionnaire_view;
 mod review_view;
 
+pub use questionnaire_view::QuestionnaireView;
 pub use review_view::ReviewView;
 
 #[derive(Clone)]

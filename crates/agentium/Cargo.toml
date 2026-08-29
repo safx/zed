@@ -76,6 +76,18 @@ workspace.workspace = true
 zed_actions.workspace = true
 zlog.workspace = true
 
+[dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+# project/test-support adds RemoteConnectionOptions::Mock; this arm needs it.
+remote_connection = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+
+[package.metadata.cargo-shear]
+ignored = ["remote_connection"]
+
 [package.metadata.bundle]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
 identifier = "dev.agentium.Agentium"
