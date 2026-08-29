@@ -5,13 +5,16 @@ use language::{Buffer, BufferEvent, LanguageRegistry, Point};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use project::{Project, ProjectEntryId, ProjectPath};
 use regex::Regex;
+use settings::{Settings as _, update_settings_file};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
+use theme_settings::ThemeSettings;
 use ui::{
-    ActiveTheme, Button, Checkbox, Clickable, Color, Icon, IconName, Label, LabelCommon, LabelSize,
-    ToggleState, h_flex, v_flex,
+    ActiveTheme, Button, Checkbox, Clickable, Color, Icon, IconName, Label, LabelCommon,
+    ToggleState, h_flex, utils::WithRemSize, v_flex,
 };
 use workspace::item::{Item, ItemBufferKind, ItemEvent, ProjectItem, SaveOptions};
+use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 actions!(questionnaire_view, [OpenAsText]);
 
@@ -829,6 +832,31 @@ impl QuestionnaireView {
             .detach_and_log_err(cx);
     }
 
+    // Shares the markdown preview's font size so cmd-+/cmd-- feel the same.
+    fn adjust_font_size(&mut self, persist: bool, delta: Pixels, cx: &mut Context<Self>) {
+        if persist {
+            let fs = self.project.read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, cx| {
+                let size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx) + delta;
+                settings.theme.markdown_preview_font_size =
+                    Some(f32::from(theme_settings::clamp_font_size(size)).into());
+            });
+        } else {
+            theme_settings::adjust_markdown_preview_font_size(cx, |size| size + delta);
+        }
+    }
+
+    fn reset_font_size(&mut self, persist: bool, cx: &mut Context<Self>) {
+        if persist {
+            let fs = self.project.read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                settings.theme.markdown_preview_font_size = None;
+            });
+        } else {
+            theme_settings::reset_markdown_preview_font_size(cx);
+        }
+    }
+
     fn render_section(
         &self,
         index: usize,
@@ -855,6 +883,8 @@ impl QuestionnaireView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        let small = rems(0.85);
         let answer = parse_answer(block);
         let disabled = block.answer.is_none() || block.read_only.is_some();
         let raw = block
@@ -884,19 +914,28 @@ impl QuestionnaireView {
                 h_flex()
                     .justify_between()
                     .gap_2()
-                    .child(Label::new(block.title.clone()).weight(FontWeight::SEMIBOLD))
                     .child(
-                        Label::new(if raw.is_empty() {
-                            "unanswered".to_string()
-                        } else {
-                            raw
-                        })
-                        .size(LabelSize::Small)
-                        .color(if answer.is_empty() {
-                            Color::Muted
-                        } else {
-                            Color::Success
-                        }),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(rems(1.1))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(block.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(small)
+                            .text_color(if answer.is_empty() {
+                                colors.text_muted
+                            } else {
+                                status.success
+                            })
+                            .child(if raw.is_empty() {
+                                "unanswered".to_string()
+                            } else {
+                                raw
+                            }),
                     ),
             )
             .when_some(self.section_markdown[index].clone(), |this, markdown| {
@@ -905,9 +944,10 @@ impl QuestionnaireView {
             .when_some(block.fingerprint.as_ref(), |this, fingerprint| {
                 let value = fingerprint.value.as_deref().unwrap_or("not computed");
                 this.child(
-                    Label::new(format!("Fingerprint: {value}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .text_size(small)
+                        .text_color(colors.text_muted)
+                        .child(format!("Fingerprint: {value}")),
                 )
             })
             .children(
@@ -951,11 +991,14 @@ impl QuestionnaireView {
                                     },
                                 )),
                             )
-                            .child(div().flex_1().min_w_0().child(if checked {
-                                Label::new(label).weight(FontWeight::BOLD)
-                            } else {
-                                Label::new(label)
-                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(rems(1.0))
+                                    .when(checked, |this| this.font_weight(FontWeight::BOLD))
+                                    .child(label),
+                            )
                     }),
             )
             .when(show_free_text && !disabled, |this| {
@@ -974,7 +1017,9 @@ impl QuestionnaireView {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.start_editing(index, window, cx);
                             }))
-                            .child(Label::new(text).color(Color::Muted)),
+                            .text_size(rems(1.0))
+                            .text_color(colors.text_muted)
+                            .child(text),
                     )
                 }
             })
@@ -983,9 +1028,10 @@ impl QuestionnaireView {
             })
             .when_some(notice, |this, notice| {
                 this.child(
-                    Label::new(notice)
-                        .size(LabelSize::Small)
-                        .color(Color::Warning),
+                    div()
+                        .text_size(small)
+                        .text_color(status.warning)
+                        .child(notice),
                 )
             })
             .into_any_element()
@@ -1016,6 +1062,7 @@ impl Render for QuestionnaireView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+        let font_size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx);
         let (answered, total) = self.progress();
         let sections: Vec<AnyElement> = self
             .document
@@ -1037,6 +1084,15 @@ impl Render for QuestionnaireView {
             .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                 this.cancel_editing(window, cx);
             }))
+            .on_action(cx.listener(|this, action: &IncreaseBufferFontSize, _, cx| {
+                this.adjust_font_size(action.persist, px(1.0), cx);
+            }))
+            .on_action(cx.listener(|this, action: &DecreaseBufferFontSize, _, cx| {
+                this.adjust_font_size(action.persist, px(-1.0), cx);
+            }))
+            .on_action(cx.listener(|this, action: &ResetBufferFontSize, _, cx| {
+                this.reset_font_size(action.persist, cx);
+            }))
             .child(
                 h_flex()
                     .justify_between()
@@ -1053,13 +1109,16 @@ impl Render for QuestionnaireView {
                     )),
             )
             .child(
-                v_flex()
-                    .id("questionnaire-body")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .p_4()
-                    .gap_4()
-                    .children(sections),
+                // Everything below scales with the rem size, like the preview.
+                WithRemSize::new(font_size).flex_1().min_h_0().child(
+                    v_flex()
+                        .id("questionnaire-body")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .p_4()
+                        .gap_4()
+                        .children(sections),
+                ),
             )
     }
 }
@@ -1910,39 +1969,8 @@ mod tests {
     #[gpui::test]
     async fn other_option_takes_free_text(cx: &mut gpui::TestAppContext) {
         use fs::Fs as _;
-        use project::ProjectItem as _;
-        use workspace::item::ProjectItem as _;
 
-        init_test(cx);
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root",
-            serde_json::json!({ "stage-questions.md": ON_DISK }),
-        )
-        .await;
-        let project = project::Project::test(fs.clone(), [std::path::Path::new("/root")], cx).await;
-        let worktree_id = cx.update(|cx| {
-            project
-                .read(cx)
-                .worktrees(cx)
-                .next()
-                .expect("test project should contain a worktree")
-                .read(cx)
-                .id()
-        });
-        let path = project::ProjectPath {
-            worktree_id,
-            path: util::rel_path::rel_path("stage-questions.md").into(),
-        };
-        let item = cx
-            .update(|cx| super::QuestionnaireItem::try_open(&project, &path, cx))
-            .expect("questionnaire files are claimed")
-            .await
-            .expect("questionnaire opens");
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            super::QuestionnaireView::for_project_item(project.clone(), None, item, window, cx)
-        });
-        cx.run_until_parked();
+        let (fs, view, cx) = open_questionnaire(cx, ON_DISK).await;
 
         view.update_in(cx, |view, window, cx| {
             view.on_option_clicked(0, 2, window, cx)
@@ -1982,6 +2010,70 @@ mod tests {
             let block = view.question(0).expect("question");
             assert_eq!(parse_answer(block), other("something else"));
         });
+    }
+
+    async fn open_questionnaire<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+    ) -> (
+        std::sync::Arc<fs::FakeFs>,
+        gpui::Entity<super::QuestionnaireView>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        use project::ProjectItem as _;
+        use workspace::item::ProjectItem as _;
+
+        init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({ "stage-questions.md": text }))
+            .await;
+        let project = project::Project::test(fs.clone(), [std::path::Path::new("/root")], cx).await;
+        let worktree_id = cx.update(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .expect("test project should contain a worktree")
+                .read(cx)
+                .id()
+        });
+        let path = project::ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path("stage-questions.md").into(),
+        };
+        let item = cx
+            .update(|cx| super::QuestionnaireItem::try_open(&project, &path, cx))
+            .expect("questionnaire files are claimed")
+            .await
+            .expect("questionnaire opens");
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            super::QuestionnaireView::for_project_item(project.clone(), None, item, window, cx)
+        });
+        cx.run_until_parked();
+        (fs, view, cx)
+    }
+
+    #[gpui::test]
+    async fn font_size_actions_follow_markdown_preview(cx: &mut gpui::TestAppContext) {
+        use settings::Settings as _;
+
+        let (_fs, view, cx) = open_questionnaire(cx, ON_DISK).await;
+        view.update_in(cx, |view, window, cx| window.focus(&view.focus_handle, cx));
+        draw_window(cx);
+        let size = |cx: &mut gpui::VisualTestContext| {
+            cx.read(|cx| {
+                theme_settings::ThemeSettings::get_global(cx).markdown_preview_font_size(cx)
+            })
+        };
+        let before = size(cx);
+
+        cx.dispatch_action(zed_actions::IncreaseBufferFontSize { persist: false });
+        assert_eq!(size(cx), before + gpui::px(1.0));
+        cx.dispatch_action(zed_actions::DecreaseBufferFontSize { persist: false });
+        assert_eq!(size(cx), before);
+        cx.dispatch_action(zed_actions::IncreaseBufferFontSize { persist: false });
+        cx.dispatch_action(zed_actions::ResetBufferFontSize { persist: false });
+        assert_eq!(size(cx), before);
     }
 
     #[test]
