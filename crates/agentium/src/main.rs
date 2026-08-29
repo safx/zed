@@ -1431,6 +1431,7 @@ fn main() {
                     editor::init(cx);
                     image_viewer::init(cx);
                     workspace::register_project_item::<agentium::ReviewView>(cx);
+                    workspace::register_project_item::<agentium::QuestionnaireView>(cx);
                     git_ui::init(cx);
                     search::init(cx);
                     file_finder::init(cx);

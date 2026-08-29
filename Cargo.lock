@@ -603,6 +603,7 @@ dependencies = [
  "project",
  "regex",
  "release_channel",
+ "remote_connection",
  "reqwest_client",
  "schemars 1.0.4",
  "search",
