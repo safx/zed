@@ -10,8 +10,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use theme_settings::ThemeSettings;
 use ui::{
-    ActiveTheme, Button, Checkbox, Clickable, Color, Icon, IconName, Label, LabelCommon,
-    ToggleState, h_flex, utils::WithRemSize, v_flex,
+    ActiveTheme, Button, ButtonCommon, Checkbox, Clickable, Color, Disableable, Icon, IconButton,
+    IconName, IconSize, Label, LabelCommon, ToggleState, Toggleable, Tooltip, h_flex,
+    utils::WithRemSize, v_flex,
 };
 use workspace::item::{Item, ItemBufferKind, ItemEvent, ProjectItem, SaveOptions};
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
@@ -649,6 +650,7 @@ pub struct QuestionnaireView {
     tail_markdown: Vec<Option<Entity<Markdown>>>,
     text_input: Entity<Editor>,
     editing: Option<EditingTarget>,
+    locked: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -665,9 +667,22 @@ impl QuestionnaireView {
         self.item.read(cx).buffer()
     }
 
-    fn reparse(&mut self, cx: &mut Context<Self>) {
+    fn is_complete(&self) -> bool {
+        let (answered, total) = self.progress();
+        total > 0 && answered == total
+    }
+
+    fn reparse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.buffer(cx).read(cx).text();
+        let was_complete = self.is_complete();
         self.document = parse_questionnaire(&text);
+        let now_complete = self.is_complete();
+        if was_complete != now_complete {
+            self.locked = now_complete;
+            if self.locked {
+                self.cancel_editing(window, cx);
+            }
+        }
         let language_registry = self.project.read(cx).languages().clone();
         let count = self.document.sections.len();
         self.section_markdown.resize_with(count, || None);
@@ -770,6 +785,9 @@ impl QuestionnaireView {
     }
 
     fn start_editing(&mut self, section_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         self.commit_editing(window, cx);
         let Some(block) = self.question(section_index) else {
             return;
@@ -803,13 +821,35 @@ impl QuestionnaireView {
         self.write_answer(section_index, &raw, cx);
     }
 
+    fn reclaim_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_input.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
     fn cancel_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing = None;
-        window.focus(&self.focus_handle, cx);
+        self.reclaim_focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_lock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.locked && self.editing.is_some() {
+            if self.text_input.read(cx).text(cx).trim().is_empty() {
+                self.cancel_editing(window, cx);
+            } else {
+                self.commit_editing(window, cx);
+                self.reclaim_focus(window, cx);
+            }
+        }
+        self.locked = !self.locked;
         cx.notify();
     }
 
     fn write_answer(&mut self, section_index: usize, raw: &str, cx: &mut Context<Self>) {
+        if self.locked {
+            return;
+        }
         let Some(block) = self.question(section_index) else {
             return;
         };
@@ -887,6 +927,7 @@ impl QuestionnaireView {
         let small = rems(0.85);
         let answer = parse_answer(block);
         let disabled = block.answer.is_none() || block.read_only.is_some();
+        let interactive = !disabled && !self.locked;
         let raw = block
             .answer
             .as_ref()
@@ -971,7 +1012,7 @@ impl QuestionnaireView {
                             .id((SharedString::from(format!("row{index}")), option_index))
                             .gap_2()
                             .items_start()
-                            .when(!disabled, |this| {
+                            .when(interactive, |this| {
                                 this.cursor_pointer().on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.on_option_clicked(index, option_index, window, cx);
@@ -983,7 +1024,7 @@ impl QuestionnaireView {
                                     (SharedString::from(format!("q{index}")), option_index),
                                     state,
                                 )
-                                .disabled(disabled)
+                                .disabled(!interactive)
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         cx.stop_propagation();
@@ -1004,7 +1045,7 @@ impl QuestionnaireView {
             .when(show_free_text && !disabled, |this| {
                 if self.is_editing(index) {
                     this.child(self.text_input.clone())
-                } else {
+                } else if interactive {
                     let text = answer
                         .other
                         .clone()
@@ -1021,6 +1062,16 @@ impl QuestionnaireView {
                             .text_color(colors.text_muted)
                             .child(text),
                     )
+                } else {
+                    match answer.other.clone().filter(|text| !text.is_empty()) {
+                        Some(text) => this.child(
+                            div()
+                                .text_size(rems(1.0))
+                                .text_color(colors.text_muted)
+                                .child(text),
+                        ),
+                        None => this,
+                    }
                 }
             })
             .when_some(self.tail_markdown[index].clone(), |this, markdown| {
@@ -1101,7 +1152,30 @@ impl Render for QuestionnaireView {
                     .py_2()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(Label::new(format!("{answered}/{total} answered")).color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Label::new(format!("{answered}/{total} answered"))
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                IconButton::new("edit-lock", IconName::LockOff)
+                                    .icon_size(IconSize::Small)
+                                    .toggle_state(self.locked)
+                                    .selected_icon(IconName::Lock)
+                                    .disabled(total == 0)
+                                    .tooltip(Tooltip::text(if self.locked {
+                                        "Unlock answers"
+                                    } else {
+                                        "Lock answers"
+                                    }))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_lock(window, cx)
+                                    })),
+                            ),
+                    )
                     .child(Button::new("open-as-text", "Open as text").on_click(
                         |_, window, cx| {
                             window.dispatch_action(OpenAsText.boxed_clone(), cx);
@@ -1236,18 +1310,22 @@ impl ProjectItem for QuestionnaireView {
             editor
         });
         let subscriptions = vec![
-            cx.subscribe(&buffer, |this, _, event: &BufferEvent, cx| {
-                if matches!(
-                    event,
-                    BufferEvent::Edited { .. }
-                        | BufferEvent::Reloaded
-                        | BufferEvent::DirtyChanged
-                        | BufferEvent::Saved
-                        | BufferEvent::FileHandleChanged
-                ) {
-                    this.reparse(cx);
-                }
-            }),
+            cx.subscribe_in(
+                &buffer,
+                window,
+                |this, _, event: &BufferEvent, window, cx| {
+                    if matches!(
+                        event,
+                        BufferEvent::Edited { .. }
+                            | BufferEvent::Reloaded
+                            | BufferEvent::DirtyChanged
+                            | BufferEvent::Saved
+                            | BufferEvent::FileHandleChanged
+                    ) {
+                        this.reparse(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &text_input,
                 window,
@@ -1267,9 +1345,10 @@ impl ProjectItem for QuestionnaireView {
             tail_markdown: Vec::new(),
             text_input,
             editing: None,
+            locked: false,
             _subscriptions: subscriptions,
         };
-        view.reparse(cx);
+        view.reparse(window, cx);
         view
     }
 }
@@ -1867,6 +1946,7 @@ mod tests {
 
     const ON_DISK: &str =
         "## Q1. What?\n\nA. Foo\nB. Bar\nX. Other (please specify)\n\n[Answer]:\n";
+    const TWO_ON_DISK: &str = "## Q1. What?\n\nA. Foo\nB. Bar\nX. Other (please specify)\n\n[Answer]:\n\n## Q2. Which?\n\nA. Foo\nB. Bar\n\n[Answer]:\n";
 
     #[gpui::test]
     async fn view_writes_answers_and_follows_disk(cx: &mut gpui::TestAppContext) {
@@ -2051,6 +2131,262 @@ mod tests {
         });
         cx.run_until_parked();
         (fs, view, cx)
+    }
+
+    #[gpui::test]
+    async fn lock_engages_at_full_completion(cx: &mut gpui::TestAppContext) {
+        use fs::Fs as _;
+
+        let (fs, view, cx) = open_questionnaire(cx, ON_DISK).await;
+        view.read_with(cx, |view, _| assert!(!view.locked));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 1, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (1, 1));
+            assert!(view.locked);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 0, window, cx)
+        });
+        cx.run_until_parked();
+        let saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(
+            saved,
+            ON_DISK.replace("[Answer]:", "[Answer]: B"),
+            "locked view discards the click"
+        );
+    }
+
+    #[gpui::test]
+    async fn opens_locked_when_already_complete(cx: &mut gpui::TestAppContext) {
+        let (_fs, view, cx) =
+            open_questionnaire(cx, &ON_DISK.replace("[Answer]:", "[Answer]: A")).await;
+        view.read_with(cx, |view, _| assert!(view.locked));
+    }
+
+    #[gpui::test]
+    async fn appended_question_unlocks(cx: &mut gpui::TestAppContext) {
+        use fs::Fs as _;
+
+        let (fs, view, cx) =
+            open_questionnaire(cx, &ON_DISK.replace("[Answer]:", "[Answer]: A")).await;
+        view.read_with(cx, |view, _| assert!(view.locked));
+
+        let after_append = TWO_ON_DISK.replacen("[Answer]:\n", "[Answer]: A\n", 1);
+        fs.insert_file(
+            "/root/stage-questions.md",
+            after_append.clone().into_bytes(),
+        )
+        .await;
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (1, 2));
+            assert!(!view.locked);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(1, 0, window, cx)
+        });
+        cx.run_until_parked();
+        let saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(saved, after_append.replace("[Answer]:\n", "[Answer]: A\n"));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (2, 2));
+            assert!(view.locked);
+        });
+    }
+
+    #[gpui::test]
+    async fn lock_during_editing_discards_pending_text(cx: &mut gpui::TestAppContext) {
+        use fs::Fs as _;
+
+        let (fs, view, cx) = open_questionnaire(cx, ON_DISK).await;
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 2, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.is_editing(0)));
+
+        fs.insert_file(
+            "/root/stage-questions.md",
+            ON_DISK.replace("[Answer]:", "[Answer]: A").into_bytes(),
+        )
+        .await;
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.locked);
+            assert!(!view.is_editing(0));
+        });
+        cx.update(|window, cx| {
+            assert!(view.read(cx).focus_handle.is_focused(window));
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.text_input.update(cx, |editor, cx| {
+                editor.set_text("x", window, cx);
+            });
+            view.commit_editing(window, cx);
+        });
+        cx.run_until_parked();
+        let saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(saved, ON_DISK.replace("[Answer]:", "[Answer]: A"));
+    }
+
+    #[gpui::test]
+    async fn lock_toggle_reenables_writes(cx: &mut gpui::TestAppContext) {
+        use fs::Fs as _;
+
+        let (fs, view, cx) =
+            open_questionnaire(cx, &ON_DISK.replace("[Answer]:", "[Answer]: A")).await;
+        view.read_with(cx, |view, _| assert!(view.locked));
+
+        view.update_in(cx, |view, window, cx| view.toggle_lock(window, cx));
+        view.read_with(cx, |view, _| assert!(!view.locked));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 1, window, cx)
+        });
+        cx.run_until_parked();
+        let saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(saved, ON_DISK.replace("[Answer]:", "[Answer]: B"));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (1, 1));
+            assert!(!view.locked, "no transition keeps the manual unlock");
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 1, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (0, 1));
+            assert!(!view.locked);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 0, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (1, 1));
+            assert!(view.locked, "completing again re-locks");
+        });
+    }
+
+    #[gpui::test]
+    async fn manual_lock_commits_pending_text(cx: &mut gpui::TestAppContext) {
+        use fs::Fs as _;
+
+        let (fs, view, cx) = open_questionnaire(cx, TWO_ON_DISK).await;
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 2, window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.text_input.update(cx, |editor, cx| {
+                editor.set_text("draft", window, cx);
+            });
+        });
+        view.update_in(cx, |view, window, cx| view.toggle_lock(window, cx));
+        cx.run_until_parked();
+        let saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(
+            saved,
+            TWO_ON_DISK.replacen("[Answer]:\n", "[Answer]: X: draft\n", 1)
+        );
+        view.read_with(cx, |view, _| {
+            assert!(!view.is_editing(0));
+            assert_eq!(view.progress(), (1, 2));
+            assert!(view.locked, "manual lock after commit");
+        });
+        cx.update(|window, cx| {
+            assert!(view.read(cx).focus_handle.is_focused(window));
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(1, 0, window, cx)
+        });
+        cx.run_until_parked();
+        let unchanged = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(unchanged, saved, "locked view discards the click");
+
+        view.update_in(cx, |view, window, cx| view.toggle_lock(window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(1, 0, window, cx)
+        });
+        cx.run_until_parked();
+        let final_saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(final_saved, saved.replace("[Answer]:\n", "[Answer]: A\n"));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (2, 2));
+            assert!(view.locked, "completing again auto-locks");
+        });
+    }
+
+    #[gpui::test]
+    async fn manual_lock_with_empty_input_keeps_answer(cx: &mut gpui::TestAppContext) {
+        use fs::Fs as _;
+
+        let (fs, view, cx) =
+            open_questionnaire(cx, &ON_DISK.replace("[Answer]:", "[Answer]: B")).await;
+        view.read_with(cx, |view, _| assert!(view.locked));
+
+        view.update_in(cx, |view, window, cx| view.toggle_lock(window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.on_option_clicked(0, 2, window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.is_editing(0)));
+
+        view.update_in(cx, |view, window, cx| view.toggle_lock(window, cx));
+        cx.run_until_parked();
+        let saved = fs
+            .load(std::path::Path::new("/root/stage-questions.md"))
+            .await
+            .expect("file loads");
+        assert_eq!(saved, ON_DISK.replace("[Answer]:", "[Answer]: B"));
+        view.read_with(cx, |view, _| {
+            assert!(!view.is_editing(0));
+            assert!(view.locked);
+        });
+        cx.update(|window, cx| {
+            assert!(view.read(cx).focus_handle.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    async fn empty_questionnaire_never_locks(cx: &mut gpui::TestAppContext) {
+        let (_fs, view, cx) = open_questionnaire(cx, "# notes\n").await;
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.progress(), (0, 0));
+            assert!(!view.locked);
+        });
+        draw_window(cx);
     }
 
     #[gpui::test]
