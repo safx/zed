@@ -8,6 +8,7 @@ use editor::{
     multibuffer_context_lines,
 };
 use git::Oid;
+use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{prelude::*, *};
 use language::{Buffer, BufferSnapshot, Capability, LanguageRegistry, Point};
@@ -237,7 +238,6 @@ impl project::ProjectItem for ReviewItem {
                     .as_ref()
                     .map(|review| review.unassigned.clone())
                     .unwrap_or_default();
-                let worktree_id = path.worktree_id;
                 let mut unique_paths: Vec<String> = Vec::new();
                 let hunk_paths = document
                     .groups
@@ -269,18 +269,15 @@ impl project::ProjectItem for ReviewItem {
                 let plans: Vec<PathPlan> = repo.read_with(cx, |repo, cx| {
                     let mut plans: Vec<PathPlan> = Vec::new();
                     for path_str in &unique_paths {
-                        let rel_path = match RelPath::from_unix_str(path_str) {
-                            Ok(p) => p.into_arc(),
+                        // avoid review.json's worktree; hunks may differ
+                        let repo_path = match RepoPath::new(path_str) {
+                            Ok(p) => p,
                             Err(err) => {
                                 log::warn!("review: skipping {path_str}: invalid path: {err}");
                                 continue;
                             }
                         };
-                        let project_path = ProjectPath {
-                            worktree_id,
-                            path: rel_path,
-                        };
-                        let Some(repo_path) = repo.project_path_to_repo_path(&project_path, cx)
+                        let Some(project_path) = repo.repo_path_to_project_path(&repo_path, cx)
                         else {
                             log::warn!("review: skipping {path_str}: not found in active repo");
                             continue;
@@ -859,7 +856,7 @@ impl ProjectItem for ReviewView {
         let (splittable, split_subscription) = build_splittable_for_group(
             &item,
             0,
-            true,
+            false,
             &project,
             &language_registry,
             weak_review,
@@ -870,7 +867,7 @@ impl ProjectItem for ReviewView {
         Self {
             item,
             active_group: 0,
-            show_reading: true,
+            show_reading: false,
             splittable,
             project,
             language_registry,
