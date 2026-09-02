@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use project::{Project, ProjectPath, WorktreeId};
 use search::ProjectSearchView;
 use search::project_search::{ProjectSearch, ProjectSearchBar};
 use task::Shell;
-use terminal::{TaskStatus, Terminal};
+use terminal::{Event as TerminalEvent, TaskStatus, Terminal};
 use terminal_view::TerminalView;
 use ui::{ActiveTheme, ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -37,6 +37,15 @@ use crate::{
 
 pub(crate) enum ArenaEvent {
     TerminalKeyInput { shell_pid: u32 },
+    /// Claude spinner (◐/◑) appeared or cleared in the terminal title.
+    TerminalTitleBusy { shell_pid: u32, busy: bool },
+}
+
+/// Watches a terminal's OSC 0 title for Claude's busy spinner.
+struct TitleWatch {
+    shell_pid: u32,
+    busy: bool,
+    _subscription: Subscription,
 }
 
 pub(crate) struct Arena {
@@ -49,6 +58,7 @@ pub(crate) struct Arena {
     pub(crate) workspace: WeakEntity<Workspace>,
     pub(crate) project: Entity<Project>,
     pub(crate) session_state: crate::SharedSessionState,
+    terminal_title_watches: HashMap<EntityId, TitleWatch>,
 }
 
 impl Arena {
@@ -105,6 +115,7 @@ impl Arena {
             workspace,
             project,
             session_state,
+            terminal_title_watches: HashMap::new(),
         }
     }
 
@@ -742,6 +753,52 @@ impl Arena {
         }
     }
 
+    /// Subscribe to a terminal's title changes to track Claude's spinner.
+    fn watch_terminal_title(
+        &mut self,
+        entity_id: EntityId,
+        shell_pid: u32,
+        terminal: Entity<Terminal>,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription =
+            cx.subscribe(&terminal, move |this, terminal, event: &TerminalEvent, cx| {
+                if matches!(event, TerminalEvent::BreadcrumbsChanged) {
+                    let busy = title_indicates_busy(&terminal.read(cx).breadcrumb_text);
+                    this.update_terminal_title_busy(entity_id, shell_pid, busy, cx);
+                }
+            });
+        self.terminal_title_watches.insert(
+            entity_id,
+            TitleWatch {
+                shell_pid,
+                busy: false,
+                _subscription: subscription,
+            },
+        );
+    }
+
+    /// Emit only when the spinner's busy/not-busy class changes.
+    fn update_terminal_title_busy(
+        &mut self,
+        entity_id: EntityId,
+        shell_pid: u32,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = match self.terminal_title_watches.get_mut(&entity_id) {
+            Some(watch) => {
+                let changed = watch.busy != busy;
+                watch.busy = busy;
+                changed
+            }
+            None => false,
+        };
+        if changed {
+            cx.emit(ArenaEvent::TerminalTitleBusy { shell_pid, busy });
+        }
+    }
+
     fn handle_pane_event(
         &mut self,
         pane: &Entity<Pane>,
@@ -782,15 +839,18 @@ impl Arena {
                     });
                 }
                 if let Some(tv) = item.downcast::<TerminalView>() {
-                    let terminal = tv.read(cx).terminal().read(cx);
+                    let terminal_entity = tv.read(cx).terminal().clone();
+                    let terminal = terminal_entity.read(cx);
                     if let Some(getter) = terminal.pid_getter() {
+                        let shell_pid = getter.fallback_pid().as_u32();
                         self.session_state.terminal_pid_cache.borrow_mut().insert(
                             tv.entity_id(),
                             crate::TerminalPidInfo {
-                                pid: getter.fallback_pid().as_u32(),
+                                pid: shell_pid,
                                 is_task_terminal: terminal.task().is_some(),
                             },
                         );
+                        self.watch_terminal_title(tv.entity_id(), shell_pid, terminal_entity, cx);
                     }
                 }
             }
@@ -800,6 +860,14 @@ impl Arena {
                         .terminal_pid_cache
                         .borrow_mut()
                         .remove(&tv.entity_id());
+                    if let Some(watch) = self.terminal_title_watches.remove(&tv.entity_id()) {
+                        if watch.busy {
+                            cx.emit(ArenaEvent::TerminalTitleBusy {
+                                shell_pid: watch.shell_pid,
+                                busy: false,
+                            });
+                        }
+                    }
                 }
             }
             &pane::Event::Split { direction, mode } => match mode {
@@ -1344,6 +1412,11 @@ fn add_terminal_view_to_pane(
     pane.update(cx, |pane, cx| {
         pane.add_item(terminal_view, true, true, None, window, cx);
     });
+}
+
+/// Claude animates ◐/◑ in the title only while busy; ✳ or empty means not busy.
+fn title_indicates_busy(title: &str) -> bool {
+    matches!(title.chars().next(), Some('\u{25D0}' | '\u{25D1}'))
 }
 
 fn indicator_for_terminal(

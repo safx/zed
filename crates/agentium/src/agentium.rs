@@ -80,8 +80,20 @@ enum ClaudeSessionState {
 struct ClaudeSession {
     ancestor_pids: Vec<u32>,
     state: ClaudeSessionState,
+    // Terminal title spinner (◐/◑) overrides `state` to Running.
+    title_busy: bool,
     user_prompt: String,
     status_message: String,
+}
+
+impl ClaudeSession {
+    fn effective_state(&self) -> ClaudeSessionState {
+        if self.title_busy {
+            ClaudeSessionState::Running
+        } else {
+            self.state
+        }
+    }
 }
 
 struct RateLimitEntry {
@@ -672,6 +684,9 @@ impl AgentiumApp {
                 // acknowledged_task_pids set.
                 ArenaEvent::TerminalKeyInput { shell_pid } => {
                     this.clear_session_for_shell_pid(*shell_pid, cx);
+                }
+                ArenaEvent::TerminalTitleBusy { shell_pid, busy } => {
+                    this.set_claude_session_title_busy(*shell_pid, *busy, cx);
                 }
             },
         );
@@ -1335,7 +1350,7 @@ impl AgentiumApp {
         let mut running_pids = HashSet::new();
         let mut permission_pids = HashSet::new();
         for session in self.claude_sessions.values() {
-            match session.state {
+            match session.effective_state() {
                 ClaudeSessionState::Completed => {
                     ready_pids.extend(session.ancestor_pids.iter().copied());
                 }
@@ -1378,6 +1393,7 @@ impl AgentiumApp {
             .or_insert_with(|| ClaudeSession {
                 ancestor_pids: Vec::new(),
                 state: ClaudeSessionState::Idle,
+                title_busy: false,
                 user_prompt: String::new(),
                 status_message: String::new(),
             });
@@ -1404,6 +1420,7 @@ impl AgentiumApp {
                 ClaudeSession {
                     ancestor_pids,
                     state: ClaudeSessionState::Completed,
+                    title_busy: false,
                     user_prompt: String::new(),
                     status_message,
                 },
@@ -1445,6 +1462,7 @@ impl AgentiumApp {
                 ClaudeSession {
                     ancestor_pids,
                     state: ClaudeSessionState::Completed,
+                    title_busy: false,
                     user_prompt: String::new(),
                     status_message: title,
                 },
@@ -1473,6 +1491,7 @@ impl AgentiumApp {
                 ClaudeSession {
                     ancestor_pids,
                     state: ClaudeSessionState::Running,
+                    title_busy: false,
                     user_prompt: prompt,
                     status_message: String::new(),
                 },
@@ -1514,6 +1533,7 @@ impl AgentiumApp {
                 ClaudeSession {
                     ancestor_pids,
                     state: ClaudeSessionState::WaitingPermission,
+                    title_busy: false,
                     user_prompt: String::new(),
                     status_message: String::new(),
                 },
@@ -2187,6 +2207,31 @@ impl AgentiumApp {
         }));
     }
 
+    fn set_claude_session_title_busy(
+        &mut self,
+        shell_pid: u32,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = self
+            .session_state
+            .pid_to_session_id
+            .borrow()
+            .get(&shell_pid)
+            .cloned();
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if let Some(session) = self.claude_sessions.get_mut(&session_id) {
+            if session.title_busy != busy {
+                session.title_busy = busy;
+                self.sync_session_derived_state();
+                self.notify_all_panes(cx);
+                cx.notify();
+            }
+        }
+    }
+
     fn clear_session_for_shell_pid(&mut self, shell_pid: u32, cx: &mut Context<Self>) {
         let mut changed = false;
         for session in self.claude_sessions.values_mut() {
@@ -2278,7 +2323,7 @@ impl AgentiumApp {
                     .claude_sessions
                     .values()
                     .find(|s| {
-                        s.state == state
+                        s.effective_state() == state
                             && s.ancestor_pids.contains(&pid)
                     })
                     .map(|s| (s.user_prompt.clone(), s.status_message.clone()))
