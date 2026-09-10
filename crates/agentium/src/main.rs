@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -154,6 +154,16 @@ enum TaskAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show the task containing the current directory: arenas, PRs, issues
+    Info {
+        /// Task selector: index from `task list`, UUID prefix, or title substring.
+        /// Defaults to the task containing the current directory.
+        #[arg(long)]
+        task: Option<String>,
+        /// Re-fetch PR and issue metadata before printing
+        #[arg(long)]
+        update: bool,
+    },
     /// Add an issue to a task
     AddIssue {
         /// Issue reference (URL, owner/repo#123, or PROJ-198)
@@ -167,6 +177,15 @@ enum TaskAction {
     AddArena {
         /// Worktree path (defaults to the current directory)
         path: Option<PathBuf>,
+        /// Task selector: index from `task list`, UUID prefix, or title substring.
+        /// Defaults to the task containing the current directory.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Link a pull request to a task
+    AddPr {
+        /// PR reference (URL, owner/repo#123, or a bare number resolved against the current repo's origin)
+        pr: String,
         /// Task selector: index from `task list`, UUID prefix, or title substring.
         /// Defaults to the task containing the current directory.
         #[arg(long)]
@@ -583,6 +602,7 @@ fn run_task_action(action: TaskAction) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        TaskAction::Info { task, update } => run_task_info(task.as_deref(), update),
         TaskAction::New {
             title,
             issue,
@@ -623,11 +643,62 @@ fn run_task_action(action: TaskAction) -> anyhow::Result<()> {
                 None => std::env::current_dir().context("cannot determine current directory")?,
             };
             let path = canonicalize_existing_path(&path)?;
+            if let Some(task) = board.tasks.iter().find(|task| task.id == task_id) {
+                if path_is_inside_task_worktrees(task, &path) {
+                    let worktree = task
+                        .worktrees
+                        .iter()
+                        .find(|worktree| path.starts_with(worktree))
+                        .map(|worktree| worktree.display().to_string())
+                        .unwrap_or_default();
+                    anyhow::bail!(
+                        "{} is inside worktree {worktree} which is already linked to this task",
+                        path.display()
+                    );
+                }
+            }
             dispatch_task_commands(vec![TaskCommand::AddArena {
                 task_id,
                 path: path.clone(),
             }])?;
             println!("linked {} to task {task_id}", path.display());
+            Ok(())
+        }
+        TaskAction::AddPr { pr, task } => {
+            let board = board::load_board();
+            let task_id = resolve_target_task(&board, task.as_deref())?;
+            let task = board
+                .tasks
+                .iter()
+                .find(|candidate| candidate.id == task_id)
+                .context("resolved task id not found in board")?;
+            let reference = resolve_pr_reference(&pr)?;
+            let label = reference.short_label();
+            // A linked PR is shown inside the arena row of its repository, so
+            // a repository no arena of the task points at would never be seen.
+            let origins = worktree_origins(task);
+            anyhow::ensure!(
+                !origins.is_empty(),
+                "task {:?} has no existing worktree to match {label} against",
+                task.title
+            );
+            anyhow::ensure!(
+                origins
+                    .iter()
+                    .any(|origin| agentium::pr_ref_matches_remote(&reference, origin)),
+                "{label} belongs to a repository that is not linked to task {:?}; linked origins:\n{}",
+                task.title,
+                origins
+                    .iter()
+                    .map(|origin| format!("  {origin}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            dispatch_task_commands(vec![TaskCommand::AddPr {
+                task_id,
+                pr: reference,
+            }])?;
+            println!("added {label} to task {task_id}");
             Ok(())
         }
         TaskAction::Done { task } => {
@@ -654,7 +725,7 @@ fn resolve_target_task(
     }
     let cwd = std::env::current_dir()?;
     let canonical = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    let containing = board.tasks_containing_worktree(&canonical);
+    let containing = board.tasks_containing_path(&canonical);
     match containing.len() {
         1 => Ok(containing[0].id),
         0 => anyhow::bail!(
@@ -678,6 +749,367 @@ fn format_active_tasks(board: &agentium::board::Board) -> String {
         "  (no tasks)".to_string()
     } else {
         lines.join("\n")
+    }
+}
+
+/// True when `path` is the same as, or a subdirectory of, one of `task`'s
+/// linked worktrees. Used to reject `add-arena` for a path already covered
+/// by an existing worktree link.
+fn path_is_inside_task_worktrees(task: &agentium::board::BoardTask, path: &std::path::Path) -> bool {
+    task.worktrees.iter().any(|worktree| path.starts_with(worktree))
+}
+
+/// Resolve an `add-pr` CLI argument to a `PrRef`. A bare number is resolved
+/// against the current directory's origin remote; anything else goes through
+/// `board::parse_pr_ref`.
+fn resolve_pr_reference(input: &str) -> anyhow::Result<agentium::board::PrRef> {
+    use agentium::board;
+    use anyhow::Context as _;
+
+    let Ok(number) = input.trim().parse::<u32>() else {
+        return board::parse_pr_ref(input);
+    };
+
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let origin = smol::block_on(agentium::git_remote_url(&cwd))
+        .with_context(|| format!("no origin remote found in {}", cwd.display()))?;
+
+    if let Some(remote) = agentium::parse_backlog_remote(&origin) {
+        return Ok(board::PrRef::Backlog {
+            web_host: remote.web_host,
+            project: remote.project,
+            repo: remote.repo,
+            number,
+        });
+    }
+
+    let browser_url = agentium::remote_url_to_browser_url(&origin);
+    let owner_repo = browser_url.as_deref().and_then(github_owner_repo_from_browser_url);
+    match owner_repo {
+        Some(repo) => Ok(board::PrRef::GitHub { repo, number }),
+        None => anyhow::bail!(
+            "cannot infer the PR provider from origin {origin}; pass a URL or owner/repo#N"
+        ),
+    }
+}
+
+/// Extract `owner/repo` from a GitHub browser URL, requiring the host to be
+/// exactly `github.com` and the path to have exactly two segments — a
+/// same-shaped URL on another host (GitLab, a GitHub Enterprise instance)
+/// must not be mistaken for a GitHub.com repository.
+fn github_owner_repo_from_browser_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
+    if host != "github.com" {
+        return None;
+    }
+    let mut segments = path.trim_matches('/').split('/').filter(|segment| !segment.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Extract the host portion of an `https://host/...` or `http://host/...` URL.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+fn provider_label(provider: agentium::board::PrProvider) -> &'static str {
+    match provider {
+        agentium::board::PrProvider::GitHub => "github",
+        agentium::board::PrProvider::Backlog => "backlog",
+    }
+}
+
+fn pr_status_label(status: agentium::board::PrStatus) -> &'static str {
+    match status {
+        agentium::board::PrStatus::Draft => "draft",
+        agentium::board::PrStatus::Open => "open",
+        agentium::board::PrStatus::Merged => "merged",
+        agentium::board::PrStatus::Closed => "closed",
+        agentium::board::PrStatus::Conflicted => "conflicted",
+    }
+}
+
+/// Origin URLs of the task's worktrees that exist on disk.
+fn worktree_origins(task: &agentium::board::BoardTask) -> Vec<String> {
+    task.worktrees
+        .iter()
+        .filter(|path| path.exists())
+        .filter_map(|path| git_output(path, &["remote", "get-url", "origin"]))
+        .collect()
+}
+
+fn cached_prs_for_path(
+    cache: &HashMap<String, Vec<agentium::PrInfo>>,
+    path: &std::path::Path,
+) -> Vec<agentium::PrInfo> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    cache
+        .get(&canonical.to_string_lossy().to_string())
+        .cloned()
+        .unwrap_or_default()
+}
+
+// Blocking is fine here: this runs in the synchronous CLI path, not in the app.
+#[allow(clippy::disallowed_methods)]
+fn probe_cli_available(program: &str) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Run one synchronous git subprocess in `path` and return trimmed stdout on
+/// success, or `None` on any failure (missing repo, no such remote, etc).
+fn git_output(path: &std::path::Path, args: &[&str]) -> Option<String> {
+    // Blocking is fine here: this runs in the synchronous CLI path, not in the app.
+    #[allow(clippy::disallowed_methods)]
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn short_uuid(id: uuid::Uuid) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+/// Print the task containing the current directory (or `--task`): its issues
+/// and its arenas with their PR state, marking PRs linked via `add-pr`. With
+/// `update`, re-fetches PR and issue metadata via `gh`/`bee` instead of
+/// showing the last-fetched cache; it never writes board.json or pr_cache.json.
+fn run_task_info(task: Option<&str>, update: bool) -> anyhow::Result<()> {
+    use agentium::board::{self, IssueRef};
+    use anyhow::Context as _;
+
+    let board = board::load_board();
+    let task_id = resolve_target_task(&board, task)?;
+    let task = board
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == task_id)
+        .context("resolved task id not found in board")?;
+    let index = board.active_tasks().position(|candidate| candidate.id == task_id);
+
+    let (gh_available, bee_available) = if update {
+        // Safety: single-threaded CLI invocation, no concurrent env access.
+        unsafe {
+            std::env::set_var("GH_PROMPT_DISABLED", "1");
+        }
+        (probe_cli_available("gh"), probe_cli_available("bee"))
+    } else {
+        (false, false)
+    };
+
+    match index {
+        Some(index) => println!("[{}] {}  ({})", index + 1, task.title, short_uuid(task.id)),
+        None => println!("{}  ({})", task.title, short_uuid(task.id)),
+    }
+
+    println!("issues:");
+    if task.issues.is_empty() {
+        println!("  (none)");
+    } else if update {
+        let results = smol::block_on(futures::future::join_all(task.issues.iter().map(
+            |issue| async move { (issue, agentium::fetch_issue_metadata_for(&issue.reference).await) },
+        )));
+        for (issue, result) in results {
+            let label = issue.reference.short_label();
+            match result {
+                Ok(metadata) => {
+                    let state = metadata.state.as_deref().or(issue.state.as_deref()).unwrap_or("?");
+                    let title = metadata.title.as_deref().or(issue.title.as_deref()).unwrap_or("");
+                    let url = metadata.url.as_deref().or(issue.url.as_deref()).unwrap_or("");
+                    println!("  {label}  {state}  {title}  {url}");
+                }
+                Err(error) => {
+                    eprintln!("failed to fetch issue {label}: {error:#}");
+                    let state = issue.state.as_deref().unwrap_or("?");
+                    let title = issue.title.as_deref().unwrap_or("");
+                    let url = issue.url.as_deref().unwrap_or("");
+                    println!("  {label}  {state}  {title}  {url}");
+                }
+            }
+        }
+    } else {
+        for issue in &task.issues {
+            let label = issue.reference.short_label();
+            let state = issue.state.as_deref().unwrap_or("?");
+            let title = issue.title.as_deref().unwrap_or("");
+            let url = issue.url.as_deref().unwrap_or("");
+            println!("  {label}  {state}  {title}  {url}");
+        }
+    }
+
+    println!("arenas:");
+    if task.worktrees.is_empty() {
+        println!("  (none)");
+    } else {
+        let task_backlog_issue_keys: Vec<String> = task
+            .issues
+            .iter()
+            .filter_map(|issue| match &issue.reference {
+                IssueRef::Backlog { issue_key } => Some(issue_key.clone()),
+                IssueRef::GitHub { .. } => None,
+            })
+            .collect();
+        // Loaded unconditionally: it's also the `--update` fallback when a
+        // fetch fails for one worktree.
+        let pr_cache = agentium::load_pr_cache();
+
+        for path in &task.worktrees {
+            if !path.exists() {
+                println!("  {}  (missing)", path.display());
+                continue;
+            }
+
+            let branch = git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            let short_sha = git_output(path, &["rev-parse", "--short", "HEAD"]);
+            let origin = git_output(path, &["remote", "get-url", "origin"]);
+            let (host, provider) = match origin.as_deref() {
+                Some(origin_url) => {
+                    if let Some(remote) = agentium::parse_backlog_remote(origin_url) {
+                        (remote.web_host, "backlog")
+                    } else if let Some(browser_url) = agentium::remote_url_to_browser_url(origin_url) {
+                        let host = url_host(&browser_url).unwrap_or_else(|| browser_url.clone());
+                        let provider = if host == "github.com" { "github" } else { "unknown" };
+                        (host, provider)
+                    } else {
+                        (origin_url.to_string(), "unknown")
+                    }
+                }
+                None => ("?".to_string(), "unknown"),
+            };
+            println!(
+                "  {}   {} @ {}   origin: {} ({})",
+                path.display(),
+                branch.as_deref().unwrap_or("?"),
+                short_sha.as_deref().unwrap_or("?"),
+                host,
+                provider,
+            );
+
+            let prs: Vec<agentium::PrInfo> = if update {
+                match smol::block_on(agentium::fetch_pr_list(
+                    path,
+                    agentium::PrFetchContext {
+                        gh_available,
+                        bee_available,
+                        task_issue_keys: task_backlog_issue_keys.clone(),
+                        task_pr_refs: task.prs.clone(),
+                        known_issue_ids: HashMap::new(),
+                        failed_issue_keys: HashSet::new(),
+                    },
+                )) {
+                    Ok(outcome) => outcome.prs,
+                    Err(error) => {
+                        eprintln!("failed to fetch PRs for {}: {error:#}", path.display());
+                        cached_prs_for_path(&pr_cache, path)
+                    }
+                }
+            } else {
+                cached_prs_for_path(&pr_cache, path)
+            };
+
+            for pr in prs {
+                let linked = task
+                    .prs
+                    .iter()
+                    .any(|reference| reference.html_url() == *pr.html_url);
+                println!(
+                    "    {}  #{}  {}  {}  {}{}",
+                    provider_label(pr.provider),
+                    pr.number,
+                    pr_status_label(pr.status),
+                    pr.base_ref,
+                    pr.title,
+                    if linked { "  (linked)" } else { "" },
+                );
+            }
+        }
+    }
+
+    // Linked PRs whose repository no existing worktree points at would never
+    // surface in an arena row, so list them explicitly.
+    let origins = worktree_origins(task);
+    let unlinked: Vec<&board::PrRef> = task
+        .prs
+        .iter()
+        .filter(|reference| {
+            !origins
+                .iter()
+                .any(|origin| agentium::pr_ref_matches_remote(reference, origin))
+        })
+        .collect();
+    if !unlinked.is_empty() {
+        println!("unlinked:");
+        for reference in unlinked {
+            println!(
+                "  {}  {}  {}",
+                provider_label(reference.provider()),
+                reference.short_label(),
+                reference.html_url(),
+            );
+        }
+    }
+
+    if !update {
+        println!("(PR/issue values are from the last fetch; pass --update to refresh)");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod task_action_tests {
+    use agentium::board::BoardTask;
+    use std::path::PathBuf;
+
+    use super::path_is_inside_task_worktrees;
+
+    fn task_with_worktrees(worktrees: Vec<PathBuf>) -> BoardTask {
+        BoardTask {
+            id: uuid::Uuid::new_v4(),
+            title: "test task".to_string(),
+            issues: Vec::new(),
+            worktrees,
+            archived: false,
+            prs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detects_subdirectory_of_worktree() {
+        let task = task_with_worktrees(vec![PathBuf::from("/repo/worktree")]);
+        assert!(path_is_inside_task_worktrees(
+            &task,
+            &PathBuf::from("/repo/worktree/subdir")
+        ));
+    }
+
+    #[test]
+    fn detects_worktree_root_itself() {
+        let task = task_with_worktrees(vec![PathBuf::from("/repo/worktree")]);
+        assert!(path_is_inside_task_worktrees(&task, &PathBuf::from("/repo/worktree")));
+    }
+
+    #[test]
+    fn rejects_unrelated_path() {
+        let task = task_with_worktrees(vec![PathBuf::from("/repo/worktree")]);
+        assert!(!path_is_inside_task_worktrees(&task, &PathBuf::from("/repo/other")));
     }
 }
 
@@ -1254,6 +1686,8 @@ fn main() {
             }
         }
         Some(Command::Task { action }) => {
+            zlog::init();
+            zlog::init_output_stderr();
             if let Err(error) = run_task_action(action) {
                 eprintln!("error: {error:#}");
                 std::process::exit(1);

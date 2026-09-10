@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Agentium
 
 A terminal application for parallel work with AI coding agents, powered by [Zed](https://zed.dev/) and built on [GPUI](../gpui/).
@@ -105,18 +108,24 @@ Manage the task board. When an Agentium instance is running, commands are handed
 ```
 agentium task new <TITLE> [--issue <ISSUE>]... [--arena <PATH>]...
 agentium task list [--json]
+agentium task info [--task <TASK>] [--update]
 agentium task add-issue <ISSUE> [--task <TASK>]
 agentium task add-arena [<PATH>] [--task <TASK>]
+agentium task add-pr <PR> [--task <TASK>]
 agentium task done <TASK>
 ```
 
 - `<ISSUE>` accepts a GitHub issue URL, `owner/repo#123`, a Backlog issue URL (`https://<space>/view/PROJ-123`), or a Backlog issue key (`PROJ-123`)
+- `<PR>` accepts a GitHub PR URL, `owner/repo#123`, a Backlog PR URL (`https://<space>/git/<project>/<repo>/pullRequests/<n>`), or a bare number resolved against the current repo's origin. The PR's repository must be the origin of one of the task's arenas; otherwise `add-pr` errors and lists the task's origins
 - `<TASK>` accepts the 1-based index shown by `task list`, a task UUID prefix, or a unique title substring
-- When `--task` is omitted, the task containing the current directory's worktree is used (errors with candidates if ambiguous)
-- `task add-arena` defaults to the current directory; paths are canonicalized
+- When `--task` is omitted, the task containing the current directory's worktree (or a subdirectory of it) is used (errors with candidates if ambiguous)
+- `task add-arena` defaults to the current directory; paths are canonicalized; it refuses a path that is already inside a worktree linked to the task
 - `task list --json` includes archived tasks and task ids; the plain listing hides archived tasks
+- `task info` prints the task's issues and its arenas with their PR state; PRs linked via `add-pr` are marked `(linked)`, and linked PRs whose repository matches none of the task's arenas are listed under `unlinked:`. Arena PRs are read from `pr_cache.json`, written by the running app, so values for arenas that were not recently active can be stale. `--update` re-fetches everything via `gh`/`bee` for the printed output only — it never writes board.json or pr_cache.json
 
 Issue metadata (title, state, URL) is fetched by the running app via `gh issue view` for GitHub and `bee issue view` for Backlog. Backlog integration requires the [`bee`](https://nulab.github.io/bee/) CLI, authenticated via `bee auth login`; without it, issues are shown by key only.
+
+PRs linked with `add-pr` appear inside the row of every arena of the task whose origin is that repository, exactly like branch-discovered PRs (status icon, CI, reviews, tooltip). Right-click a PR pill for "Open in Browser"; a linked PR also offers "Remove from Task". Backlog PRs in arena rows carry a `b` badge.
 
 ### `agentium claude hook <event>`
 
