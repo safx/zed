@@ -40,6 +40,10 @@ pub struct BoardTask {
     pub worktrees: Vec<PathBuf>,
     #[serde(default)]
     pub archived: bool,
+    // Manually linked PRs. Each belongs to the arena(s) of this task whose
+    // origin is the same repository; see `pr_ref_matches_remote`.
+    #[serde(default)]
+    pub prs: Vec<PrRef>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -94,6 +98,71 @@ impl IssueLink {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum PrStatus {
+    Draft,
+    Open,
+    Merged,
+    Closed,
+    Conflicted,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum PrProvider {
+    GitHub,
+    Backlog,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum PrRef {
+    #[serde(rename = "github")]
+    GitHub { repo: String, number: u32 },
+    Backlog {
+        web_host: String,
+        project: String,
+        repo: String,
+        number: u32,
+    },
+}
+
+impl PrRef {
+    pub fn number(&self) -> u32 {
+        match self {
+            PrRef::GitHub { number, .. } => *number,
+            PrRef::Backlog { number, .. } => *number,
+        }
+    }
+
+    pub fn provider(&self) -> PrProvider {
+        match self {
+            PrRef::GitHub { .. } => PrProvider::GitHub,
+            PrRef::Backlog { .. } => PrProvider::Backlog,
+        }
+    }
+
+    pub fn short_label(&self) -> String {
+        match self {
+            PrRef::GitHub { repo, number } => format!("{repo}#{number}"),
+            PrRef::Backlog { repo, number, .. } => format!("{repo}#{number}"),
+        }
+    }
+
+    pub fn html_url(&self) -> String {
+        match self {
+            PrRef::GitHub { repo, number } => format!("https://github.com/{repo}/pull/{number}"),
+            PrRef::Backlog {
+                web_host,
+                project,
+                repo,
+                number,
+            } => format!("https://{web_host}/git/{project}/{repo}/pullRequests/{number}"),
+        }
+    }
+}
+
 /// A fully-resolved mutation, produced by the CLI (selectors and paths already
 /// resolved against a read-only snapshot) and applied by whichever process owns
 /// the board at that moment.
@@ -111,6 +180,10 @@ pub enum TaskCommand {
     AddIssue {
         task_id: Uuid,
         issue: IssueLink,
+    },
+    AddPr {
+        task_id: Uuid,
+        pr: PrRef,
     },
     AddArena {
         task_id: Uuid,
@@ -174,6 +247,19 @@ impl Board {
             .collect()
     }
 
+    /// Find the tasks whose worktrees contain `path` or an ancestor of it
+    /// (already canonicalized). Lets callers resolve a task from a
+    /// subdirectory of a worktree, not just the worktree root itself.
+    pub fn tasks_containing_path(&self, path: &Path) -> Vec<&BoardTask> {
+        for ancestor in path.ancestors() {
+            let matches = self.tasks_containing_worktree(ancestor);
+            if !matches.is_empty() {
+                return matches;
+            }
+        }
+        Vec::new()
+    }
+
     pub fn task_mut(&mut self, task_id: Uuid) -> anyhow::Result<&mut BoardTask> {
         self.tasks
             .iter_mut()
@@ -199,6 +285,7 @@ impl Board {
                     issues,
                     worktrees,
                     archived: false,
+                    prs: Vec::new(),
                 });
             }
             TaskCommand::AddIssue { task_id, issue } => {
@@ -209,6 +296,12 @@ impl Board {
                     .any(|existing| existing.reference == issue.reference)
                 {
                     task.issues.push(issue);
+                }
+            }
+            TaskCommand::AddPr { task_id, pr } => {
+                let task = self.task_mut(task_id)?;
+                if !task.prs.contains(&pr) {
+                    task.prs.push(pr);
                 }
             }
             TaskCommand::AddArena { task_id, path } => {
@@ -330,6 +423,76 @@ pub fn parse_issue_ref(input: &str) -> anyhow::Result<IssueLink> {
     );
 }
 
+/// Parse a user-supplied PR reference. Accepts:
+/// - `https://github.com/{owner}/{repo}/pull/{n}` (query string and trailing
+///   path segments such as `/files` are ignored)
+/// - `https://{host}/git/{project}/{repo}/pullRequests/{n}` (Backlog, any host)
+/// - `owner/repo#N`
+///
+/// Bare numbers are deliberately not handled here: resolving them needs the
+/// current repo's origin remote, which the CLI does separately.
+pub fn parse_pr_ref(input: &str) -> anyhow::Result<PrRef> {
+    let input = input.trim();
+    const ACCEPTED_FORMS: &str = "expected a GitHub PR URL (https://github.com/owner/repo/pull/123), \
+        a Backlog PR URL (https://space.backlog.jp/git/PROJECT/repo/pullRequests/123), \
+        or owner/repo#123";
+
+    if let Some(rest) = input.strip_prefix("https://github.com/") {
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+        if parts.len() >= 4 && parts[2] == "pull" {
+            let number: u32 = parts[3]
+                .parse()
+                .with_context(|| format!("invalid PR number in {input:?}"))?;
+            return Ok(PrRef::GitHub {
+                repo: format!("{}/{}", parts[0], parts[1]),
+                number,
+            });
+        }
+        anyhow::bail!("unsupported GitHub URL: {input} ({ACCEPTED_FORMS})");
+    }
+
+    if input.starts_with("https://") || input.starts_with("http://") {
+        let without_scheme = input.split("://").nth(1).unwrap_or_default();
+        let mut segments = without_scheme.split('/');
+        let host = segments.next().unwrap_or_default();
+        if segments.next() == Some("git") {
+            if let (Some(project), Some(repo), Some("pullRequests"), Some(number)) = (
+                segments.next(),
+                segments.next(),
+                segments.next(),
+                segments.next(),
+            ) {
+                let number = number.split(['?', '#']).next().unwrap_or(number);
+                let number: u32 = number
+                    .parse()
+                    .with_context(|| format!("invalid PR number in {input:?}"))?;
+                return Ok(PrRef::Backlog {
+                    web_host: host.to_string(),
+                    project: project.to_string(),
+                    repo: repo.to_string(),
+                    number,
+                });
+            }
+        }
+        anyhow::bail!("unsupported PR URL: {input} ({ACCEPTED_FORMS})");
+    }
+
+    if let Some((repo, number)) = input.split_once('#') {
+        if repo.split('/').count() == 2 && !repo.contains(char::is_whitespace) {
+            let number: u32 = number
+                .parse()
+                .with_context(|| format!("invalid PR number in {input:?}"))?;
+            return Ok(PrRef::GitHub {
+                repo: repo.to_string(),
+                number,
+            });
+        }
+    }
+
+    anyhow::bail!("cannot parse PR reference {input:?} ({ACCEPTED_FORMS})");
+}
+
 pub(crate) fn is_backlog_issue_key(input: &str) -> bool {
     let Some((project, number)) = input.rsplit_once('-') else {
         return false;
@@ -372,6 +535,7 @@ mod tests {
                 ],
                 worktrees: vec![PathBuf::from("/tmp/example")],
                 archived: false,
+                prs: Vec::new(),
             }],
         }
     }
@@ -450,6 +614,7 @@ mod tests {
             issues: Vec::new(),
             worktrees: Vec::new(),
             archived: true,
+            prs: Vec::new(),
         });
         let id = board.tasks[0].id;
         assert_eq!(board.resolve_task("1").unwrap(), id);
@@ -457,5 +622,137 @@ mod tests {
         assert_eq!(board.resolve_task("yyy").unwrap(), id);
         assert!(board.resolve_task("2").is_err());
         assert!(board.resolve_task("archived").is_err());
+    }
+
+    #[test]
+    fn parse_pr_ref_accepts_documented_forms() {
+        assert_eq!(
+            parse_pr_ref("https://github.com/safx/zed/pull/12").unwrap(),
+            PrRef::GitHub {
+                repo: "safx/zed".to_string(),
+                number: 12
+            }
+        );
+        assert_eq!(
+            parse_pr_ref("https://github.com/safx/zed/pull/12/files").unwrap(),
+            PrRef::GitHub {
+                repo: "safx/zed".to_string(),
+                number: 12
+            }
+        );
+        assert_eq!(
+            parse_pr_ref("https://github.com/safx/zed/pull/12?diff=split").unwrap(),
+            PrRef::GitHub {
+                repo: "safx/zed".to_string(),
+                number: 12
+            }
+        );
+        assert_eq!(
+            parse_pr_ref("safx/zed#12").unwrap(),
+            PrRef::GitHub {
+                repo: "safx/zed".to_string(),
+                number: 12
+            }
+        );
+        assert_eq!(
+            parse_pr_ref(
+                "https://nulab.backlog.jp/git/BLG_AI_INTEGRATION/backlog-ai-agent/pullRequests/163"
+            )
+            .unwrap(),
+            PrRef::Backlog {
+                web_host: "nulab.backlog.jp".to_string(),
+                project: "BLG_AI_INTEGRATION".to_string(),
+                repo: "backlog-ai-agent".to_string(),
+                number: 163,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pr_ref_rejects_unsupported_forms() {
+        assert!(parse_pr_ref("https://github.com/safx/zed/issues/12").is_err());
+        assert!(parse_pr_ref("12").is_err());
+        assert!(parse_pr_ref("not a pr").is_err());
+    }
+
+    #[test]
+    fn task_command_add_pr_round_trips_through_value_and_string() {
+        let command = TaskCommand::AddPr {
+            task_id: Uuid::new_v4(),
+            pr: parse_pr_ref("safx/zed#12").unwrap(),
+        };
+        let value = serde_json::to_value(&command).unwrap();
+        let parsed: TaskCommand = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, command);
+
+        let json = serde_json::to_string(&command).unwrap();
+        let parsed: TaskCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, command);
+    }
+
+    #[test]
+    fn apply_add_pr_is_idempotent() {
+        let mut board = sample_board();
+        let task_id = board.tasks[0].id;
+        let pr = parse_pr_ref("safx/zed#12").unwrap();
+        board
+            .apply(TaskCommand::AddPr {
+                task_id,
+                pr: pr.clone(),
+            })
+            .unwrap();
+        board
+            .apply(TaskCommand::AddPr { task_id, pr })
+            .unwrap();
+        assert_eq!(board.tasks[0].prs.len(), 1);
+    }
+
+    #[test]
+    fn pr_ref_deserializes_ignoring_legacy_cache_fields() {
+        // Boards written by the first implementation carried cached title and
+        // status next to the reference; they must still load.
+        let json = r#"{"provider":"github","repo":"o/r","number":1,"title":"x","status":"open"}"#;
+        let reference: PrRef = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            reference,
+            PrRef::GitHub {
+                repo: "o/r".to_string(),
+                number: 1
+            }
+        );
+        let json = r#"{"provider":"backlog","web_host":"h.backlog.jp","project":"P","repo":"r","number":2,"title":"y","status":"closed"}"#;
+        let reference: PrRef = serde_json::from_str(json).unwrap();
+        assert_eq!(reference.number(), 2);
+        assert_eq!(reference.provider(), PrProvider::Backlog);
+    }
+
+    #[test]
+    fn pr_status_round_trips_as_lowercase_json() {
+        assert_eq!(
+            serde_json::to_string(&PrStatus::Conflicted).unwrap(),
+            "\"conflicted\""
+        );
+        let parsed: PrStatus = serde_json::from_str("\"merged\"").unwrap();
+        assert_eq!(parsed, PrStatus::Merged);
+    }
+
+    #[test]
+    fn tasks_containing_path_resolves_subdirectories_of_a_worktree() {
+        let board = sample_board();
+        let worktree = &board.tasks[0].worktrees[0];
+        let subdirectory = worktree.join("src");
+
+        let by_worktree = board.tasks_containing_path(worktree);
+        let by_subdirectory = board.tasks_containing_path(&subdirectory);
+        assert_eq!(by_worktree.len(), 1);
+        assert_eq!(by_subdirectory.len(), 1);
+        assert_eq!(by_worktree[0].id, board.tasks[0].id);
+        assert_eq!(by_subdirectory[0].id, board.tasks[0].id);
+
+        assert!(
+            board
+                .tasks_containing_path(Path::new("/unrelated/path"))
+                .is_empty()
+        );
     }
 }
