@@ -149,24 +149,17 @@ pub struct PrSessionData {
     pub pr: BTreeSet<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum PrStatus {
-    Draft,
-    Open,
-    Merged,
-    Closed,
-    Conflicted,
-}
+pub use board::{PrProvider, PrStatus};
 
-#[derive(Clone, Debug, PartialEq)]
-enum ReviewDecision {
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ReviewDecision {
     Approved,
     ChangesRequested,
     ReviewRequired,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum ReviewState {
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ReviewState {
     Approved,
     ChangesRequested,
     Commented,
@@ -174,37 +167,31 @@ enum ReviewState {
     Pending,
 }
 
-#[derive(Clone, Debug)]
-struct ReviewEntry {
-    user: SharedString,
-    state: ReviewState,
-    commit_oid: SharedString,
-    avatar_url: SharedString,
-    submitted_at: SharedString,
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewEntry {
+    pub user: SharedString,
+    pub state: ReviewState,
+    pub commit_oid: SharedString,
+    pub avatar_url: SharedString,
+    pub submitted_at: SharedString,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PrProvider {
-    GitHub,
-    Backlog,
-}
-
-#[derive(Clone, Debug)]
-struct PrInfo {
-    number: u32,
-    title: SharedString,
-    status: PrStatus,
-    html_url: SharedString,
-    review_decision: Option<ReviewDecision>,
-    review_count: usize,
-    head_sha: SharedString,
-    reviews: Vec<ReviewEntry>,
-    base_ref: SharedString,
-    provider: PrProvider,
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PrInfo {
+    pub number: u32,
+    pub title: SharedString,
+    pub status: PrStatus,
+    pub html_url: SharedString,
+    pub review_decision: Option<ReviewDecision>,
+    pub review_count: usize,
+    pub head_sha: SharedString,
+    pub reviews: Vec<ReviewEntry>,
+    pub base_ref: SharedString,
+    pub provider: PrProvider,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum CiStatus {
+pub enum CiStatus {
     AllPassed,
     Failed,
     PendingWithFailure,
@@ -212,15 +199,15 @@ enum CiStatus {
 }
 
 #[derive(Clone, Debug)]
-struct CiCheckEntry {
-    name: SharedString,
-    bucket: SharedString,
+pub struct CiCheckEntry {
+    pub name: SharedString,
+    pub bucket: SharedString,
 }
 
 #[derive(Clone, Debug)]
-struct CiInfo {
-    status: CiStatus,
-    checks: Vec<CiCheckEntry>,
+pub struct CiInfo {
+    pub status: CiStatus,
+    pub checks: Vec<CiCheckEntry>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -287,6 +274,11 @@ pub struct AgentiumApp {
     last_branch_names: HashMap<EntityId, Option<String>>,
     pr_session_db: HashMap<String, HashMap<String, PrSessionData>>,
     _pr_session_db_write_task: Option<Task<()>>,
+    // Snapshot of the most recent arena-derived PR fetch per canonical worktree
+    // path, persisted so `agentium task info` can show PRs without an app
+    // instance running. Loaded once at startup; see `apply_pr_fetch_result`.
+    pr_cache: HashMap<String, Vec<PrInfo>>,
+    _pr_cache_write_task: Option<Task<()>>,
     board: board::Board,
     _board_write_task: Option<Task<()>>,
     bee_available: bool,
@@ -608,6 +600,8 @@ impl AgentiumApp {
             last_branch_names: HashMap::new(),
             pr_session_db: load_pr_session_db(),
             _pr_session_db_write_task: None,
+            pr_cache: load_pr_cache(),
+            _pr_cache_write_task: None,
             board: board::load_board(),
             _board_write_task: None,
             bee_available: false,
@@ -808,17 +802,17 @@ impl AgentiumApp {
     /// touches app state.
     fn pr_fetch_context(&self, entity_id: EntityId, cx: &App) -> PrFetchContext {
         let mut task_issue_keys: Vec<String> = Vec::new();
-        if self.bee_available {
-            if let Some(index) = self
-                .arenas
-                .iter()
-                .position(|arena| arena.entity_id() == entity_id)
-            {
-                for task_id in self.tasks_containing_arena(index, cx) {
-                    let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id)
-                    else {
-                        continue;
-                    };
+        let mut task_pr_refs: Vec<board::PrRef> = Vec::new();
+        if let Some(index) = self
+            .arenas
+            .iter()
+            .position(|arena| arena.entity_id() == entity_id)
+        {
+            for task_id in self.tasks_containing_arena(index, cx) {
+                let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id) else {
+                    continue;
+                };
+                if self.bee_available {
                     for issue in &task.issues {
                         if let board::IssueRef::Backlog { issue_key } = &issue.reference {
                             if !task_issue_keys.contains(issue_key) {
@@ -827,12 +821,18 @@ impl AgentiumApp {
                         }
                     }
                 }
+                for reference in &task.prs {
+                    if !task_pr_refs.contains(reference) {
+                        task_pr_refs.push(reference.clone());
+                    }
+                }
             }
         }
         PrFetchContext {
             gh_available: self.gh_available,
             bee_available: self.bee_available,
             task_issue_keys,
+            task_pr_refs,
             known_issue_ids: self.backlog_issue_ids.clone(),
             failed_issue_keys: self.failed_backlog_issue_keys.clone(),
         }
@@ -907,6 +907,33 @@ impl AgentiumApp {
                 self.pr_info.remove(&entity_id);
             }
         }
+
+        // Snapshot the fetch result to disk so `agentium task info` can show
+        // arena PRs without an app instance running. Keyed the same way as
+        // `save_pr_session_mapping` so both agree on one arena's identity.
+        if let Some(working_dir) = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)
+            .and_then(|a| a.read(cx).working_directory.clone())
+        {
+            let path = std::fs::canonicalize(&working_dir)
+                .unwrap_or(working_dir)
+                .to_string_lossy()
+                .to_string();
+            let new_entry = self.pr_info.get(&entity_id).cloned();
+            let old_entry = match &new_entry {
+                Some(prs) => self.pr_cache.insert(path.clone(), prs.clone()),
+                None => self.pr_cache.remove(&path),
+            };
+            if old_entry != new_entry {
+                let snapshot = self.pr_cache.clone();
+                self._pr_cache_write_task = Some(cx.background_spawn(async move {
+                    write_pr_cache(&snapshot).log_err();
+                }));
+            }
+        }
+
         cx.notify();
     }
 
@@ -954,7 +981,7 @@ impl AgentiumApp {
                     let result = cx
                         .background_executor()
                         .spawn(async move {
-                            fetch_ci_status(&working_dir, pr_number).await
+                            fetch_ci_status(Some(&working_dir), pr_number, None).await
                         })
                         .await;
                     let elapsed = start.elapsed();
@@ -1045,7 +1072,7 @@ impl AgentiumApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_ci_status(&working_dir, pr_number).await })
+                .spawn(async move { fetch_ci_status(Some(&working_dir), pr_number, None).await })
                 .await;
             this.update(cx, |this, cx| {
                 this.ci_last_checked
@@ -1709,12 +1736,71 @@ impl AgentiumApp {
     }
 
     pub fn handle_task_command(&mut self, command: board::TaskCommand, cx: &mut Context<Self>) {
+        let linked_pr_task = match &command {
+            board::TaskCommand::AddPr { task_id, .. } => Some(*task_id),
+            _ => None,
+        };
         if let Err(error) = self.board.apply(command) {
             log::warn!("failed to apply task command: {error:#}");
             return;
         }
         self.board_changed(cx);
         self.fetch_issue_metadata(false, cx);
+        if let Some(task_id) = linked_pr_task {
+            // Polling only covers the active arena, so a PR linked to an
+            // inactive arena would otherwise not show until it is switched to.
+            self.refetch_prs_for_task_arenas(task_id, cx);
+        }
+    }
+
+    fn live_arena_entity_ids_for_task(&self, task_id: Uuid) -> Vec<EntityId> {
+        self.board_cache
+            .task_worktrees
+            .get(&task_id)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| match row {
+                        WorktreeRow::Live { arena_index } => self
+                            .arenas
+                            .get(*arena_index)
+                            .map(|arena| arena.entity_id()),
+                        WorktreeRow::Closed { .. } | WorktreeRow::Missing { .. } => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn refetch_prs_for_task_arenas(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
+        for entity_id in self.live_arena_entity_ids_for_task(task_id) {
+            self.fetch_pr_for_arena(entity_id, cx);
+        }
+    }
+
+    /// Which task, if any, manually linked the PR at `html_url` to the arena at
+    /// `arena_index`. Render-path helper: reads the board cache only, never the
+    /// filesystem.
+    fn manual_pr_link_for_arena(
+        &self,
+        arena_index: usize,
+        html_url: &str,
+    ) -> Option<(Uuid, board::PrRef)> {
+        self.board_cache
+            .task_worktrees
+            .iter()
+            .find_map(|(task_id, rows)| {
+                let arena_is_in_task = rows.iter().any(|row| {
+                    matches!(row, WorktreeRow::Live { arena_index: index } if *index == arena_index)
+                });
+                if !arena_is_in_task {
+                    return None;
+                }
+                let task = self.board.tasks.iter().find(|task| task.id == *task_id)?;
+                task.prs
+                    .iter()
+                    .find(|reference| reference.html_url() == html_url)
+                    .map(|reference| (*task_id, reference.clone()))
+            })
     }
 
     fn board_changed(&mut self, cx: &mut Context<Self>) {
@@ -1964,6 +2050,19 @@ impl AgentiumApp {
         self.board_changed(cx);
     }
 
+    fn remove_pr_from_task(
+        &mut self,
+        task_id: Uuid,
+        reference: &board::PrRef,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(task) = self.board.task_mut(task_id) {
+            task.prs.retain(|pr| pr != reference);
+        }
+        self.board_changed(cx);
+        self.refetch_prs_for_task_arenas(task_id, cx);
+    }
+
     fn remove_worktree_from_task(
         &mut self,
         task_id: Uuid,
@@ -2081,6 +2180,45 @@ impl AgentiumApp {
                     this.remove_issue_from_task(task_id, &reference, cx);
                 }),
             )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn deploy_pr_context_menu(
+        &mut self,
+        url: String,
+        manual_link: Option<(Uuid, board::PrRef)>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            let menu = menu.entry(
+                "Open in Browser",
+                None,
+                window.handler_for(&this, move |_this, _window, cx| {
+                    cx.open_url(&url);
+                }),
+            );
+            match manual_link {
+                Some((task_id, reference)) => menu.entry(
+                    "Remove from Task",
+                    None,
+                    window.handler_for(&this, move |this, _window, cx| {
+                        this.remove_pr_from_task(task_id, &reference, cx);
+                    }),
+                ),
+                None => menu,
+            }
         });
         window.focus(&context_menu.focus_handle(cx), cx);
         let subscription =
@@ -2978,7 +3116,7 @@ fn format_relative_time(iso: &str) -> String {
     }
 }
 
-fn remote_url_to_browser_url(url: &str) -> Option<String> {
+pub fn remote_url_to_browser_url(url: &str) -> Option<String> {
     let url = url.strip_suffix(".git").unwrap_or(url).trim_end_matches('/');
     if url.starts_with("https://") || url.starts_with("http://") {
         Some(url.to_string())
@@ -3024,33 +3162,112 @@ fn write_pr_session_db(
     Ok(())
 }
 
+/// Snapshot of the last-fetched PRs per worktree, keyed by canonical path, so
+/// `agentium task info` can show arena PRs without a live app instance.
+/// Written only by the app (single-writer, same rule as `board.json`).
+pub fn load_pr_cache() -> HashMap<String, Vec<PrInfo>> {
+    let path = paths::data_dir().join("pr_cache.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|error| anyhow::anyhow!("Failed to parse {}: {error}", path.display()))
+            .log_err()
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+pub fn write_pr_cache(cache: &HashMap<String, Vec<PrInfo>>) -> anyhow::Result<()> {
+    let path = paths::data_dir().join("pr_cache.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_string_pretty(cache)?)?;
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
 /// Per-fetch inputs snapshotted on the main thread so the background fetch
 /// never touches app state.
-struct PrFetchContext {
-    gh_available: bool,
-    bee_available: bool,
+pub struct PrFetchContext {
+    pub gh_available: bool,
+    pub bee_available: bool,
     // Backlog issue keys registered on tasks containing this arena.
-    task_issue_keys: Vec<String>,
-    known_issue_ids: HashMap<String, u64>,
-    failed_issue_keys: HashSet<String>,
+    pub task_issue_keys: Vec<String>,
+    // PRs manually linked (`agentium task add-pr`) on tasks containing this
+    // arena; only those of the arena's own repository are fetched.
+    pub task_pr_refs: Vec<board::PrRef>,
+    pub known_issue_ids: HashMap<String, u64>,
+    pub failed_issue_keys: HashSet<String>,
 }
 
 #[derive(Default)]
-struct PrFetchOutcome {
-    prs: Vec<PrInfo>,
+pub struct PrFetchOutcome {
+    pub prs: Vec<PrInfo>,
     // Issue key -> id pairs resolved during this fetch, for the app-level cache.
-    resolved_backlog_ids: Vec<(String, u64)>,
+    pub resolved_backlog_ids: Vec<(String, u64)>,
     // Keys Backlog reported as nonexistent, for the negative cache.
-    failed_backlog_keys: Vec<String>,
+    pub failed_backlog_keys: Vec<String>,
 }
 
-struct BacklogRemote {
-    web_host: String,
-    project: String,
-    repo: String,
+pub struct BacklogRemote {
+    pub web_host: String,
+    pub project: String,
+    pub repo: String,
 }
 
-fn parse_backlog_remote(url: &str) -> Option<BacklogRemote> {
+/// Whether a manually linked PR belongs to the repository at `remote_url`
+/// (a git origin URL). Shared by the arena PR fetch, which uses it to pick
+/// the task's linked PRs that concern the arena, and by the CLI, which refuses
+/// to link a PR from a repository none of the task's worktrees point at.
+pub fn pr_ref_matches_remote(reference: &board::PrRef, remote_url: &str) -> bool {
+    match reference {
+        board::PrRef::GitHub { repo, .. } => github_owner_repo_from_remote(remote_url)
+            .is_some_and(|owner_repo| owner_repo.eq_ignore_ascii_case(repo)),
+        board::PrRef::Backlog {
+            web_host,
+            project,
+            repo,
+            ..
+        } => parse_backlog_remote(remote_url).is_some_and(|remote| {
+            remote.web_host == *web_host && remote.project == *project && remote.repo == *repo
+        }),
+    }
+}
+
+/// `owner/repo` of a github.com origin in `https://`, `git@host:` or
+/// `ssh://git@host/` form; `None` for any other host or path shape.
+pub fn github_owner_repo_from_remote(remote_url: &str) -> Option<String> {
+    let url = remote_url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let host_and_path = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
+        rest.to_string()
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        rest.replacen(':', "/", 1)
+    } else {
+        return None;
+    };
+    let (host, path) = host_and_path.split_once('/')?;
+    // Drop a `user@` prefix and a `:port` suffix from the authority.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+pub fn parse_backlog_remote(url: &str) -> Option<BacklogRemote> {
     let url = url.trim();
     let (host, path) = if let Some(rest) = url
         .strip_prefix("https://")
@@ -3104,7 +3321,7 @@ fn backlog_issue_keys_in_branch(branch: &str) -> Vec<String> {
     keys
 }
 
-async fn git_remote_url(working_dir: &std::path::Path) -> Option<String> {
+pub async fn git_remote_url(working_dir: &std::path::Path) -> Option<String> {
     let get_url = |remote: String| async move {
         let output = smol::process::Command::new("git")
             .current_dir(working_dir)
@@ -3139,30 +3356,69 @@ async fn git_remote_url(working_dir: &std::path::Path) -> Option<String> {
     get_url(first).await
 }
 
-async fn fetch_pr_list(
+#[derive(serde::Deserialize)]
+struct GhPr {
+    number: u32,
+    title: String,
+    state: String,
+    mergeable: String,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    url: String,
+    #[serde(rename = "reviewDecision")]
+    review_decision: String,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+}
+
+const JSON_FIELDS: &str =
+    "number,title,state,mergeable,isDraft,url,reviewDecision,headRefOid,baseRefName";
+
+fn pr_info_from_gh(pr: GhPr, reviews: Vec<ReviewEntry>) -> PrInfo {
+    let status = if pr.mergeable == "CONFLICTING" {
+        PrStatus::Conflicted
+    } else if pr.is_draft {
+        PrStatus::Draft
+    } else {
+        match pr.state.as_str() {
+            "MERGED" => PrStatus::Merged,
+            "CLOSED" => PrStatus::Closed,
+            _ => PrStatus::Open,
+        }
+    };
+
+    let review_decision = match pr.review_decision.as_str() {
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    };
+
+    let review_count = reviews
+        .iter()
+        .filter(|entry| entry.commit_oid.as_ref() == pr.head_ref_oid)
+        .count();
+
+    PrInfo {
+        number: pr.number,
+        title: pr.title.into(),
+        status,
+        html_url: pr.url.into(),
+        review_decision,
+        review_count,
+        head_sha: pr.head_ref_oid.into(),
+        reviews,
+        base_ref: pr.base_ref_name.into(),
+        provider: PrProvider::GitHub,
+    }
+}
+
+pub async fn fetch_pr_list(
     working_dir: &std::path::Path,
     context: PrFetchContext,
 ) -> anyhow::Result<PrFetchOutcome> {
-    #[derive(serde::Deserialize)]
-    struct GhPr {
-        number: u32,
-        title: String,
-        state: String,
-        mergeable: String,
-        #[serde(rename = "isDraft")]
-        is_draft: bool,
-        url: String,
-        #[serde(rename = "reviewDecision")]
-        review_decision: String,
-        #[serde(rename = "headRefOid")]
-        head_ref_oid: String,
-        #[serde(rename = "baseRefName")]
-        base_ref_name: String,
-    }
-
-    const JSON_FIELDS: &str =
-        "number,title,state,mergeable,isDraft,url,reviewDecision,headRefOid,baseRefName";
-
     let branch_output = smol::process::Command::new("git")
         .current_dir(working_dir)
         .args(&["rev-parse", "--abbrev-ref", "HEAD"])
@@ -3178,20 +3434,65 @@ async fn fetch_pr_list(
         None
     };
 
-    if let Some(remote) = git_remote_url(working_dir)
-        .await
-        .as_deref()
-        .and_then(parse_backlog_remote)
-    {
-        if !context.bee_available {
-            return Ok(PrFetchOutcome::default());
-        }
-        return fetch_backlog_pr_list(branch, remote, context).await;
-    }
-    if !context.gh_available {
+    let remote_url = git_remote_url(working_dir).await;
+    let backlog_remote = remote_url.as_deref().and_then(parse_backlog_remote);
+    let provider_available = if backlog_remote.is_some() {
+        context.bee_available
+    } else {
+        context.gh_available
+    };
+    if !provider_available {
         return Ok(PrFetchOutcome::default());
     }
 
+    // PRs linked with `agentium task add-pr` that belong to this repository.
+    // Fetched alongside the branch-driven discovery rather than after it: the
+    // PR polling loop disables itself when one pass exceeds 5 seconds.
+    let manual_refs: Vec<board::PrRef> = match remote_url.as_deref() {
+        Some(remote_url) => context
+            .task_pr_refs
+            .iter()
+            .filter(|reference| pr_ref_matches_remote(reference, remote_url))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    let manual_fetch = futures::future::join_all(manual_refs.iter().map(|reference| async move {
+        match fetch_pr_by_ref(reference).await {
+            Ok(pr) => Some(pr),
+            // Isolated per PR: an error here must not become an `Err` for the
+            // whole fetch, which would wipe the arena's discovered PRs.
+            Err(error) => {
+                log::warn!(
+                    "failed to fetch linked PR {}: {error:#}",
+                    reference.short_label()
+                );
+                None
+            }
+        }
+    }));
+    let discovered_fetch = async {
+        match backlog_remote {
+            Some(remote) => fetch_backlog_pr_list(branch, remote, context).await,
+            None => fetch_github_pr_list(working_dir, branch).await,
+        }
+    };
+    let (discovered, manual_prs) = futures::join!(discovered_fetch, manual_fetch);
+
+    let mut outcome = discovered?;
+    for pr in manual_prs.into_iter().flatten() {
+        if !outcome.prs.iter().any(|existing| existing.number == pr.number) {
+            outcome.prs.push(pr);
+        }
+    }
+    outcome.prs.sort_by_key(|pr| pr.number);
+    Ok(outcome)
+}
+
+async fn fetch_github_pr_list(
+    working_dir: &std::path::Path,
+    branch: Option<String>,
+) -> anyhow::Result<PrFetchOutcome> {
     let mut gh_prs: Vec<GhPr> = Vec::new();
     if let Some(branch) = branch {
         let output = smol::process::Command::new("gh")
@@ -3246,7 +3547,7 @@ async fn fetch_pr_list(
     let reviews_per_pr = futures::future::join_all(
         gh_prs
             .iter()
-            .map(|pr| fetch_reviews(working_dir, &pr.url, &pr.head_ref_oid)),
+            .map(|pr| fetch_reviews(Some(working_dir), &pr.url, &pr.head_ref_oid)),
     )
     .await;
 
@@ -3254,51 +3555,14 @@ async fn fetch_pr_list(
         .into_iter()
         .zip(reviews_per_pr)
         .map(|(pr, reviews)| {
-            let status = if pr.mergeable == "CONFLICTING" {
-                PrStatus::Conflicted
-            } else if pr.is_draft {
-                PrStatus::Draft
-            } else {
-                match pr.state.as_str() {
-                    "MERGED" => PrStatus::Merged,
-                    "CLOSED" => PrStatus::Closed,
-                    _ => PrStatus::Open,
-                }
-            };
-
-            let review_decision = match pr.review_decision.as_str() {
-                "APPROVED" => Some(ReviewDecision::Approved),
-                "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
-                "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
-                _ => None,
-            };
-
-            let (reviews, review_count) = match reviews {
-                Ok(entries) => {
-                    let count = entries
-                        .iter()
-                        .filter(|entry| entry.commit_oid.as_ref() == pr.head_ref_oid)
-                        .count();
-                    (entries, count)
-                }
+            let reviews = match reviews {
+                Ok(entries) => entries,
                 Err(err) => {
                     log::warn!("failed to fetch reviews: {err}");
-                    (Vec::new(), 0)
+                    Vec::new()
                 }
             };
-
-            PrInfo {
-                number: pr.number,
-                title: pr.title.into(),
-                status,
-                html_url: pr.url.into(),
-                review_decision,
-                review_count,
-                head_sha: pr.head_ref_oid.into(),
-                reviews,
-                base_ref: pr.base_ref_name.into(),
-                provider: PrProvider::GitHub,
-            }
+            pr_info_from_gh(pr, reviews)
         })
         .collect();
     Ok(PrFetchOutcome {
@@ -3340,6 +3604,47 @@ async fn resolve_backlog_issue_id(
     json["id"]
         .as_u64()
         .ok_or_else(|| BacklogIssueIdError::Other(anyhow::anyhow!("bee issue view returned no id")))
+}
+
+#[derive(serde::Deserialize)]
+struct BeePrStatus {
+    name: String,
+}
+#[derive(serde::Deserialize)]
+struct BeePr {
+    number: u32,
+    summary: String,
+    base: String,
+    branch: String,
+    status: BeePrStatus,
+}
+
+fn pr_info_from_bee(pr: BeePr, remote: &BacklogRemote) -> PrInfo {
+    let status = match pr.status.name.as_str() {
+        "Merged" => PrStatus::Merged,
+        "Closed" => PrStatus::Closed,
+        "Open" => PrStatus::Open,
+        other => {
+            log::warn!("unknown backlog PR status {other:?}, treating as open");
+            PrStatus::Open
+        }
+    };
+    PrInfo {
+        number: pr.number,
+        title: pr.summary.into(),
+        status,
+        html_url: format!(
+            "https://{}/git/{}/{}/pullRequests/{}",
+            remote.web_host, remote.project, remote.repo, pr.number
+        )
+        .into(),
+        review_decision: None,
+        review_count: 0,
+        head_sha: "".into(),
+        reviews: Vec::new(),
+        base_ref: pr.base.into(),
+        provider: PrProvider::Backlog,
+    }
 }
 
 async fn fetch_backlog_pr_list(
@@ -3428,50 +3733,11 @@ async fn fetch_backlog_pr_list(
         return Ok(outcome);
     }
 
-    #[derive(serde::Deserialize)]
-    struct BeePrStatus {
-        name: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct BeePr {
-        number: u32,
-        summary: String,
-        base: String,
-        branch: String,
-        status: BeePrStatus,
-    }
-
     let bee_prs: Vec<BeePr> = serde_json::from_slice(&output.stdout)?;
     outcome.prs = bee_prs
         .into_iter()
         .filter(|pr| pr.branch == branch)
-        .map(|pr| {
-            let status = match pr.status.name.as_str() {
-                "Merged" => PrStatus::Merged,
-                "Closed" => PrStatus::Closed,
-                "Open" => PrStatus::Open,
-                other => {
-                    log::warn!("unknown backlog PR status {other:?}, treating as open");
-                    PrStatus::Open
-                }
-            };
-            PrInfo {
-                number: pr.number,
-                title: pr.summary.into(),
-                status,
-                html_url: format!(
-                    "https://{}/git/{}/{}/pullRequests/{}",
-                    remote.web_host, remote.project, remote.repo, pr.number
-                )
-                .into(),
-                review_decision: None,
-                review_count: 0,
-                head_sha: "".into(),
-                reviews: Vec::new(),
-                base_ref: pr.base.into(),
-                provider: PrProvider::Backlog,
-            }
-        })
+        .map(|pr| pr_info_from_bee(pr, &remote))
         .collect();
     outcome.prs.sort_by_key(|pr| pr.number);
     Ok(outcome)
@@ -3479,8 +3745,8 @@ async fn fetch_backlog_pr_list(
 
 /// Fetch per-reviewer data via the REST API (`gh api repos/{owner}/{repo}/pulls/{number}/reviews`).
 /// Deduplicates by author, keeping only the latest review per user.
-async fn fetch_reviews(
-    working_dir: &std::path::Path,
+pub async fn fetch_reviews(
+    working_dir: Option<&std::path::Path>,
     pr_url: &str,
     _head_ref_oid: &str,
 ) -> anyhow::Result<Vec<ReviewEntry>> {
@@ -3495,11 +3761,11 @@ async fn fetch_reviews(
     let (owner, repo, number) = (parts[0], parts[1], parts[3]);
     let api_path = format!("repos/{owner}/{repo}/pulls/{number}/reviews");
 
-    let output = smol::process::Command::new("gh")
-        .current_dir(working_dir)
-        .args(&["api", &api_path])
-        .output()
-        .await?;
+    let mut command = smol::process::Command::new("gh");
+    if let Some(working_dir) = working_dir {
+        command.current_dir(working_dir);
+    }
+    let output = command.args(&["api", &api_path]).output().await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3549,21 +3815,27 @@ async fn fetch_reviews(
         .collect())
 }
 
-async fn fetch_ci_status(
-    working_dir: &std::path::Path,
+pub async fn fetch_ci_status(
+    working_dir: Option<&std::path::Path>,
     pr_number: u32,
+    repo: Option<&str>,
 ) -> anyhow::Result<Option<CiInfo>> {
-    let output = smol::process::Command::new("gh")
-        .current_dir(working_dir)
-        .args(&[
-            "pr",
-            "checks",
-            &pr_number.to_string(),
-            "--json",
-            "name,bucket",
-        ])
-        .output()
-        .await?;
+    let mut command = smol::process::Command::new("gh");
+    if let Some(working_dir) = working_dir {
+        command.current_dir(working_dir);
+    }
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "checks".into(),
+        pr_number.to_string(),
+        "--json".into(),
+        "name,bucket".into(),
+    ];
+    if let Some(repo) = repo {
+        args.push("--repo".into());
+        args.push(repo.to_string());
+    }
+    let output = command.args(&args).output().await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3616,6 +3888,84 @@ async fn fetch_ci_status(
     }))
 }
 
+/// Fetch a single PR by reference, independent of any branch/worktree. Used
+/// by manually-linked PRs (`agentium task add-pr`), where there is no local
+/// checkout to derive the branch from.
+///
+/// Unlike `fetch_pr_list`, subprocess failures are propagated with `bail!`
+/// rather than logged and swallowed: this is also called from the CLI, where
+/// `log::warn!` output is otherwise invisible, so an expired `gh`/`bee` login
+/// must not silently look like "no PR found".
+pub async fn fetch_pr_by_ref(reference: &board::PrRef) -> anyhow::Result<PrInfo> {
+    match reference {
+        board::PrRef::GitHub { repo, number } => {
+            let output = smol::process::Command::new("gh")
+                .args(&[
+                    "pr",
+                    "view",
+                    &number.to_string(),
+                    "--repo",
+                    repo,
+                    "--json",
+                    JSON_FIELDS,
+                ])
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "gh pr view failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let pr: GhPr = serde_json::from_slice(&output.stdout)?;
+            let reviews = match fetch_reviews(None, &pr.url, &pr.head_ref_oid).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    log::warn!("failed to fetch reviews: {err}");
+                    Vec::new()
+                }
+            };
+            Ok(pr_info_from_gh(pr, reviews))
+        }
+        board::PrRef::Backlog {
+            web_host,
+            project,
+            repo,
+            number,
+        } => {
+            let output = smol::process::Command::new("bee")
+                .args(&[
+                    "pr",
+                    "view",
+                    &number.to_string(),
+                    "-p",
+                    project,
+                    "-R",
+                    repo,
+                    "-s",
+                    web_host,
+                    "--json",
+                    "number,summary,base,branch,status",
+                ])
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "bee pr view failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let pr: BeePr = serde_json::from_slice(&output.stdout)?;
+            let remote = BacklogRemote {
+                web_host: web_host.clone(),
+                project: project.clone(),
+                repo: repo.clone(),
+            };
+            Ok(pr_info_from_bee(pr, &remote))
+        }
+    }
+}
+
 async fn version_check_succeeds(program: &str) -> bool {
     smol::process::Command::new(program)
         .args(&["--version"])
@@ -3625,15 +3975,15 @@ async fn version_check_succeeds(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-struct IssueMetadata {
-    title: Option<String>,
-    state: Option<String>,
-    url: Option<String>,
+pub struct IssueMetadata {
+    pub title: Option<String>,
+    pub state: Option<String>,
+    pub url: Option<String>,
     // Numeric Backlog issue id, needed by `bee pr list --issue`. None for GitHub.
-    backlog_id: Option<u64>,
+    pub backlog_id: Option<u64>,
 }
 
-async fn fetch_issue_metadata_for(reference: &board::IssueRef) -> anyhow::Result<IssueMetadata> {
+pub async fn fetch_issue_metadata_for(reference: &board::IssueRef) -> anyhow::Result<IssueMetadata> {
     match reference {
         board::IssueRef::GitHub { repo, number } => fetch_github_issue(repo, *number).await,
         board::IssueRef::Backlog { issue_key } => fetch_backlog_issue(issue_key).await,
@@ -3714,6 +4064,26 @@ async fn fetch_backlog_issue(issue_key: &str) -> anyhow::Result<IssueMetadata> {
     })
 }
 
+/// The small green "b" square used to mark a Backlog issue or PR row where
+/// the provider isn't otherwise obvious (task rows can mix GitHub and
+/// Backlog; arena rows don't need it since the provider is implied by the
+/// arena's remote).
+fn backlog_badge() -> AnyElement {
+    h_flex()
+        .flex_shrink_0()
+        .w(px(14.0))
+        .h(px(14.0))
+        .rounded_sm()
+        // Backlog brand green
+        .bg(hsla(160.0 / 360.0, 0.55, 0.42, 1.0))
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_color(gpui::white())
+        .child("b")
+        .into_any_element()
+}
+
 impl Focusable for AgentiumApp {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -3781,164 +4151,17 @@ impl AgentiumApp {
 
                             let mut pr_rows: Vec<(AnyElement, Option<AnyElement>)> = Vec::new();
                             for pr in prs.map(|prs| prs.as_slice()).unwrap_or_default() {
-                                let is_pr_merged = matches!(pr.status, PrStatus::Merged);
-
                                 let ci_info = self.ci_status.get(&(entity_id, pr.number));
-                                let ci_icon_element = if is_pr_merged {
-                                    None
-                                } else {
-                                    ci_info.map(|ci| {
-                                        let (icon, color) = match &ci.status {
-                                            CiStatus::AllPassed => (IconName::Check, status_colors.success),
-                                            CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
-                                            CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
-                                            CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
-                                        };
-                                        Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
-                                    })
-                                };
-
-                                let tooltip_pr = pr.clone();
-                                let tooltip_ci = ci_info.cloned();
-                                let tooltip_branch = tooltip_branch.clone();
-
-                                let pr_color = match pr.status {
-                                    PrStatus::Draft => colors.text_muted,
-                                    PrStatus::Open => status_colors.success,
-                                    // No semantic purple in StatusColors; matches GitHub's merge color
-                                    PrStatus::Merged => hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
-                                    PrStatus::Closed => status_colors.error,
-                                    PrStatus::Conflicted => status_colors.warning,
-                                };
-                                let pr_icon = match pr.status {
-                                    PrStatus::Draft | PrStatus::Open => IconName::GitPullRequest,
-                                    PrStatus::Merged => IconName::GitGraph,
-                                    PrStatus::Closed => IconName::GitPullRequestClosed,
-                                    PrStatus::Conflicted => IconName::GitMergeConflict,
-                                };
-                                let url = pr.html_url.clone();
-                                let pr_el = h_flex()
-                                    .id(SharedString::from(format!(
-                                        "arena-pr-{}-{}",
-                                        arena.id, pr.number
-                                    )))
-                                    .gap_1()
-                                    .items_center()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .when(is_active, |d| {
-                                        d.cursor_pointer()
-                                            .hover(|d| d.bg(colors.element_hover))
-                                    })
-                                    .child(
-                                        Icon::new(pr_icon)
-                                            .size(IconSize::Small)
-                                            .color(Color::Custom(pr_color)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(colors.text_muted)
-                                            .child(format!("#{}", pr.number)),
-                                    )
-                                    .when_some(ci_icon_element, |d, icon| d.child(icon))
-                                    .when(multiple_prs, |d| {
-                                        d.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(colors.text_muted)
-                                                .max_w_20()
-                                                .truncate()
-                                                .child(pr.base_ref.clone()),
-                                        )
-                                    })
-                                    .tooltip(Tooltip::element({
-                                        move |_window, cx| {
-                                            render_pr_tooltip(
-                                                &tooltip_pr,
-                                                tooltip_ci.as_ref(),
-                                                tooltip_branch.as_deref(),
-                                                cx,
-                                            )
-                                        }
-                                    }))
-                                    .when(is_active, |d| {
-                                        d.on_click(cx.listener({
-                                            let url = url.clone();
-                                            move |_this, _event: &ClickEvent, _window, cx| {
-                                                cx.stop_propagation();
-                                                cx.open_url(&url);
-                                            }
-                                        }))
-                                    })
-                                    .into_any_element();
-
-                                let review_el = if is_pr_merged {
-                                    None
-                                } else {
-                                    match &pr.review_decision {
-                                        Some(ReviewDecision::Approved) => {
-                                            Some((IconName::Check, status_colors.success, None))
-                                        }
-                                        Some(ReviewDecision::ChangesRequested) => {
-                                            Some((IconName::Circle, status_colors.error, None))
-                                        }
-                                        Some(ReviewDecision::ReviewRequired) => {
-                                            Some((IconName::Circle, status_colors.warning, None))
-                                        }
-                                        None if pr.review_count > 0 => {
-                                            Some((IconName::Eye, colors.text_muted, Some(pr.review_count.to_string())))
-                                        }
-                                        None => None,
-                                    }
-                                    .map(|(review_icon, review_color, review_label)| {
-                                        let tooltip_reviews = pr.reviews.clone();
-                                        let tooltip_head_sha = pr.head_sha.clone();
-                                        h_flex()
-                                            .id(SharedString::from(format!(
-                                                "arena-review-{}-{}",
-                                                arena.id, pr.number
-                                            )))
-                                            .gap_0p5()
-                                            .items_center()
-                                            .px_1()
-                                            .rounded_sm()
-                                            .when(is_active, |d| {
-                                                d.cursor_pointer()
-                                                    .hover(|d| d.bg(colors.element_hover))
-                                            })
-                                            .child(
-                                                Icon::new(review_icon)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Custom(review_color)),
-                                            )
-                                            .when_some(review_label, |d, label| {
-                                                d.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(colors.text_muted)
-                                                        .child(label),
-                                                )
-                                            })
-                                            .tooltip(Tooltip::element(move |_window, cx| {
-                                                render_review_tooltip(
-                                                    &tooltip_reviews,
-                                                    &tooltip_head_sha,
-                                                    cx,
-                                                )
-                                            }))
-                                            .when(is_active, |d| {
-                                                d.on_click(cx.listener(
-                                                    move |_this, _event: &ClickEvent, _window, cx| {
-                                                        cx.stop_propagation();
-                                                        cx.open_url(&url);
-                                                    },
-                                                ))
-                                            })
-                                            .into_any_element()
-                                    })
-                                };
-
+                                let (pr_el, review_el) = self.render_pr_elements(
+                                    &format!("arena-pr-{}", arena.id),
+                                    pr,
+                                    ci_info,
+                                    tooltip_branch.as_deref(),
+                                    multiple_prs,
+                                    is_active,
+                                    self.manual_pr_link_for_arena(i, &pr.html_url),
+                                    cx,
+                                );
                                 pr_rows.push((pr_el, review_el));
                             }
                             let mut pr_rows = pr_rows.into_iter();
@@ -4238,6 +4461,188 @@ impl AgentiumApp {
             .into_any_element()
     }
 
+    /// Build the PR pill and (optional) review pill for one `PrInfo`. Shared
+    /// between arena rows (`show_base` for multi-PR branches, tooltips always
+    /// on) and manually-linked task PR rows (no base column, tooltip only
+    /// once real status is known — see `render_task_pr_row`).
+    fn render_pr_elements(
+        &self,
+        id_prefix: &str,
+        pr: &PrInfo,
+        ci: Option<&CiInfo>,
+        branch: Option<&str>,
+        show_base: bool,
+        clickable: bool,
+        manual_link: Option<(Uuid, board::PrRef)>,
+        cx: &Context<Self>,
+    ) -> (AnyElement, Option<AnyElement>) {
+        let colors = cx.theme().colors();
+        let status_colors = cx.theme().status();
+        let is_pr_merged = matches!(pr.status, PrStatus::Merged);
+
+        let ci_icon_element = if is_pr_merged {
+            None
+        } else {
+            ci.map(|ci| {
+                let (icon, color) = match &ci.status {
+                    CiStatus::AllPassed => (IconName::Check, status_colors.success),
+                    CiStatus::Failed => (IconName::XCircleFilled, status_colors.error),
+                    CiStatus::PendingWithFailure => (IconName::Circle, status_colors.error),
+                    CiStatus::PendingClean => (IconName::Circle, status_colors.warning),
+                };
+                Icon::new(icon).size(IconSize::Small).color(Color::Custom(color))
+            })
+        };
+
+        let tooltip_pr = pr.clone();
+        let tooltip_ci = ci.cloned();
+        let tooltip_branch = branch.map(|branch| branch.to_string());
+
+        let pr_color = match pr.status {
+            PrStatus::Draft => colors.text_muted,
+            PrStatus::Open => status_colors.success,
+            // No semantic purple in StatusColors; matches GitHub's merge color
+            PrStatus::Merged => hsla(286.0 / 360.0, 0.51, 0.64, 1.0),
+            PrStatus::Closed => status_colors.error,
+            PrStatus::Conflicted => status_colors.warning,
+        };
+        let pr_icon = match pr.status {
+            PrStatus::Draft | PrStatus::Open => IconName::GitPullRequest,
+            PrStatus::Merged => IconName::GitGraph,
+            PrStatus::Closed => IconName::GitPullRequestClosed,
+            PrStatus::Conflicted => IconName::GitMergeConflict,
+        };
+        let url = pr.html_url.clone();
+        let pr_el = h_flex()
+            .id(SharedString::from(format!("{id_prefix}-{}", pr.number)))
+            .gap_1()
+            .items_center()
+            .px_1()
+            .rounded_sm()
+            .when(clickable, |d| {
+                d.cursor_pointer().hover(|d| d.bg(colors.element_hover))
+            })
+            .when(pr.provider == PrProvider::Backlog, |d| d.child(backlog_badge()))
+            .child(
+                Icon::new(pr_icon)
+                    .size(IconSize::Small)
+                    .color(Color::Custom(pr_color)),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(colors.text_muted)
+                    .child(format!("#{}", pr.number)),
+            )
+            .when_some(ci_icon_element, |d, icon| d.child(icon))
+            .when(show_base, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .max_w_20()
+                        .truncate()
+                        .child(pr.base_ref.clone()),
+                )
+            })
+            .tooltip(Tooltip::element({
+                move |_window, cx| {
+                    render_pr_tooltip(
+                        &tooltip_pr,
+                        tooltip_ci.as_ref(),
+                        tooltip_branch.as_deref(),
+                        cx,
+                    )
+                }
+            }))
+            .when(clickable, |d| {
+                d.on_click(cx.listener({
+                    let url = url.clone();
+                    move |_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    }
+                }))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let url = url.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.deploy_pr_context_menu(
+                            url.to_string(),
+                            manual_link.clone(),
+                            event.position,
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
+            .into_any_element();
+
+        let review_el = if is_pr_merged {
+            None
+        } else {
+            match &pr.review_decision {
+                Some(ReviewDecision::Approved) => {
+                    Some((IconName::Check, status_colors.success, None))
+                }
+                Some(ReviewDecision::ChangesRequested) => {
+                    Some((IconName::Circle, status_colors.error, None))
+                }
+                Some(ReviewDecision::ReviewRequired) => {
+                    Some((IconName::Circle, status_colors.warning, None))
+                }
+                None if pr.review_count > 0 => {
+                    Some((IconName::Eye, colors.text_muted, Some(pr.review_count.to_string())))
+                }
+                None => None,
+            }
+            .map(|(review_icon, review_color, review_label)| {
+                let tooltip_reviews = pr.reviews.clone();
+                let tooltip_head_sha = pr.head_sha.clone();
+                h_flex()
+                    .id(SharedString::from(format!("{id_prefix}-review-{}", pr.number)))
+                    .gap_0p5()
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .when(clickable, |d| {
+                        d.cursor_pointer().hover(|d| d.bg(colors.element_hover))
+                    })
+                    .child(
+                        Icon::new(review_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(review_color)),
+                    )
+                    .when_some(review_label, |d, label| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors.text_muted)
+                                .child(label),
+                        )
+                    })
+                    .tooltip(Tooltip::element(move |_window, cx| {
+                        render_review_tooltip(&tooltip_reviews, &tooltip_head_sha, cx)
+                    }))
+                    .when(clickable, |d| {
+                        d.on_click(cx.listener(
+                            move |_this, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&url);
+                            },
+                        ))
+                    })
+                    .into_any_element()
+            })
+        };
+
+        (pr_el, review_el)
+    }
+
     fn render_sidebar_tab_button(
         &self,
         label: &'static str,
@@ -4474,19 +4879,7 @@ impl AgentiumApp {
                 .size(IconSize::XSmall)
                 .color(Color::Muted)
                 .into_any_element(),
-            board::IssueRef::Backlog { .. } => h_flex()
-                .flex_shrink_0()
-                .w(px(14.0))
-                .h(px(14.0))
-                .rounded_sm()
-                // Backlog brand green
-                .bg(hsla(160.0 / 360.0, 0.55, 0.42, 1.0))
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(gpui::white())
-                .child("b")
-                .into_any_element(),
+            board::IssueRef::Backlog { .. } => backlog_badge(),
         };
 
         let tooltip_text = issue.title.as_ref().map(|title| match &issue.state {
@@ -4547,6 +4940,11 @@ impl AgentiumApp {
             .into_any_element()
     }
 
+    /// Render one manually-linked task PR (`agentium task add-pr`). Mirrors
+    /// `render_issue_row`'s layout. Falls back to a provisional `PrInfo`
+    /// built from the cached `PrLink` (title/status only) when `gh`/`bee`
+    /// haven't resolved it yet, and suppresses the tooltip in that case so it
+    /// doesn't show a fabricated "Draft" state.
     fn render_closed_worktree_row(
         &self,
         task_id: Uuid,
@@ -5252,7 +5650,32 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
 mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
-    use super::{backlog_issue_keys_in_branch, parse_backlog_remote};
+    use super::{backlog_issue_keys_in_branch, parse_backlog_remote, pr_ref_matches_remote};
+    use crate::board::PrRef;
+
+    #[test]
+    fn pr_ref_matches_remote_compares_repository_identity() {
+        let github = PrRef::GitHub {
+            repo: "safx/zed".to_string(),
+            number: 1,
+        };
+        assert!(pr_ref_matches_remote(&github, "https://github.com/safx/zed.git"));
+        assert!(pr_ref_matches_remote(&github, "git@github.com:safx/zed.git"));
+        assert!(pr_ref_matches_remote(&github, "ssh://git@github.com/safx/zed"));
+        assert!(pr_ref_matches_remote(&github, "https://github.com/SafX/Zed"));
+        assert!(!pr_ref_matches_remote(&github, "https://github.com/safx/other.git"));
+        assert!(!pr_ref_matches_remote(&github, "https://gitlab.com/safx/zed.git"));
+
+        let backlog = PrRef::Backlog {
+            web_host: "nulab.backlog.jp".to_string(),
+            project: "BLG_AI".to_string(),
+            repo: "repo-name".to_string(),
+            number: 2,
+        };
+        assert!(pr_ref_matches_remote(&backlog, "https://nulab.backlog.jp/git/BLG_AI/repo-name.git"));
+        assert!(!pr_ref_matches_remote(&backlog, "https://nulab.backlog.jp/git/BLG_AI/other.git"));
+        assert!(!pr_ref_matches_remote(&backlog, "https://github.com/safx/zed.git"));
+    }
 
     #[test]
     fn parse_backlog_remote_accepts_known_url_forms() {
