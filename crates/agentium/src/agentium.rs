@@ -1617,6 +1617,7 @@ impl AgentiumApp {
     pub fn handle_tab_new(
         &mut self,
         content_type: PaneContentType,
+        title: Option<String>,
         command: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1625,7 +1626,7 @@ impl AgentiumApp {
             return;
         };
         arena.update(cx, |arena, cx| {
-            arena.add_tab(content_type, command, window, cx);
+            arena.add_tab(content_type, title, command, window, cx);
         });
     }
 

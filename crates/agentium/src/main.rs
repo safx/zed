@@ -116,6 +116,9 @@ enum TabAction {
     New {
         #[arg(long, default_value = "terminal")]
         r#type: PaneContentType,
+        /// Override the tab title (only applied for --type terminal with a command)
+        #[arg(long)]
+        title: Option<String>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -538,6 +541,7 @@ enum IpcMessage {
     },
     TabNew {
         content_type: agentium::PaneContentType,
+        title: Option<String>,
         command: Vec<String>,
     },
     ChangeTheme {
@@ -1382,7 +1386,12 @@ fn start_ipc_listener(
                                             .collect()
                                     })
                                     .unwrap_or_default();
-                                IpcMessage::TabNew { content_type, command }
+                                let title = json["title"].as_str().map(String::from);
+                                IpcMessage::TabNew {
+                                    content_type,
+                                    title,
+                                    command,
+                                }
                             }
                             Some("change_theme") => {
                                 let name = json["name"]
@@ -1645,8 +1654,12 @@ fn main() {
             return;
         }
         Some(Command::Tab { action }) => {
-            let (content_type, command) = match action {
-                TabAction::New { r#type, command } => (r#type, command),
+            let (content_type, title, command) = match action {
+                TabAction::New {
+                    r#type,
+                    title,
+                    command,
+                } => (r#type, title, command),
             };
             let content_type_str = match content_type {
                 PaneContentType::Terminal => "terminal",
@@ -1659,6 +1672,7 @@ fn main() {
             let msg = serde_json::json!({
                 "type": "tab_new",
                 "content_type": content_type_str,
+                "title": title,
                 "command": command,
             });
             let socket_path = agentium_socket_path();
@@ -2209,12 +2223,14 @@ fn main() {
                                         }
                                         IpcMessage::TabNew {
                                             content_type,
+                                            title,
                                             command,
                                         } => {
                                             window_handle
                                                 .update(cx, |app, window, cx| {
                                                     app.handle_tab_new(
                                                         content_type,
+                                                        title,
                                                         command,
                                                         window,
                                                         cx,

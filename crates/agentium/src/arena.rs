@@ -382,6 +382,7 @@ impl Arena {
     pub(crate) fn add_tab(
         &mut self,
         content_type: PaneContentType,
+        title: Option<String>,
         command: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -398,7 +399,7 @@ impl Arena {
                     let shell = Shell::WithArguments {
                         program,
                         args,
-                        title_override: None,
+                        title_override: title,
                     };
                     self.project.update(cx, |project, cx| {
                         project.create_terminal_with_shell(
