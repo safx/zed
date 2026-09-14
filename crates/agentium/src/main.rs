@@ -122,6 +122,20 @@ enum TabAction {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Paste text into the terminal tab whose title matches
+    #[command(alias = "sendMessage")]
+    SendMessage {
+        /// Tab title to match exactly (errors on zero or multiple matches)
+        #[arg(long)]
+        title: String,
+        /// Arena working directory to search; defaults to the active arena
+        #[arg(long)]
+        arena: Option<PathBuf>,
+        /// Press Enter after pasting
+        #[arg(long)]
+        submit: bool,
+        message: String,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -516,6 +530,9 @@ fn claude_project_dir_name(path: &str) -> String {
         .collect()
 }
 
+// macOS caps AF_UNIX datagrams at net.local.dgram.maxdgram (2048); larger sends fail with EMSGSIZE.
+const MAX_DATAGRAM_BYTES: usize = 2048;
+
 fn agentium_socket_path() -> PathBuf {
     util::paths::home_dir()
         .join(".local")
@@ -543,6 +560,12 @@ enum IpcMessage {
         content_type: agentium::PaneContentType,
         title: Option<String>,
         command: Vec<String>,
+    },
+    TabSendMessage {
+        title: String,
+        arena: Option<PathBuf>,
+        submit: bool,
+        text: String,
     },
     ChangeTheme {
         name: String,
@@ -1393,6 +1416,20 @@ fn start_ipc_listener(
                                     command,
                                 }
                             }
+                            Some("tab_send_message") => {
+                                let Some(title) = json["title"].as_str() else {
+                                    continue;
+                                };
+                                let Some(text) = json["text"].as_str() else {
+                                    continue;
+                                };
+                                IpcMessage::TabSendMessage {
+                                    title: title.to_string(),
+                                    arena: json["arena"].as_str().map(PathBuf::from),
+                                    submit: json["submit"].as_bool().unwrap_or(false),
+                                    text: text.to_string(),
+                                }
+                            }
                             Some("change_theme") => {
                                 let name = json["name"]
                                     .as_str()
@@ -1654,32 +1691,72 @@ fn main() {
             return;
         }
         Some(Command::Tab { action }) => {
-            let (content_type, title, command) = match action {
+            let msg = match action {
                 TabAction::New {
                     r#type,
                     title,
                     command,
-                } => (r#type, title, command),
-            };
-            let content_type_str = match content_type {
-                PaneContentType::Terminal => "terminal",
-                PaneContentType::Diff => "diff",
-                PaneContentType::BranchDiff => "branch-diff",
-                PaneContentType::GitStatus => "git-status",
-                PaneContentType::ProjectSearch => "project-search",
-                PaneContentType::GitGraph => "git-graph",
-            };
-            let msg = serde_json::json!({
-                "type": "tab_new",
-                "content_type": content_type_str,
-                "title": title,
-                "command": command,
-            });
-            let socket_path = agentium_socket_path();
-            if let Ok(socket) = UnixDatagram::unbound() {
-                if socket.connect(&socket_path).is_ok() {
-                    socket.send(msg.to_string().as_bytes()).ok();
+                } => {
+                    let content_type_str = match r#type {
+                        PaneContentType::Terminal => "terminal",
+                        PaneContentType::Diff => "diff",
+                        PaneContentType::BranchDiff => "branch-diff",
+                        PaneContentType::GitStatus => "git-status",
+                        PaneContentType::ProjectSearch => "project-search",
+                        PaneContentType::GitGraph => "git-graph",
+                    };
+                    serde_json::json!({
+                        "type": "tab_new",
+                        "content_type": content_type_str,
+                        "title": title,
+                        "command": command,
+                    })
                 }
+                TabAction::SendMessage {
+                    title,
+                    arena,
+                    submit,
+                    message,
+                } => {
+                    let arena = match arena
+                        .map(|path| canonicalize_existing_path(&path))
+                        .transpose()
+                    {
+                        Ok(arena) => arena,
+                        Err(error) => {
+                            eprintln!("error: {error:#}");
+                            std::process::exit(1);
+                        }
+                    };
+                    serde_json::json!({
+                        "type": "tab_send_message",
+                        "title": title,
+                        "arena": arena,
+                        "submit": submit,
+                        "text": message,
+                    })
+                }
+            };
+            let payload = msg.to_string();
+            if payload.len() > MAX_DATAGRAM_BYTES {
+                eprintln!(
+                    "error: message too long ({} bytes with envelope, limit {})",
+                    payload.len(),
+                    MAX_DATAGRAM_BYTES
+                );
+                std::process::exit(1);
+            }
+            let socket_path = agentium_socket_path();
+            let sent = UnixDatagram::unbound().and_then(|socket| {
+                socket.connect(&socket_path)?;
+                socket.send(payload.as_bytes())
+            });
+            if let Err(error) = sent {
+                eprintln!(
+                    "error: cannot reach Agentium at {}: {error}",
+                    socket_path.display()
+                );
+                std::process::exit(1);
             }
             return;
         }
@@ -2233,6 +2310,24 @@ fn main() {
                                                         title,
                                                         command,
                                                         window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }
+                                        IpcMessage::TabSendMessage {
+                                            title,
+                                            arena,
+                                            submit,
+                                            text,
+                                        } => {
+                                            window_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.handle_tab_send_message(
+                                                        &title,
+                                                        arena.as_deref(),
+                                                        submit,
+                                                        &text,
                                                         cx,
                                                     );
                                                 })
