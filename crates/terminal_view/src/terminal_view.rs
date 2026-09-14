@@ -1608,11 +1608,11 @@ impl Item for TerminalView {
     }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
-        if self.is_claude_code_running(cx) {
-            return "Claude".into();
-        }
         if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
             return custom_title.clone().into();
+        }
+        if self.is_claude_code_running(cx) {
+            return "Claude".into();
         }
         let terminal = self.terminal().read(cx);
         terminal.title(detail == 0).into()

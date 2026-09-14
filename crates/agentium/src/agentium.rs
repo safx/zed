@@ -14,7 +14,7 @@ impl gpui::Global for AgentiumWorkspaceHandle {}
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1627,6 +1627,61 @@ impl AgentiumApp {
         };
         arena.update(cx, |arena, cx| {
             arena.add_tab(content_type, title, command, window, cx);
+        });
+    }
+
+    pub fn handle_tab_send_message(
+        &mut self,
+        title: &str,
+        arena_path: Option<&Path>,
+        submit: bool,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let arena = match arena_path {
+            Some(path) => self.arenas.iter().find(|arena| {
+                arena
+                    .read(cx)
+                    .working_directory
+                    .as_deref()
+                    .and_then(|directory| std::fs::canonicalize(directory).ok())
+                    .is_some_and(|directory| directory == path)
+            }),
+            None => self.active_arena(),
+        };
+        let Some(arena) = arena else {
+            log::warn!("tab send-message: no arena for {arena_path:?}");
+            return;
+        };
+        let mut matches = Vec::new();
+        for pane in arena.read(cx).center.panes() {
+            for item in pane.read(cx).items() {
+                if &*item.tab_content_text(0, cx) == title {
+                    matches.push(item.boxed_clone());
+                }
+            }
+        }
+        let item = match matches.as_slice() {
+            [item] => item,
+            [] => {
+                log::warn!("tab send-message: no tab titled {title:?}");
+                return;
+            }
+            _ => {
+                log::warn!("tab send-message: {} tabs titled {title:?}", matches.len());
+                return;
+            }
+        };
+        let Some(terminal_view) = item.act_as::<TerminalView>(cx) else {
+            log::warn!("tab send-message: tab {title:?} is not a terminal");
+            return;
+        };
+        let terminal = terminal_view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _cx| {
+            terminal.paste(text);
+            if submit {
+                terminal.input(&b"\r"[..]);
+            }
         });
     }
 
