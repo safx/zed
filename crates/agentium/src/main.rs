@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
@@ -122,13 +122,14 @@ enum TabAction {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Paste text into the terminal tab whose title matches
+    /// Paste text into the terminal tab whose title matches (long text is pasted in chunks)
     #[command(alias = "sendMessage")]
     SendMessage {
         /// Tab title to match exactly (errors on zero or multiple matches)
         #[arg(long)]
         title: String,
-        /// Arena working directory to search; defaults to the active arena
+        /// Arena worktree to search; defaults to the arena this command runs in
+        /// (by process ancestry, then by current directory)
         #[arg(long)]
         arena: Option<PathBuf>,
         /// Press Enter after pasting
@@ -533,6 +534,106 @@ fn claude_project_dir_name(path: &str) -> String {
 // macOS caps AF_UNIX datagrams at net.local.dgram.maxdgram (2048); larger sends fail with EMSGSIZE.
 const MAX_DATAGRAM_BYTES: usize = 2048;
 
+/// Splits `text` into `tab_send_message` payloads that each fit in one datagram.
+/// Every chunk is pasted separately; `submit` rides on the last one only.
+fn send_message_datagrams(
+    title: &str,
+    arena: Option<&Path>,
+    ancestor_pids: &[u32],
+    cwd: Option<&Path>,
+    submit: bool,
+    text: &str,
+) -> anyhow::Result<Vec<String>> {
+    let payload = |chunk: &str, submit: bool| {
+        serde_json::json!({
+            "type": "tab_send_message",
+            "title": title,
+            "arena": arena,
+            "ancestor_pids": ancestor_pids,
+            "cwd": cwd,
+            "submit": submit,
+            "text": chunk,
+        })
+        .to_string()
+    };
+    // `false` is the longer spelling, so a chunk budgeted here also fits with `submit: true`.
+    let base_len = payload("", false).len();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_len = 0;
+    for character in text.chars() {
+        // JSON escaping is per character, so measure each one with serde_json rather than
+        // re-serializing the whole chunk; subtract the surrounding quotes.
+        let character_len = serde_json::to_string(&character.to_string())?.len() - 2;
+        if base_len + chunk_len + character_len > MAX_DATAGRAM_BYTES {
+            if chunk.is_empty() {
+                anyhow::bail!("title or arena path too long for one datagram");
+            }
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_len = 0;
+        }
+        chunk.push(character);
+        chunk_len += character_len;
+    }
+    chunks.push(chunk);
+    let last = chunks.len().saturating_sub(1);
+    Ok(chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| payload(chunk, submit && index == last))
+        .collect())
+}
+
+fn send_datagrams(socket_path: &Path, payloads: &[String]) -> std::io::Result<()> {
+    let socket = UnixDatagram::unbound()?;
+    socket.connect(socket_path)?;
+    for payload in payloads {
+        let mut attempts = 0;
+        loop {
+            match socket.send(payload.as_bytes()) {
+                Ok(_) => break,
+                // The receive queue holds only ~2 datagrams (net.local.dgram.recvspace) and macOS
+                // returns ENOBUFS instead of blocking, so wait for the listener to drain it.
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) && attempts < 400 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod send_message_datagram_tests {
+    use super::{MAX_DATAGRAM_BYTES, send_message_datagrams};
+
+    #[test]
+    fn chunks_fit_and_reassemble() {
+        let text = "日本語 \"quoted\" \\ back\nslash 🎉 ".repeat(300);
+        let payloads = send_message_datagrams("Claude", None, &[], None, true, &text).unwrap();
+        assert!(payloads.len() > 1);
+        let mut reassembled = String::new();
+        for (index, payload) in payloads.iter().enumerate() {
+            assert!(payload.len() <= MAX_DATAGRAM_BYTES, "{}", payload.len());
+            let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(json["submit"].as_bool(), Some(index == payloads.len() - 1));
+            reassembled.push_str(json["text"].as_str().unwrap());
+        }
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn empty_message_still_submits() {
+        let payloads = send_message_datagrams("Claude", None, &[], None, true, "").unwrap();
+        assert_eq!(payloads.len(), 1);
+        let json: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(json["text"].as_str(), Some(""));
+        assert_eq!(json["submit"].as_bool(), Some(true));
+    }
+}
+
 fn agentium_socket_path() -> PathBuf {
     util::paths::home_dir()
         .join(".local")
@@ -563,7 +664,7 @@ enum IpcMessage {
     },
     TabSendMessage {
         title: String,
-        arena: Option<PathBuf>,
+        arena: agentium::ArenaSelector,
         submit: bool,
         text: String,
     },
@@ -1423,9 +1524,16 @@ fn start_ipc_listener(
                                 let Some(text) = json["text"].as_str() else {
                                     continue;
                                 };
+                                let arena = match json["arena"].as_str() {
+                                    Some(path) => agentium::ArenaSelector::Path(PathBuf::from(path)),
+                                    None => agentium::ArenaSelector::Caller {
+                                        ancestor_pids,
+                                        cwd: json["cwd"].as_str().map(PathBuf::from),
+                                    },
+                                };
                                 IpcMessage::TabSendMessage {
                                     title: title.to_string(),
-                                    arena: json["arena"].as_str().map(PathBuf::from),
+                                    arena,
                                     submit: json["submit"].as_bool().unwrap_or(false),
                                     text: text.to_string(),
                                 }
@@ -1691,7 +1799,7 @@ fn main() {
             return;
         }
         Some(Command::Tab { action }) => {
-            let msg = match action {
+            let payloads = match action {
                 TabAction::New {
                     r#type,
                     title,
@@ -1705,12 +1813,22 @@ fn main() {
                         PaneContentType::ProjectSearch => "project-search",
                         PaneContentType::GitGraph => "git-graph",
                     };
-                    serde_json::json!({
+                    let payload = serde_json::json!({
                         "type": "tab_new",
                         "content_type": content_type_str,
                         "title": title,
                         "command": command,
                     })
+                    .to_string();
+                    if payload.len() > MAX_DATAGRAM_BYTES {
+                        eprintln!(
+                            "error: command too long ({} bytes with envelope, limit {})",
+                            payload.len(),
+                            MAX_DATAGRAM_BYTES
+                        );
+                        std::process::exit(1);
+                    }
+                    vec![payload]
                 }
                 TabAction::SendMessage {
                     title,
@@ -1728,30 +1846,33 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    serde_json::json!({
-                        "type": "tab_send_message",
-                        "title": title,
-                        "arena": arena,
-                        "submit": submit,
-                        "text": message,
-                    })
+                    // Only needed when the arena is implicit; keeps the datagram budget for text.
+                    let (ancestor_pids, cwd) = if arena.is_some() {
+                        (Vec::new(), None)
+                    } else {
+                        let cwd = std::env::current_dir()
+                            .and_then(std::fs::canonicalize)
+                            .ok();
+                        (get_ancestor_pids(), cwd)
+                    };
+                    match send_message_datagrams(
+                        &title,
+                        arena.as_deref(),
+                        &ancestor_pids,
+                        cwd.as_deref(),
+                        submit,
+                        &message,
+                    ) {
+                        Ok(payloads) => payloads,
+                        Err(error) => {
+                            eprintln!("error: {error:#}");
+                            std::process::exit(1);
+                        }
+                    }
                 }
             };
-            let payload = msg.to_string();
-            if payload.len() > MAX_DATAGRAM_BYTES {
-                eprintln!(
-                    "error: message too long ({} bytes with envelope, limit {})",
-                    payload.len(),
-                    MAX_DATAGRAM_BYTES
-                );
-                std::process::exit(1);
-            }
             let socket_path = agentium_socket_path();
-            let sent = UnixDatagram::unbound().and_then(|socket| {
-                socket.connect(&socket_path)?;
-                socket.send(payload.as_bytes())
-            });
-            if let Err(error) = sent {
+            if let Err(error) = send_datagrams(&socket_path, &payloads) {
                 eprintln!(
                     "error: cannot reach Agentium at {}: {error}",
                     socket_path.display()
@@ -2325,7 +2446,7 @@ fn main() {
                                                 .update(cx, |app, _window, cx| {
                                                     app.handle_tab_send_message(
                                                         &title,
-                                                        arena.as_deref(),
+                                                        &arena,
                                                         submit,
                                                         &text,
                                                         cx,
