@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::os::unix::net::UnixDatagram;
+use std::io::{Read as _, Write as _};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -122,7 +123,7 @@ enum TabAction {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Paste text into the terminal tab whose title matches (long text is pasted in chunks)
+    /// Paste text into the terminal tab whose title matches; fails unless exactly one tab matches
     #[command(alias = "sendMessage")]
     SendMessage {
         /// Tab title to match exactly (errors on zero or multiple matches)
@@ -136,6 +137,20 @@ enum TabAction {
         #[arg(long)]
         submit: bool,
         message: String,
+    },
+    /// Print the title of the terminal tab this command runs in
+    #[command(name = "self")]
+    SelfTab {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the tabs of the arena this command runs in
+    List {
+        /// Arena worktree to list instead of the caller's
+        #[arg(long)]
+        arena: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -534,56 +549,6 @@ fn claude_project_dir_name(path: &str) -> String {
 // macOS caps AF_UNIX datagrams at net.local.dgram.maxdgram (2048); larger sends fail with EMSGSIZE.
 const MAX_DATAGRAM_BYTES: usize = 2048;
 
-/// Splits `text` into `tab_send_message` payloads that each fit in one datagram.
-/// Every chunk is pasted separately; `submit` rides on the last one only.
-fn send_message_datagrams(
-    title: &str,
-    arena: Option<&Path>,
-    ancestor_pids: &[u32],
-    cwd: Option<&Path>,
-    submit: bool,
-    text: &str,
-) -> anyhow::Result<Vec<String>> {
-    let payload = |chunk: &str, submit: bool| {
-        serde_json::json!({
-            "type": "tab_send_message",
-            "title": title,
-            "arena": arena,
-            "ancestor_pids": ancestor_pids,
-            "cwd": cwd,
-            "submit": submit,
-            "text": chunk,
-        })
-        .to_string()
-    };
-    // `false` is the longer spelling, so a chunk budgeted here also fits with `submit: true`.
-    let base_len = payload("", false).len();
-    let mut chunks: Vec<String> = Vec::new();
-    let mut chunk = String::new();
-    let mut chunk_len = 0;
-    for character in text.chars() {
-        // JSON escaping is per character, so measure each one with serde_json rather than
-        // re-serializing the whole chunk; subtract the surrounding quotes.
-        let character_len = serde_json::to_string(&character.to_string())?.len() - 2;
-        if base_len + chunk_len + character_len > MAX_DATAGRAM_BYTES {
-            if chunk.is_empty() {
-                anyhow::bail!("title or arena path too long for one datagram");
-            }
-            chunks.push(std::mem::take(&mut chunk));
-            chunk_len = 0;
-        }
-        chunk.push(character);
-        chunk_len += character_len;
-    }
-    chunks.push(chunk);
-    let last = chunks.len().saturating_sub(1);
-    Ok(chunks
-        .iter()
-        .enumerate()
-        .map(|(index, chunk)| payload(chunk, submit && index == last))
-        .collect())
-}
-
 fn send_datagrams(socket_path: &Path, payloads: &[String]) -> std::io::Result<()> {
     let socket = UnixDatagram::unbound()?;
     socket.connect(socket_path)?;
@@ -605,41 +570,131 @@ fn send_datagrams(socket_path: &Path, payloads: &[String]) -> std::io::Result<()
     Ok(())
 }
 
-#[cfg(test)]
-mod send_message_datagram_tests {
-    use super::{MAX_DATAGRAM_BYTES, send_message_datagrams};
-
-    #[test]
-    fn chunks_fit_and_reassemble() {
-        let text = "日本語 \"quoted\" \\ back\nslash 🎉 ".repeat(300);
-        let payloads = send_message_datagrams("Claude", None, &[], None, true, &text).unwrap();
-        assert!(payloads.len() > 1);
-        let mut reassembled = String::new();
-        for (index, payload) in payloads.iter().enumerate() {
-            assert!(payload.len() <= MAX_DATAGRAM_BYTES, "{}", payload.len());
-            let json: serde_json::Value = serde_json::from_str(payload).unwrap();
-            assert_eq!(json["submit"].as_bool(), Some(index == payloads.len() - 1));
-            reassembled.push_str(json["text"].as_str().unwrap());
-        }
-        assert_eq!(reassembled, text);
-    }
-
-    #[test]
-    fn empty_message_still_submits() {
-        let payloads = send_message_datagrams("Claude", None, &[], None, true, "").unwrap();
-        assert_eq!(payloads.len(), 1);
-        let json: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
-        assert_eq!(json["text"].as_str(), Some(""));
-        assert_eq!(json["submit"].as_bool(), Some(true));
-    }
-}
-
 fn agentium_socket_path() -> PathBuf {
     util::paths::home_dir()
         .join(".local")
         .join("share")
         .join("agentium")
         .join("agentium.sock")
+}
+
+/// Stream socket for CLI requests that need a reply (`tab self`, `tab list`, `tab send-message`).
+fn agentium_cli_socket_path() -> PathBuf {
+    util::paths::home_dir()
+        .join(".local")
+        .join("share")
+        .join("agentium")
+        .join("agentium-cli.sock")
+}
+
+/// Sends one request over the CLI socket and returns the app's reply, failing on `ok: false`.
+fn cli_request(mut request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    request["ancestor_pids"] = serde_json::json!(get_ancestor_pids());
+    if let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) {
+        request["cwd"] = serde_json::json!(cwd);
+    }
+    let socket_path = agentium_cli_socket_path();
+    let mut stream = UnixStream::connect(&socket_path)
+        .with_context(|| format!("cannot reach Agentium at {}", socket_path.display()))?;
+    stream.write_all(request.to_string().as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let response: serde_json::Value =
+        serde_json::from_str(&response).context("malformed reply from Agentium")?;
+    if response["ok"].as_bool() == Some(true) {
+        Ok(response)
+    } else {
+        anyhow::bail!(
+            "{}",
+            response["error"].as_str().unwrap_or("request failed")
+        )
+    }
+}
+
+fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    match action {
+        TabAction::New {
+            r#type,
+            title,
+            command,
+        } => {
+            let content_type_str = match r#type {
+                PaneContentType::Terminal => "terminal",
+                PaneContentType::Diff => "diff",
+                PaneContentType::BranchDiff => "branch-diff",
+                PaneContentType::GitStatus => "git-status",
+                PaneContentType::ProjectSearch => "project-search",
+                PaneContentType::GitGraph => "git-graph",
+            };
+            let payload = serde_json::json!({
+                "type": "tab_new",
+                "content_type": content_type_str,
+                "title": title,
+                "command": command,
+            })
+            .to_string();
+            if payload.len() > MAX_DATAGRAM_BYTES {
+                anyhow::bail!(
+                    "command too long ({} bytes with envelope, limit {})",
+                    payload.len(),
+                    MAX_DATAGRAM_BYTES
+                );
+            }
+            let socket_path = agentium_socket_path();
+            send_datagrams(&socket_path, &[payload])
+                .with_context(|| format!("cannot reach Agentium at {}", socket_path.display()))
+        }
+        TabAction::SendMessage {
+            title,
+            arena,
+            submit,
+            message,
+        } => {
+            let arena = arena
+                .map(|path| canonicalize_existing_path(&path))
+                .transpose()?;
+            cli_request(serde_json::json!({
+                "type": "tab_send_message",
+                "title": title,
+                "arena": arena,
+                "submit": submit,
+                "text": message,
+            }))?;
+            Ok(())
+        }
+        TabAction::SelfTab { json } => {
+            let response = cli_request(serde_json::json!({ "type": "tab_self" }))?;
+            if json {
+                println!("{}", response["tab"]);
+            } else {
+                println!("{}", response["tab"]["title"].as_str().unwrap_or_default());
+            }
+            Ok(())
+        }
+        TabAction::List { arena, json } => {
+            let arena = arena
+                .map(|path| canonicalize_existing_path(&path))
+                .transpose()?;
+            let response =
+                cli_request(serde_json::json!({ "type": "tab_list", "arena": arena }))?;
+            if json {
+                println!("{}", response["tabs"]);
+            } else if let Some(tabs) = response["tabs"].as_array() {
+                for tab in tabs {
+                    println!(
+                        "{}\t{}\t{}",
+                        tab["title"].as_str().unwrap_or_default(),
+                        tab["kind"].as_str().unwrap_or_default(),
+                        tab["state"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 enum IpcMessage {
@@ -662,11 +717,10 @@ enum IpcMessage {
         title: Option<String>,
         command: Vec<String>,
     },
-    TabSendMessage {
-        title: String,
-        arena: agentium::ArenaSelector,
-        submit: bool,
-        text: String,
+    /// A request from the CLI stream socket; the reply is written back on that connection.
+    CliRequest {
+        request: serde_json::Value,
+        reply: std::sync::mpsc::Sender<serde_json::Value>,
     },
     ChangeTheme {
         name: String,
@@ -1372,6 +1426,108 @@ fn get_ancestor_pids() -> Vec<u32> {
     pids
 }
 
+fn start_cli_listener(
+    socket_path: PathBuf,
+    msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
+) -> anyhow::Result<()> {
+    if socket_path.exists() {
+        match UnixStream::connect(&socket_path) {
+            Ok(_) => {
+                return Err(anyhow::anyhow!(
+                    "another instance is already listening on the CLI socket"
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(&socket_path)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let msg_sender = msg_sender.clone();
+                    std::thread::spawn(move || handle_cli_connection(stream, msg_sender));
+                }
+                Err(error) => log::warn!("cli socket accept failed: {error}"),
+            }
+        }
+    });
+    Ok(())
+}
+
+fn handle_cli_connection(
+    mut stream: UnixStream,
+    msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
+) {
+    let response = cli_connection_reply(&mut stream, msg_sender).unwrap_or_else(|error| {
+        serde_json::json!({ "ok": false, "error": format!("{error:#}") })
+    });
+    if let Err(error) = stream.write_all(response.to_string().as_bytes()) {
+        log::warn!("cli socket reply failed: {error}");
+    }
+}
+
+fn cli_connection_reply(
+    stream: &mut UnixStream,
+    msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
+) -> anyhow::Result<serde_json::Value> {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut request = String::new();
+    stream.read_to_string(&mut request)?;
+    let request: serde_json::Value = serde_json::from_str(&request)?;
+    let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
+    msg_sender
+        .unbounded_send(IpcMessage::CliRequest {
+            request,
+            reply: reply_sender,
+        })
+        .map_err(|_| anyhow::anyhow!("Agentium is shutting down"))?;
+    Ok(reply_receiver.recv_timeout(std::time::Duration::from_secs(10))?)
+}
+
+/// Runs one CLI request on the foreground thread and builds its JSON reply.
+fn handle_cli_request(
+    app: &mut agentium::AgentiumApp,
+    request: &serde_json::Value,
+    cx: &mut Context<agentium::AgentiumApp>,
+) -> serde_json::Value {
+    let ancestor_pids: Vec<u32> = request["ancestor_pids"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default();
+    let selector = match request["arena"].as_str() {
+        Some(path) => agentium::ArenaSelector::Path(PathBuf::from(path)),
+        None => agentium::ArenaSelector::Caller {
+            ancestor_pids: ancestor_pids.clone(),
+            cwd: request["cwd"].as_str().map(PathBuf::from),
+        },
+    };
+    let result = match request["type"].as_str() {
+        Some("tab_self") => app
+            .tab_self(&ancestor_pids, cx)
+            .map(|tab| serde_json::json!({ "ok": true, "tab": tab })),
+        Some("tab_list") => app
+            .tab_list(&selector, cx)
+            .map(|tabs| serde_json::json!({ "ok": true, "tabs": tabs })),
+        Some("tab_send_message") => {
+            let title = request["title"].as_str().unwrap_or_default();
+            let text = request["text"].as_str().unwrap_or_default();
+            let submit = request["submit"].as_bool().unwrap_or(false);
+            app.handle_tab_send_message(title, &selector, submit, text, cx)
+                .map(|()| serde_json::json!({ "ok": true }))
+        }
+        other => Err(anyhow::anyhow!("unknown request type {other:?}")),
+    };
+    result.unwrap_or_else(|error| serde_json::json!({ "ok": false, "error": format!("{error:#}") }))
+}
+
 fn start_ipc_listener(
     socket_path: PathBuf,
     msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
@@ -1515,27 +1671,6 @@ fn start_ipc_listener(
                                     content_type,
                                     title,
                                     command,
-                                }
-                            }
-                            Some("tab_send_message") => {
-                                let Some(title) = json["title"].as_str() else {
-                                    continue;
-                                };
-                                let Some(text) = json["text"].as_str() else {
-                                    continue;
-                                };
-                                let arena = match json["arena"].as_str() {
-                                    Some(path) => agentium::ArenaSelector::Path(PathBuf::from(path)),
-                                    None => agentium::ArenaSelector::Caller {
-                                        ancestor_pids,
-                                        cwd: json["cwd"].as_str().map(PathBuf::from),
-                                    },
-                                };
-                                IpcMessage::TabSendMessage {
-                                    title: title.to_string(),
-                                    arena,
-                                    submit: json["submit"].as_bool().unwrap_or(false),
-                                    text: text.to_string(),
                                 }
                             }
                             Some("change_theme") => {
@@ -1799,84 +1934,8 @@ fn main() {
             return;
         }
         Some(Command::Tab { action }) => {
-            let payloads = match action {
-                TabAction::New {
-                    r#type,
-                    title,
-                    command,
-                } => {
-                    let content_type_str = match r#type {
-                        PaneContentType::Terminal => "terminal",
-                        PaneContentType::Diff => "diff",
-                        PaneContentType::BranchDiff => "branch-diff",
-                        PaneContentType::GitStatus => "git-status",
-                        PaneContentType::ProjectSearch => "project-search",
-                        PaneContentType::GitGraph => "git-graph",
-                    };
-                    let payload = serde_json::json!({
-                        "type": "tab_new",
-                        "content_type": content_type_str,
-                        "title": title,
-                        "command": command,
-                    })
-                    .to_string();
-                    if payload.len() > MAX_DATAGRAM_BYTES {
-                        eprintln!(
-                            "error: command too long ({} bytes with envelope, limit {})",
-                            payload.len(),
-                            MAX_DATAGRAM_BYTES
-                        );
-                        std::process::exit(1);
-                    }
-                    vec![payload]
-                }
-                TabAction::SendMessage {
-                    title,
-                    arena,
-                    submit,
-                    message,
-                } => {
-                    let arena = match arena
-                        .map(|path| canonicalize_existing_path(&path))
-                        .transpose()
-                    {
-                        Ok(arena) => arena,
-                        Err(error) => {
-                            eprintln!("error: {error:#}");
-                            std::process::exit(1);
-                        }
-                    };
-                    // Only needed when the arena is implicit; keeps the datagram budget for text.
-                    let (ancestor_pids, cwd) = if arena.is_some() {
-                        (Vec::new(), None)
-                    } else {
-                        let cwd = std::env::current_dir()
-                            .and_then(std::fs::canonicalize)
-                            .ok();
-                        (get_ancestor_pids(), cwd)
-                    };
-                    match send_message_datagrams(
-                        &title,
-                        arena.as_deref(),
-                        &ancestor_pids,
-                        cwd.as_deref(),
-                        submit,
-                        &message,
-                    ) {
-                        Ok(payloads) => payloads,
-                        Err(error) => {
-                            eprintln!("error: {error:#}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            };
-            let socket_path = agentium_socket_path();
-            if let Err(error) = send_datagrams(&socket_path, &payloads) {
-                eprintln!(
-                    "error: cannot reach Agentium at {}: {error}",
-                    socket_path.display()
-                );
+            if let Err(error) = run_tab_action(action) {
+                eprintln!("error: {error:#}");
                 std::process::exit(1);
             }
             return;
@@ -2280,7 +2339,8 @@ fn main() {
                         let (msg_sender, mut msg_receiver) =
                             futures::channel::mpsc::unbounded::<IpcMessage>();
 
-                        start_ipc_listener(socket_path, msg_sender).log_err();
+                        start_ipc_listener(socket_path, msg_sender.clone()).log_err();
+                        start_cli_listener(agentium_cli_socket_path(), msg_sender).log_err();
 
                         cx.spawn({
                             async move |cx| {
@@ -2436,23 +2496,22 @@ fn main() {
                                                 })
                                                 .log_err();
                                         }
-                                        IpcMessage::TabSendMessage {
-                                            title,
-                                            arena,
-                                            submit,
-                                            text,
-                                        } => {
-                                            window_handle
+                                        IpcMessage::CliRequest { request, reply } => {
+                                            let response = window_handle
                                                 .update(cx, |app, _window, cx| {
-                                                    app.handle_tab_send_message(
-                                                        &title,
-                                                        &arena,
-                                                        submit,
-                                                        &text,
-                                                        cx,
-                                                    );
+                                                    handle_cli_request(app, &request, cx)
                                                 })
-                                                .log_err();
+                                                .unwrap_or_else(|error| {
+                                                    serde_json::json!({
+                                                        "ok": false,
+                                                        "error": format!("{error:#}"),
+                                                    })
+                                                });
+                                            if reply.send(response).is_err() {
+                                                log::warn!(
+                                                    "cli client disconnected before the reply"
+                                                );
+                                            }
                                         }
                                         IpcMessage::TaskCommand(command) => {
                                             window_handle
