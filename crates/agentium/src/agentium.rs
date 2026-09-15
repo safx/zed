@@ -58,6 +58,15 @@ pub enum ArenaSelector {
     },
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct TabInfo {
+    pub title: String,
+    pub kind: &'static str,
+    /// Claude hook state of a terminal tab: permission, running, ready, or idle.
+    pub state: Option<&'static str>,
+    pub arena: Option<PathBuf>,
+}
+
 pub enum PaneContentType {
     Terminal,
     Diff,
@@ -1643,14 +1652,11 @@ impl AgentiumApp {
         });
     }
 
-    pub fn handle_tab_send_message(
-        &mut self,
-        title: &str,
+    fn resolve_arena(
+        &self,
         selector: &ArenaSelector,
-        submit: bool,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
+        cx: &App,
+    ) -> anyhow::Result<&Entity<Arena>> {
         let arena = match selector {
             ArenaSelector::Path(path) => self.arena_containing_path(path, cx),
             ArenaSelector::Caller { ancestor_pids, cwd } => self
@@ -1665,10 +1671,76 @@ impl AgentiumApp {
                         .and_then(|cwd| self.arena_containing_path(cwd, cx))
                 }),
         };
-        let Some(arena) = arena else {
-            log::warn!("tab send-message: no arena for {selector:?}");
-            return;
-        };
+        arena.ok_or_else(|| anyhow::anyhow!("no arena for {selector:?}"))
+    }
+
+    fn terminal_shell_pid(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<u32> {
+        let terminal_view = item.act_as::<TerminalView>(cx)?;
+        let getter = terminal_view.read(cx).terminal().read(cx).pid_getter()?;
+        Some(getter.fallback_pid().as_u32())
+    }
+
+    fn tab_info(
+        &self,
+        item: &dyn workspace::ItemHandle,
+        arena: &Entity<Arena>,
+        cx: &App,
+    ) -> TabInfo {
+        let state = self.terminal_shell_pid(item, cx).map(|pid| {
+            if self.session_state.permission_shell_pids.borrow().contains(&pid) {
+                "permission"
+            } else if self.session_state.running_shell_pids.borrow().contains(&pid) {
+                "running"
+            } else if self.session_state.ready_shell_pids.borrow().contains(&pid) {
+                "ready"
+            } else {
+                "idle"
+            }
+        });
+        let is_terminal = item.act_as::<TerminalView>(cx).is_some();
+        TabInfo {
+            title: item.tab_content_text(0, cx).to_string(),
+            kind: if is_terminal { "terminal" } else { "other" },
+            state,
+            arena: arena.read(cx).working_directory.clone(),
+        }
+    }
+
+    /// The terminal tab whose shell is among the caller's ancestor processes.
+    pub fn tab_self(&self, ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TabInfo> {
+        for arena in &self.arenas {
+            for pane in arena.read(cx).center.panes() {
+                for item in pane.read(cx).items() {
+                    let pid = self.terminal_shell_pid(item.as_ref(), cx);
+                    if pid.is_some_and(|pid| ancestor_pids.contains(&pid)) {
+                        return Ok(self.tab_info(item.as_ref(), arena, cx));
+                    }
+                }
+            }
+        }
+        anyhow::bail!("caller is not running inside an Agentium terminal")
+    }
+
+    pub fn tab_list(&self, selector: &ArenaSelector, cx: &App) -> anyhow::Result<Vec<TabInfo>> {
+        let arena = self.resolve_arena(selector, cx)?;
+        let mut tabs = Vec::new();
+        for pane in arena.read(cx).center.panes() {
+            for item in pane.read(cx).items() {
+                tabs.push(self.tab_info(item.as_ref(), arena, cx));
+            }
+        }
+        Ok(tabs)
+    }
+
+    pub fn handle_tab_send_message(
+        &mut self,
+        title: &str,
+        selector: &ArenaSelector,
+        submit: bool,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let arena = self.resolve_arena(selector, cx)?;
         let mut matches = Vec::new();
         for pane in arena.read(cx).center.panes() {
             for item in pane.read(cx).items() {
@@ -1679,19 +1751,12 @@ impl AgentiumApp {
         }
         let item = match matches.as_slice() {
             [item] => item,
-            [] => {
-                log::warn!("tab send-message: no tab titled {title:?}");
-                return;
-            }
-            _ => {
-                log::warn!("tab send-message: {} tabs titled {title:?}", matches.len());
-                return;
-            }
+            [] => anyhow::bail!("no tab titled {title:?}"),
+            _ => anyhow::bail!("{} tabs titled {title:?}", matches.len()),
         };
-        let Some(terminal_view) = item.act_as::<TerminalView>(cx) else {
-            log::warn!("tab send-message: tab {title:?} is not a terminal");
-            return;
-        };
+        let terminal_view = item
+            .act_as::<TerminalView>(cx)
+            .ok_or_else(|| anyhow::anyhow!("tab {title:?} is not a terminal"))?;
         let terminal = terminal_view.read(cx).terminal().clone();
         terminal.update(cx, |terminal, _cx| {
             if !text.is_empty() {
@@ -1701,6 +1766,7 @@ impl AgentiumApp {
                 terminal.input(&b"\r"[..]);
             }
         });
+        Ok(())
     }
 
     /// The arena whose worktree contains `path`; the deepest one wins when worktrees nest.
