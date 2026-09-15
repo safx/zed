@@ -100,6 +100,27 @@ agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 ```
 
 - `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
+- `--title` — tab title override (terminal with a command only)
+
+### `agentium tab send-message`
+
+Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches.
+
+```
+agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] <MESSAGE>
+```
+
+- `--arena` — arena worktree to search; defaults to the arena the command runs in (process ancestry, then current directory)
+- `--submit` — send Enter after pasting
+
+### `agentium tab self` / `agentium tab list`
+
+```
+agentium tab self [--json]
+agentium tab list [--arena <PATH>] [--json]
+```
+
+`self` prints the title of the terminal tab the command runs in. `list` prints title, kind, and Claude hook state (`permission`, `running`, `ready`, `idle`) for each tab of the arena. Both use the CLI socket `~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`.
 
 ### `agentium task`
 
