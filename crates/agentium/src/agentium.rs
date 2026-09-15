@@ -45,6 +45,19 @@ use workspace::{
 
 use arena::{Arena, ArenaEvent};
 
+/// How a CLI command names the arena it targets.
+#[derive(Debug)]
+pub enum ArenaSelector {
+    /// Explicit `--arena <path>`: the arena whose worktree contains this path.
+    Path(PathBuf),
+    /// The arena the command was run from: a terminal whose shell is among the
+    /// caller's ancestor processes, else the arena whose worktree contains the cwd.
+    Caller {
+        ancestor_pids: Vec<u32>,
+        cwd: Option<PathBuf>,
+    },
+}
+
 pub enum PaneContentType {
     Terminal,
     Diff,
@@ -1633,24 +1646,27 @@ impl AgentiumApp {
     pub fn handle_tab_send_message(
         &mut self,
         title: &str,
-        arena_path: Option<&Path>,
+        selector: &ArenaSelector,
         submit: bool,
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        let arena = match arena_path {
-            Some(path) => self.arenas.iter().find(|arena| {
-                arena
-                    .read(cx)
-                    .working_directory
-                    .as_deref()
-                    .and_then(|directory| std::fs::canonicalize(directory).ok())
-                    .is_some_and(|directory| directory == path)
-            }),
-            None => self.active_arena(),
+        let arena = match selector {
+            ArenaSelector::Path(path) => self.arena_containing_path(path, cx),
+            ArenaSelector::Caller { ancestor_pids, cwd } => self
+                .find_arena_entity_id_for_pids(ancestor_pids, cx)
+                .and_then(|entity_id| {
+                    self.arenas
+                        .iter()
+                        .find(|arena| arena.entity_id() == entity_id)
+                })
+                .or_else(|| {
+                    cwd.as_deref()
+                        .and_then(|cwd| self.arena_containing_path(cwd, cx))
+                }),
         };
         let Some(arena) = arena else {
-            log::warn!("tab send-message: no arena for {arena_path:?}");
+            log::warn!("tab send-message: no arena for {selector:?}");
             return;
         };
         let mut matches = Vec::new();
@@ -1678,11 +1694,27 @@ impl AgentiumApp {
         };
         let terminal = terminal_view.read(cx).terminal().clone();
         terminal.update(cx, |terminal, _cx| {
-            terminal.paste(text);
+            if !text.is_empty() {
+                terminal.paste(text);
+            }
             if submit {
                 terminal.input(&b"\r"[..]);
             }
         });
+    }
+
+    /// The arena whose worktree contains `path`; the deepest one wins when worktrees nest.
+    fn arena_containing_path(&self, path: &Path, cx: &App) -> Option<&Entity<Arena>> {
+        self.arenas
+            .iter()
+            .filter_map(|arena| {
+                let directory = arena.read(cx).working_directory.as_deref()?;
+                let directory = std::fs::canonicalize(directory).ok()?;
+                path.starts_with(&directory)
+                    .then_some((directory.components().count(), arena))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, arena)| arena)
     }
 
     fn find_arena_entity_id_for_pids(&self, pids: &[u32], cx: &App) -> Option<EntityId> {
