@@ -23,7 +23,7 @@ Use the title the user gave. Otherwise list the tabs of your arena:
 agentium tab list
 ```
 
-Columns are title, kind (`terminal` or `other`), and state. Pick the terminal tab named after the target agent, such as `Codex`. If none or several fit, ask the user. `state` (`permission`, `running`, `ready`, `idle`) comes from Claude Code hooks; for Codex and other tabs it is always `idle` and carries no information.
+Columns are title, kind (`terminal` or `other`), and state. Pick the terminal tab named after the target agent, such as `Codex`. If none or several fit, ask the user. `state` (`permission`, `running`, `ready`, `idle`) comes from Claude Code hooks for Claude tabs and from the terminal title (spinner, "Action Required") for Codex tabs; for other tabs it is always `idle` and carries no information.
 
 Do not create tabs (`agentium tab new --title Codex -- codex`) unless the user asks for a new agent.
 
@@ -31,7 +31,6 @@ Do not create tabs (`agentium tab new --title Codex -- codex`) unless the user a
 
 ```bash
 agentium tab send-message --submit --title Codex "$(cat <<'EOF'
-[from: Claude]
 Review /abs/path/to/file.md for <criteria>. Report only must-fix findings.
 
 Reply in a single message with:
@@ -49,11 +48,10 @@ EOF
 
 ## Wait for the reply
 
-End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` when the peer follows the convention. Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
+End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` (the CLI adds the sender line for any message sent from an Agentium tab). Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
 
 ## Message conventions (both directions)
 
-- First line: `[from: <your tab title>]`.
 - Last block: the exact command the peer should run to reply.
 - Review rounds: send only must-fix deltas. After applying feedback, send what changed and ask for approval or the remaining must-fix items.
 
