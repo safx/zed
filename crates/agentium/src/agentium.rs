@@ -43,7 +43,7 @@ use workspace::{
     WorkspaceDb, WorkspaceId, ZoomOut,
 };
 
-use arena::{Arena, ArenaEvent};
+use arena::{Arena, ArenaEvent, TitleState};
 
 /// How a CLI command names the arena it targets.
 #[derive(Debug)]
@@ -91,7 +91,7 @@ pub struct ActivateArena {
     pub index: usize,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ClaudeSessionState {
     Idle,
     Running,
@@ -115,6 +115,37 @@ impl ClaudeSession {
         } else {
             self.state
         }
+    }
+}
+
+/// Prepends the `[from: <tab title>]` line agents use to tell messages apart.
+/// An empty message (Enter-only send) stays empty, and a message that already
+/// carries the line keeps the one its author wrote.
+fn with_from_line(from: Option<&str>, text: &str) -> String {
+    match from {
+        Some(from) if !text.is_empty() && !text.starts_with("[from:") => {
+            format!("[from: {from}]\n{text}")
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// Next state of a hook-less agent (Codex) tracked from its terminal title.
+/// `None` means "not tracked": a plain title never starts tracking, so a shell
+/// that sets its own title after the agent exited is left alone.
+fn next_title_driven_state(
+    previous: Option<ClaudeSessionState>,
+    title: TitleState,
+) -> Option<ClaudeSessionState> {
+    match (previous, title) {
+        (_, TitleState::Busy) => Some(ClaudeSessionState::Running),
+        (_, TitleState::ActionRequired) => Some(ClaudeSessionState::WaitingPermission),
+        (
+            Some(ClaudeSessionState::Running | ClaudeSessionState::WaitingPermission),
+            TitleState::Idle,
+        ) => Some(ClaudeSessionState::Completed),
+        (previous, TitleState::Idle) => previous,
+        (_, TitleState::Empty) => None,
     }
 }
 
@@ -268,6 +299,10 @@ pub struct AgentiumApp {
     rename_editor: Entity<Editor>,
     renaming_arena: Option<Entity<Arena>>,
     pub(crate) claude_sessions: HashMap<String, ClaudeSession>,
+    // Hook-less agents (Codex) tracked from their terminal title, keyed by the
+    // terminal's wrapper PID. Kept apart from `claude_sessions` so Fork Session,
+    // pr.json and the caffeinate monitor never see them.
+    title_driven_states: HashMap<u32, ClaudeSessionState>,
     session_state: SharedSessionState,
     should_move_window: bool,
     rate_limits: Option<RateLimits>,
@@ -597,6 +632,7 @@ impl AgentiumApp {
             rename_editor,
             renaming_arena: None,
             claude_sessions: HashMap::new(),
+            title_driven_states: HashMap::new(),
             should_move_window: false,
             rate_limits: None,
             _rate_limits_refresh_task: None,
@@ -701,8 +737,8 @@ impl AgentiumApp {
                 ArenaEvent::TerminalKeyInput { shell_pid } => {
                     this.clear_session_for_shell_pid(*shell_pid, cx);
                 }
-                ArenaEvent::TerminalTitleBusy { shell_pid, busy } => {
-                    this.set_claude_session_title_busy(*shell_pid, *busy, cx);
+                ArenaEvent::TerminalTitleState { shell_pid, state } => {
+                    this.handle_terminal_title_state(*shell_pid, *state, cx);
                 }
             },
         );
@@ -1412,6 +1448,20 @@ impl AgentiumApp {
                 ClaudeSessionState::Idle => {}
             }
         }
+        for (&pid, &state) in &self.title_driven_states {
+            match state {
+                ClaudeSessionState::Completed => {
+                    ready_pids.insert(pid);
+                }
+                ClaudeSessionState::Running => {
+                    running_pids.insert(pid);
+                }
+                ClaudeSessionState::WaitingPermission => {
+                    permission_pids.insert(pid);
+                }
+                ClaudeSessionState::Idle => {}
+            }
+        }
         *self.session_state.ready_shell_pids.borrow_mut() = ready_pids;
         *self.session_state.running_shell_pids.borrow_mut() = running_pids;
         *self.session_state.permission_shell_pids.borrow_mut() = permission_pids;
@@ -1737,6 +1787,7 @@ impl AgentiumApp {
         title: &str,
         selector: &ArenaSelector,
         submit: bool,
+        from: Option<&str>,
         text: &str,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
@@ -1758,9 +1809,10 @@ impl AgentiumApp {
             .act_as::<TerminalView>(cx)
             .ok_or_else(|| anyhow::anyhow!("tab {title:?} is not a terminal"))?;
         let terminal = terminal_view.read(cx).terminal().clone();
+        let text = with_from_line(from, text);
         terminal.update(cx, |terminal, _cx| {
             if !text.is_empty() {
-                terminal.paste(text);
+                terminal.paste(&text);
             }
             if submit {
                 terminal.input(&b"\r"[..]);
@@ -2499,10 +2551,10 @@ impl AgentiumApp {
         }));
     }
 
-    fn set_claude_session_title_busy(
+    fn handle_terminal_title_state(
         &mut self,
         shell_pid: u32,
-        busy: bool,
+        state: TitleState,
         cx: &mut Context<Self>,
     ) {
         let session_id = self
@@ -2511,16 +2563,33 @@ impl AgentiumApp {
             .borrow()
             .get(&shell_pid)
             .cloned();
-        let Some(session_id) = session_id else {
-            return;
-        };
-        if let Some(session) = self.claude_sessions.get_mut(&session_id) {
-            if session.title_busy != busy {
-                session.title_busy = busy;
-                self.sync_session_derived_state();
-                self.notify_all_panes(cx);
-                cx.notify();
+        let changed = match session_id {
+            // A hook-registered Claude session owns the terminal; its title
+            // spinner only overrides the hook state to Running.
+            Some(session_id) => {
+                let dropped_title_entry = self.title_driven_states.remove(&shell_pid).is_some();
+                let busy = state == TitleState::Busy;
+                let session_changed = match self.claude_sessions.get_mut(&session_id) {
+                    Some(session) if session.title_busy != busy => {
+                        session.title_busy = busy;
+                        true
+                    }
+                    _ => false,
+                };
+                dropped_title_entry || session_changed
             }
+            None => {
+                let previous = self.title_driven_states.get(&shell_pid).copied();
+                match next_title_driven_state(previous, state) {
+                    Some(next) => self.title_driven_states.insert(shell_pid, next) != Some(next),
+                    None => self.title_driven_states.remove(&shell_pid).is_some(),
+                }
+            }
+        };
+        if changed {
+            self.sync_session_derived_state();
+            self.notify_all_panes(cx);
+            cx.notify();
         }
     }
 
@@ -2531,6 +2600,12 @@ impl AgentiumApp {
                 && session.ancestor_pids.contains(&shell_pid)
             {
                 session.state = ClaudeSessionState::Idle;
+                changed = true;
+            }
+        }
+        if let Some(state) = self.title_driven_states.get_mut(&shell_pid) {
+            if *state == ClaudeSessionState::Completed {
+                *state = ClaudeSessionState::Idle;
                 changed = true;
             }
         }
@@ -2619,7 +2694,12 @@ impl AgentiumApp {
                             && s.ancestor_pids.contains(&pid)
                     })
                     .map(|s| (s.user_prompt.clone(), s.status_message.clone()))
-                    .unwrap_or_default();
+                    // Title-driven agents (Codex) have no hook data; their
+                    // title carries the thread name and project instead.
+                    .unwrap_or_else(|| {
+                        let title = tv.read(cx).terminal().read(cx).breadcrumb_text.clone();
+                        (title, String::new())
+                    });
                 infos.push(BadgeEntryInfo {
                     pane: pane.clone(),
                     terminal_view: tv,
@@ -2695,7 +2775,9 @@ impl AgentiumApp {
                     continue;
                 };
                 let shell_pid = getter.fallback_pid().as_u32();
-                if claude_pids.contains_key(&shell_pid) {
+                if claude_pids.contains_key(&shell_pid)
+                    || self.title_driven_states.contains_key(&shell_pid)
+                {
                     continue;
                 }
                 if let Some(live_pid) = terminal.pid() {
@@ -2731,7 +2813,7 @@ impl AgentiumApp {
             let Some(name) = process.name().to_str() else {
                 continue;
             };
-            if name == "claude" || is_shell_process_name(name) {
+            if matches!(name, "claude" | "codex") || is_shell_process_name(name) {
                 continue;
             }
             infos.push(BadgeEntryInfo {
@@ -5804,8 +5886,43 @@ impl PickerDelegate for AgentiumRecentProjectsDelegate {
 mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
-    use super::{backlog_issue_keys_in_branch, parse_backlog_remote, pr_ref_matches_remote};
+    use super::{
+        ClaudeSessionState, backlog_issue_keys_in_branch, next_title_driven_state,
+        parse_backlog_remote, pr_ref_matches_remote, with_from_line,
+    };
+    use crate::arena::TitleState;
     use crate::board::PrRef;
+
+    #[test]
+    fn with_from_line_adds_the_sender_once() {
+        assert_eq!(with_from_line(Some("Codex"), "hi"), "[from: Codex]\nhi");
+        assert_eq!(
+            with_from_line(Some("Codex"), "[from: Codex]\nhi"),
+            "[from: Codex]\nhi"
+        );
+        assert_eq!(with_from_line(Some("Codex"), ""), "");
+        assert_eq!(with_from_line(None, "hi"), "hi");
+    }
+
+    #[test]
+    fn title_driven_state_follows_codex_title_transitions() {
+        // A plain title alone (shell prompt, idle Codex) is not tracked.
+        assert_eq!(next_title_driven_state(None, TitleState::Idle), None);
+        let running = next_title_driven_state(None, TitleState::Busy);
+        assert_eq!(running, Some(ClaudeSessionState::Running));
+        let waiting = next_title_driven_state(running, TitleState::ActionRequired);
+        assert_eq!(waiting, Some(ClaudeSessionState::WaitingPermission));
+        let completed = next_title_driven_state(waiting, TitleState::Idle);
+        assert_eq!(completed, Some(ClaudeSessionState::Completed));
+        // Completed stays until key input clears it; a thread rename does not.
+        assert_eq!(next_title_driven_state(completed, TitleState::Idle), completed);
+        assert_eq!(
+            next_title_driven_state(Some(ClaudeSessionState::Idle), TitleState::Idle),
+            Some(ClaudeSessionState::Idle)
+        );
+        // Codex clears its title on exit.
+        assert_eq!(next_title_driven_state(completed, TitleState::Empty), None);
+    }
 
     #[test]
     fn pr_ref_matches_remote_compares_repository_identity() {
