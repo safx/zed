@@ -136,6 +136,9 @@ enum TabAction {
         /// Press Enter after pasting
         #[arg(long)]
         submit: bool,
+        /// Do not prepend the `[from: <your tab title>]` line
+        #[arg(long)]
+        no_from: bool,
         message: String,
     },
     /// Print the title of the terminal tab this command runs in
@@ -651,6 +654,7 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
             title,
             arena,
             submit,
+            no_from,
             message,
         } => {
             let arena = arena
@@ -661,6 +665,7 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
                 "title": title,
                 "arena": arena,
                 "submit": submit,
+                "no_from": no_from,
                 "text": message,
             }))?;
             Ok(())
@@ -1520,7 +1525,13 @@ fn handle_cli_request(
             let title = request["title"].as_str().unwrap_or_default();
             let text = request["text"].as_str().unwrap_or_default();
             let submit = request["submit"].as_bool().unwrap_or(false);
-            app.handle_tab_send_message(title, &selector, submit, text, cx)
+            // The sender is the tab the CLI runs in; outside Agentium there is none.
+            let from = if request["no_from"].as_bool().unwrap_or(false) {
+                None
+            } else {
+                app.tab_self(&ancestor_pids, cx).ok().map(|tab| tab.title)
+            };
+            app.handle_tab_send_message(title, &selector, submit, from.as_deref(), text, cx)
                 .map(|()| serde_json::json!({ "ok": true }))
         }
         other => Err(anyhow::anyhow!("unknown request type {other:?}")),

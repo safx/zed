@@ -22,7 +22,8 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **Task board** — a Tasks sidebar tab with a priority-ordered task list; each task bundles issues (GitHub and Backlog) and arenas (worktrees), so multi-repository work is grouped under one task. Persisted to `~/Library/Application Support/Agentium/board.json`; closed worktrees reopen as arenas with one click. Issue titles/states are fetched via the `gh` and [`bee`](https://nulab.github.io/bee/) CLIs (both optional)
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
 - **Claude Code session ↔ PR tracking** — persist a many-to-many mapping between Claude Code session IDs and PR numbers per project (`~/Library/Application Support/Agentium/pr.json`), queryable via CLI. PR numbers are GitHub or Backlog depending on the project's origin remote
-- **Running-command badge** — sidebar pill (theme-inverted white/black) shows the count of terminals in each arena currently running a non-Claude command (e.g. `cargo build`, `sleep 30`)
+- **Codex state** — Codex terminals get the same running/permission/completed indicators as Claude Code, read from the terminal title Codex sets (braille spinner while working, `Action Required` while awaiting an approval); no hooks or Codex config needed
+- **Running-command badge** — sidebar pill (theme-inverted white/black) shows the count of terminals in each arena currently running a command other than a coding agent (e.g. `cargo build`, `sleep 30`)
 
 ## Keyboard Shortcuts
 
@@ -57,17 +58,18 @@ Add the following to your Claude Code `settings.json`:
 Terminal tabs show dot indicators based on execution state:
 
 - **Claude terminals**: green dot while a prompt is running, blue dot + blue pane border when completed
+- **Codex terminals**: same dots, derived from the terminal title. Busy is reported once the spinner has run for 2 seconds so that the startup spin (MCP servers loading) does not count as a turn
 - **Non-Claude task terminals**: green dot while running, blue dot on success, red dot on failure
 
 Pressing any key while focused on a terminal clears its dot (and border). Selecting a terminal from the arena badge menu also clears it.
 
 The arena sidebar shows pill-shaped badges:
-- Orange pill — Claude sessions awaiting a permission decision (clickable: opens a menu to jump to the specific terminal)
-- Green pill — running Claude sessions
-- Blue pill — completed Claude sessions (clickable: opens a menu to jump to the specific terminal)
-- White/black pill (theme-inverted) — terminals running a non-Claude foreground command, refreshed every 2 seconds
+- Orange pill — Claude or Codex sessions awaiting a permission decision (clickable: opens a menu to jump to the specific terminal)
+- Green pill — running Claude or Codex sessions
+- Blue pill — completed Claude or Codex sessions (clickable: opens a menu to jump to the specific terminal)
+- White/black pill (theme-inverted) — terminals running a foreground command other than `claude` or `codex`, refreshed every 2 seconds
 
-Terminals that previously hosted a Claude Code session are excluded from the white/black pill until that session ends. The `SessionEnd` hook is the canonical way to release the terminal so it can be counted as non-Claude busy when running other commands afterwards; on macOS, a caffeinate-based monitor is also used as a fallback for hard exits (SIGKILL, terminal close).
+Terminals that previously hosted a Claude Code session are excluded from the white/black pill until that session ends. Codex terminals are excluded by process name and, once their title has shown a spinner, until Codex clears the title on exit. The `SessionEnd` hook is the canonical way to release the terminal so it can be counted as non-Claude busy when running other commands afterwards; on macOS, a caffeinate-based monitor is also used as a fallback for hard exits (SIGKILL, terminal close).
 
 The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info for display. A "!" indicator appears if no update has been received for over 1 hour.
 
@@ -107,11 +109,12 @@ agentium tab new [--type <TYPE>] [-- <COMMAND>...]
 Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches.
 
 ```
-agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] <MESSAGE>
+agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--no-from] <MESSAGE>
 ```
 
 - `--arena` — arena worktree to search; defaults to the arena the command runs in (process ancestry, then current directory)
 - `--submit` — send Enter after pasting
+- `--no-from` — do not prepend the sender line. By default a message sent from inside an Agentium terminal tab starts with `[from: <that tab's title>]` on its own line (the same title `agentium tab self` prints), unless the message already begins with `[from:` or is empty
 
 ### `agentium tab self` / `agentium tab list`
 

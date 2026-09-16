@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{prelude::*, *};
 use markdown_preview::markdown_preview_view::{MarkdownPreviewMode, MarkdownPreviewView};
@@ -37,14 +38,32 @@ use crate::{
 
 pub(crate) enum ArenaEvent {
     TerminalKeyInput { shell_pid: u32 },
-    /// Claude spinner (◐/◑) appeared or cleared in the terminal title.
-    TerminalTitleBusy { shell_pid: u32, busy: bool },
+    /// The agent state read from the terminal title changed.
+    TerminalTitleState { shell_pid: u32, state: TitleState },
 }
 
-/// Watches a terminal's OSC 0 title for Claude's busy spinner.
+/// Agent state read from a terminal's OSC 0 title.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum TitleState {
+    /// Title cleared. Codex clears its title on exit.
+    Empty,
+    Idle,
+    Busy,
+    ActionRequired,
+}
+
+// Codex spins the title for about a second while its MCP servers start, before
+// any prompt was sent. Reporting Busy only after it persisted this long keeps a
+// freshly opened Codex tab from flashing green and then landing on Completed.
+// ponytail: fixed hold; read Codex's `run-state` title words if startup ever
+// exceeds it.
+const TITLE_BUSY_HOLD: Duration = Duration::from_secs(2);
+
+/// Watches a terminal's OSC 0 title for an agent's busy spinner.
 struct TitleWatch {
     shell_pid: u32,
-    busy: bool,
+    state: TitleState,
+    busy_since: Option<Instant>,
     _subscription: Subscription,
 }
 
@@ -754,7 +773,7 @@ impl Arena {
         }
     }
 
-    /// Subscribe to a terminal's title changes to track Claude's spinner.
+    /// Subscribe to a terminal's title changes to track the agent's spinner.
     fn watch_terminal_title(
         &mut self,
         entity_id: EntityId,
@@ -765,38 +784,47 @@ impl Arena {
         let subscription =
             cx.subscribe(&terminal, move |this, terminal, event: &TerminalEvent, cx| {
                 if matches!(event, TerminalEvent::BreadcrumbsChanged) {
-                    let busy = title_indicates_busy(&terminal.read(cx).breadcrumb_text);
-                    this.update_terminal_title_busy(entity_id, shell_pid, busy, cx);
+                    let state = classify_title(&terminal.read(cx).breadcrumb_text);
+                    this.update_terminal_title_state(entity_id, shell_pid, state, cx);
                 }
             });
         self.terminal_title_watches.insert(
             entity_id,
             TitleWatch {
                 shell_pid,
-                busy: false,
+                state: TitleState::Empty,
+                busy_since: None,
                 _subscription: subscription,
             },
         );
     }
 
-    /// Emit only when the spinner's busy/not-busy class changes.
-    fn update_terminal_title_busy(
+    /// Emit only when the title's state class changes. Busy is held back for
+    /// `TITLE_BUSY_HOLD`; the spinner redraws the title every 100ms-1s, so the
+    /// hold expires on a later frame without a timer.
+    fn update_terminal_title_state(
         &mut self,
         entity_id: EntityId,
         shell_pid: u32,
-        busy: bool,
+        observed: TitleState,
         cx: &mut Context<Self>,
     ) {
-        let changed = match self.terminal_title_watches.get_mut(&entity_id) {
-            Some(watch) => {
-                let changed = watch.busy != busy;
-                watch.busy = busy;
-                changed
-            }
-            None => false,
+        let Some(watch) = self.terminal_title_watches.get_mut(&entity_id) else {
+            return;
         };
-        if changed {
-            cx.emit(ArenaEvent::TerminalTitleBusy { shell_pid, busy });
+        let state = if observed == TitleState::Busy {
+            let since = *watch.busy_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < TITLE_BUSY_HOLD {
+                return;
+            }
+            TitleState::Busy
+        } else {
+            watch.busy_since = None;
+            observed
+        };
+        if watch.state != state {
+            watch.state = state;
+            cx.emit(ArenaEvent::TerminalTitleState { shell_pid, state });
         }
     }
 
@@ -862,10 +890,10 @@ impl Arena {
                         .borrow_mut()
                         .remove(&tv.entity_id());
                     if let Some(watch) = self.terminal_title_watches.remove(&tv.entity_id()) {
-                        if watch.busy {
-                            cx.emit(ArenaEvent::TerminalTitleBusy {
+                        if watch.state != TitleState::Empty {
+                            cx.emit(ArenaEvent::TerminalTitleState {
                                 shell_pid: watch.shell_pid,
-                                busy: false,
+                                state: TitleState::Empty,
                             });
                         }
                     }
@@ -1415,9 +1443,19 @@ fn add_terminal_view_to_pane(
     });
 }
 
-/// Claude animates ◐/◑ in the title only while busy; ✳ or empty means not busy.
-fn title_indicates_busy(title: &str) -> bool {
-    matches!(title.chars().next(), Some('\u{25D0}' | '\u{25D1}'))
+/// Claude leads its title with ◐/◑ and Codex with a braille spinner only while
+/// busy; Codex shows "Action Required" while it waits for an approval. Only the
+/// first character counts: Codex also spins at the end of "renaming... ⠧" while
+/// naming the thread after the turn has already finished.
+fn classify_title(title: &str) -> TitleState {
+    if title.contains("Action Required") {
+        return TitleState::ActionRequired;
+    }
+    match title.chars().next() {
+        None => TitleState::Empty,
+        Some('\u{25D0}' | '\u{25D1}' | '\u{2800}'..='\u{28FF}') => TitleState::Busy,
+        Some(_) => TitleState::Idle,
+    }
 }
 
 fn indicator_for_terminal(
@@ -1713,4 +1751,33 @@ pub(crate) fn new_agentium_pane(
     cx.observe(&pane, |_, _, cx| cx.notify()).detach();
 
     pane
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: that would pull gpui's `test` attribute macro into
+    // scope and make `#[test]` expand recursively.
+    use super::{TitleState, classify_title};
+
+    #[test]
+    fn classify_title_reads_claude_and_codex_titles() {
+        // Titles observed from Claude Code 2.1.x and Codex 0.154.0.
+        assert_eq!(classify_title(""), TitleState::Empty);
+        assert_eq!(classify_title("✳ Fixing tests"), TitleState::Idle);
+        assert_eq!(classify_title("◐ Fixing tests"), TitleState::Busy);
+        assert_eq!(classify_title("project-themepark_claude"), TitleState::Idle);
+        assert_eq!(classify_title("⠙ project-themepark_claude"), TitleState::Busy);
+        assert_eq!(classify_title("⠋ renaming... ⠧ | project"), TitleState::Busy);
+        // Thread naming keeps spinning after the turn itself has finished.
+        assert_eq!(classify_title("renaming... ⠧ | project"), TitleState::Idle);
+        assert_eq!(classify_title("Reply ok | project"), TitleState::Idle);
+        assert_eq!(
+            classify_title("[ ! ] Action Required | Run curl | project"),
+            TitleState::ActionRequired
+        );
+        assert_eq!(
+            classify_title("[ . ] Action Required | Run curl | project"),
+            TitleState::ActionRequired
+        );
+    }
 }
