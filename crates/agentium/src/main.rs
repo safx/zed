@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -196,9 +196,12 @@ enum TaskAction {
         /// Defaults to the task containing the current directory.
         #[arg(long)]
         task: Option<String>,
-        /// Re-fetch PR and issue metadata before printing
+        /// Re-fetch PR and issue metadata before printing. Requires a running Agentium.
         #[arg(long)]
         update: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Add an issue to a task
     AddIssue {
@@ -590,16 +593,35 @@ fn agentium_cli_socket_path() -> PathBuf {
         .join("agentium-cli.sock")
 }
 
-/// Sends one request over the CLI socket and returns the app's reply, failing on `ok: false`.
-fn cli_request(mut request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+/// Sends one request over the CLI socket. Returns `None` when no Agentium
+/// instance is listening (`NotFound` / `ConnectionRefused`, the same check
+/// `dispatch_task_commands` uses) so callers can fall back to reading state
+/// directly. Any other connect failure, or an `ok: false` reply, is an error
+/// with no fallback: a second writer must never race the running app.
+fn cli_request_if_running(
+    mut request: serde_json::Value,
+) -> anyhow::Result<Option<serde_json::Value>> {
     use anyhow::Context as _;
     request["ancestor_pids"] = serde_json::json!(get_ancestor_pids());
     if let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) {
         request["cwd"] = serde_json::json!(cwd);
     }
     let socket_path = agentium_cli_socket_path();
-    let mut stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("cannot reach Agentium at {}", socket_path.display()))?;
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context(format!("cannot reach Agentium at {}", socket_path.display())));
+        }
+    };
     stream.write_all(request.to_string().as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
@@ -607,13 +629,24 @@ fn cli_request(mut request: serde_json::Value) -> anyhow::Result<serde_json::Val
     let response: serde_json::Value =
         serde_json::from_str(&response).context("malformed reply from Agentium")?;
     if response["ok"].as_bool() == Some(true) {
-        Ok(response)
+        Ok(Some(response))
     } else {
         anyhow::bail!(
             "{}",
             response["error"].as_str().unwrap_or("request failed")
         )
     }
+}
+
+/// Sends one request that always requires a running Agentium (the `tab_*`
+/// commands have no direct-file fallback, unlike `task info` / `task list`).
+fn cli_request(request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    cli_request_if_running(request)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot reach Agentium at {}",
+            agentium_cli_socket_path().display()
+        )
+    })
 }
 
 fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
@@ -762,15 +795,23 @@ fn run_task_action(action: TaskAction) -> anyhow::Result<()> {
 
     match action {
         TaskAction::List { json } => {
-            let board = board::load_board();
+            // A running Agentium's in-memory board is authoritative; without
+            // one, board.json is the only copy there is.
+            let tasks: Vec<board::BoardTask> =
+                match cli_request_if_running(serde_json::json!({ "type": "task_list" }))? {
+                    Some(response) => serde_json::from_value(response["tasks"].clone())
+                        .context("malformed tasks in Agentium's reply")?,
+                    None => board::load_board().tasks,
+                };
             if json {
-                println!("{}", serde_json::to_string_pretty(&board.tasks)?);
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {
-                let tasks: Vec<_> = board.active_tasks().collect();
-                if tasks.is_empty() {
+                let active: Vec<&board::BoardTask> =
+                    tasks.iter().filter(|task| !task.archived).collect();
+                if active.is_empty() {
                     println!("(no tasks)");
                 }
-                for (index, task) in tasks.iter().enumerate() {
+                for (index, task) in active.iter().enumerate() {
                     let mut line = format!("[{}] {}", index + 1, task.title);
                     if !task.issues.is_empty() {
                         let issues = task
@@ -789,7 +830,7 @@ fn run_task_action(action: TaskAction) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        TaskAction::Info { task, update } => run_task_info(task.as_deref(), update),
+        TaskAction::Info { task, update, json } => run_task_info(task.as_deref(), update, json),
         TaskAction::New {
             title,
             issue,
@@ -903,40 +944,22 @@ fn canonicalize_existing_path(path: &std::path::Path) -> anyhow::Result<PathBuf>
     std::fs::canonicalize(path).with_context(|| format!("cannot resolve path '{}'", path.display()))
 }
 
+/// Thin wrapper around `Board::resolve_target` that supplies the CLI
+/// process's own current directory when no selector is given. Only computes
+/// `cwd` in that case, so a resolution by selector alone still works when the
+/// current directory cannot be determined.
 fn resolve_target_task(
     board: &agentium::board::Board,
     selector: Option<&str>,
 ) -> anyhow::Result<uuid::Uuid> {
-    if let Some(selector) = selector {
-        return board.resolve_task(selector);
-    }
-    let cwd = std::env::current_dir()?;
-    let canonical = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    let containing = board.tasks_containing_path(&canonical);
-    match containing.len() {
-        1 => Ok(containing[0].id),
-        0 => anyhow::bail!(
-            "current directory is not linked to any task; pass --task <TASK>. Tasks:\n{}",
-            format_active_tasks(board)
-        ),
-        _ => anyhow::bail!(
-            "current directory belongs to multiple tasks; pass --task <TASK>. Tasks:\n{}",
-            format_active_tasks(board)
-        ),
-    }
-}
-
-fn format_active_tasks(board: &agentium::board::Board) -> String {
-    let lines: Vec<String> = board
-        .active_tasks()
-        .enumerate()
-        .map(|(index, task)| format!("  [{}] {}", index + 1, task.title))
-        .collect();
-    if lines.is_empty() {
-        "  (no tasks)".to_string()
-    } else {
-        lines.join("\n")
-    }
+    let cwd = match selector {
+        Some(_) => None,
+        None => {
+            let cwd = std::env::current_dir()?;
+            Some(std::fs::canonicalize(&cwd).unwrap_or(cwd))
+        }
+    };
+    board.resolve_target(selector, cwd.as_deref())
 }
 
 /// True when `path` is the same as, or a subdirectory of, one of `task`'s
@@ -1043,16 +1066,6 @@ fn cached_prs_for_path(
         .unwrap_or_default()
 }
 
-// Blocking is fine here: this runs in the synchronous CLI path, not in the app.
-#[allow(clippy::disallowed_methods)]
-fn probe_cli_available(program: &str) -> bool {
-    std::process::Command::new(program)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
 /// Run one synchronous git subprocess in `path` and return trimmed stdout on
 /// success, or `None` on any failure (missing repo, no such remote, etc).
 fn git_output(path: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -1074,63 +1087,109 @@ fn short_uuid(id: uuid::Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-/// Print the task containing the current directory (or `--task`): its issues
-/// and its arenas with their PR state, marking PRs linked via `add-pr`. With
-/// `update`, re-fetches PR and issue metadata via `gh`/`bee` instead of
-/// showing the last-fetched cache; it never writes board.json or pr_cache.json.
-fn run_task_info(task: Option<&str>, update: bool) -> anyhow::Result<()> {
-    use agentium::board::{self, IssueRef};
+/// Show the task containing the current directory (or `--task`): its issues
+/// and its arenas with their PR state, marking PRs linked via `add-pr`. With a
+/// running Agentium, the request (and any `--update` fetch) is handled by the
+/// app over the CLI socket, which also writes the fetch results into its
+/// normal state (board.json / pr_cache.json), same as PR polling. Without a
+/// running instance, falls back to reading board.json / pr_cache.json
+/// directly; `--update` has no such fallback (there is nothing to write the
+/// fetch result's state into) and errors instead.
+fn run_task_info(task: Option<&str>, update: bool, json: bool) -> anyhow::Result<()> {
+    use agentium::board;
     use anyhow::Context as _;
 
-    let board = board::load_board();
-    let task_id = resolve_target_task(&board, task)?;
-    let task = board
-        .tasks
-        .iter()
-        .find(|candidate| candidate.id == task_id)
-        .context("resolved task id not found in board")?;
-    let index = board.active_tasks().position(|candidate| candidate.id == task_id);
+    let request = serde_json::json!({
+        "type": "task_info",
+        "task": task,
+        "update": update,
+    });
 
-    let (gh_available, bee_available) = if update {
-        // Safety: single-threaded CLI invocation, no concurrent env access.
-        unsafe {
-            std::env::set_var("GH_PROMPT_DISABLED", "1");
+    match cli_request_if_running(request)? {
+        Some(response) => {
+            let index: Option<usize> = serde_json::from_value(response["index"].clone())
+                .context("malformed index in Agentium's reply")?;
+            let task: board::BoardTask = serde_json::from_value(response["task"].clone())
+                .context("malformed task in Agentium's reply")?;
+            let prs: HashMap<String, Vec<agentium::PrInfo>> =
+                serde_json::from_value(response["prs"].clone())
+                    .context("malformed prs in Agentium's reply")?;
+            let warnings: Vec<String> = serde_json::from_value(response["warnings"].clone())
+                .context("malformed warnings in Agentium's reply")?;
+            // Printed before the `--json`/plain branch so both output modes
+            // surface fetch warnings, not just the plain-text one.
+            for warning in &warnings {
+                eprintln!("{warning}");
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
+            }
+            print_task_info(index, &task, &prs, update);
+            Ok(())
         }
-        (probe_cli_available("gh"), probe_cli_available("bee"))
-    } else {
-        (false, false)
-    };
+        None => {
+            anyhow::ensure!(!update, "task info --update requires a running Agentium");
+            let board = board::load_board();
+            let task_id = resolve_target_task(&board, task)?;
+            let task = board
+                .tasks
+                .iter()
+                .find(|candidate| candidate.id == task_id)
+                .context("resolved task id not found in board")?;
+            // 1-based, matching `task list` output and the `--task <N>` selector.
+            let index = board
+                .active_tasks()
+                .position(|candidate| candidate.id == task_id)
+                .map(|index| index + 1);
+            let pr_cache = agentium::load_pr_cache();
+            let prs: HashMap<String, Vec<agentium::PrInfo>> = task
+                .worktrees
+                .iter()
+                .map(|worktree| {
+                    let key = worktree.to_string_lossy().to_string();
+                    (key, cached_prs_for_path(&pr_cache, worktree))
+                })
+                .collect();
+            if json {
+                let value = serde_json::json!({
+                    "ok": true,
+                    "index": index,
+                    "task": task,
+                    "prs": prs,
+                    "warnings": Vec::<String>::new(),
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            print_task_info(index, task, &prs, update);
+            Ok(())
+        }
+    }
+}
 
+/// Prints one `task_info` result: header, issues (already merged with fresh
+/// metadata when `update` fetched them — a running Agentium wrote that
+/// straight into the `BoardTask` before replying), arenas with their PR
+/// state, and unlinked PRs. Any fetch warnings are printed by the caller
+/// before this runs, so they surface for `--json` too. Branch/sha/origin come
+/// from a local git subprocess even with a running Agentium: bringing that
+/// into the app would mean either blocking its foreground thread on a
+/// subprocess or adding a whole new async round trip for no benefit.
+fn print_task_info(
+    index: Option<usize>,
+    task: &agentium::board::BoardTask,
+    prs: &HashMap<String, Vec<agentium::PrInfo>>,
+    update: bool,
+) {
     match index {
-        Some(index) => println!("[{}] {}  ({})", index + 1, task.title, short_uuid(task.id)),
+        Some(index) => println!("[{}] {}  ({})", index, task.title, short_uuid(task.id)),
         None => println!("{}  ({})", task.title, short_uuid(task.id)),
     }
 
     println!("issues:");
     if task.issues.is_empty() {
         println!("  (none)");
-    } else if update {
-        let results = smol::block_on(futures::future::join_all(task.issues.iter().map(
-            |issue| async move { (issue, agentium::fetch_issue_metadata_for(&issue.reference).await) },
-        )));
-        for (issue, result) in results {
-            let label = issue.reference.short_label();
-            match result {
-                Ok(metadata) => {
-                    let state = metadata.state.as_deref().or(issue.state.as_deref()).unwrap_or("?");
-                    let title = metadata.title.as_deref().or(issue.title.as_deref()).unwrap_or("");
-                    let url = metadata.url.as_deref().or(issue.url.as_deref()).unwrap_or("");
-                    println!("  {label}  {state}  {title}  {url}");
-                }
-                Err(error) => {
-                    eprintln!("failed to fetch issue {label}: {error:#}");
-                    let state = issue.state.as_deref().unwrap_or("?");
-                    let title = issue.title.as_deref().unwrap_or("");
-                    let url = issue.url.as_deref().unwrap_or("");
-                    println!("  {label}  {state}  {title}  {url}");
-                }
-            }
-        }
     } else {
         for issue in &task.issues {
             let label = issue.reference.short_label();
@@ -1145,18 +1204,6 @@ fn run_task_info(task: Option<&str>, update: bool) -> anyhow::Result<()> {
     if task.worktrees.is_empty() {
         println!("  (none)");
     } else {
-        let task_backlog_issue_keys: Vec<String> = task
-            .issues
-            .iter()
-            .filter_map(|issue| match &issue.reference {
-                IssueRef::Backlog { issue_key } => Some(issue_key.clone()),
-                IssueRef::GitHub { .. } => None,
-            })
-            .collect();
-        // Loaded unconditionally: it's also the `--update` fallback when a
-        // fetch fails for one worktree.
-        let pr_cache = agentium::load_pr_cache();
-
         for path in &task.worktrees {
             if !path.exists() {
                 println!("  {}  (missing)", path.display());
@@ -1189,29 +1236,7 @@ fn run_task_info(task: Option<&str>, update: bool) -> anyhow::Result<()> {
                 provider,
             );
 
-            let prs: Vec<agentium::PrInfo> = if update {
-                match smol::block_on(agentium::fetch_pr_list(
-                    path,
-                    agentium::PrFetchContext {
-                        gh_available,
-                        bee_available,
-                        task_issue_keys: task_backlog_issue_keys.clone(),
-                        task_pr_refs: task.prs.clone(),
-                        known_issue_ids: HashMap::new(),
-                        failed_issue_keys: HashSet::new(),
-                    },
-                )) {
-                    Ok(outcome) => outcome.prs,
-                    Err(error) => {
-                        eprintln!("failed to fetch PRs for {}: {error:#}", path.display());
-                        cached_prs_for_path(&pr_cache, path)
-                    }
-                }
-            } else {
-                cached_prs_for_path(&pr_cache, path)
-            };
-
-            for pr in prs {
+            for pr in cached_prs_for_path(prs, path) {
                 let linked = task
                     .prs
                     .iter()
@@ -1232,7 +1257,7 @@ fn run_task_info(task: Option<&str>, update: bool) -> anyhow::Result<()> {
     // Linked PRs whose repository no existing worktree points at would never
     // surface in an arena row, so list them explicitly.
     let origins = worktree_origins(task);
-    let unlinked: Vec<&board::PrRef> = task
+    let unlinked: Vec<&agentium::board::PrRef> = task
         .prs
         .iter()
         .filter(|reference| {
@@ -1256,8 +1281,6 @@ fn run_task_info(task: Option<&str>, update: bool) -> anyhow::Result<()> {
     if !update {
         println!("(PR/issue values are from the last fetch; pass --update to refresh)");
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1475,6 +1498,13 @@ fn handle_cli_connection(
     }
 }
 
+// `task_info --update` can run several `gh pr list` / `bee pr list` / issue
+// fetches; 10s was enough only for the `tab_*` requests this socket used to
+// carry. This timeout's job is just to not leak the connection thread if the
+// foreground never replies (which only happens if the whole app is stuck), so
+// 120s is fine even for the fast requests.
+const CLI_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn cli_connection_reply(
     stream: &mut UnixStream,
     msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
@@ -1490,7 +1520,7 @@ fn cli_connection_reply(
             reply: reply_sender,
         })
         .map_err(|_| anyhow::anyhow!("Agentium is shutting down"))?;
-    Ok(reply_receiver.recv_timeout(std::time::Duration::from_secs(10))?)
+    Ok(reply_receiver.recv_timeout(CLI_REPLY_TIMEOUT)?)
 }
 
 /// Runs one CLI request on the foreground thread and builds its JSON reply.
@@ -1498,7 +1528,7 @@ fn handle_cli_request(
     app: &mut agentium::AgentiumApp,
     request: &serde_json::Value,
     cx: &mut Context<agentium::AgentiumApp>,
-) -> serde_json::Value {
+) -> Task<serde_json::Value> {
     let ancestor_pids: Vec<u32> = request["ancestor_pids"]
         .as_array()
         .map(|arr| {
@@ -1514,7 +1544,20 @@ fn handle_cli_request(
             cwd: request["cwd"].as_str().map(PathBuf::from),
         },
     };
-    let result = match request["type"].as_str() {
+
+    // `task_info` returns its own `Task`, unlike every other request below
+    // (which resolve synchronously): `--update` awaits `gh`/`bee` fetches, so
+    // this needs its own conversion to `Task<Value>` rather than the
+    // `Task::ready` the other branches share.
+    if request["type"].as_str() == Some("task_info") {
+        let task_selector = request["task"].as_str();
+        let cwd = request["cwd"].as_str().map(PathBuf::from);
+        let update = request["update"].as_bool().unwrap_or(false);
+        let reply = app.task_info(task_selector, cwd.as_deref(), update, cx);
+        return cx.spawn(async move |_this, _cx| task_info_reply_to_value(reply.await));
+    }
+
+    let result: anyhow::Result<serde_json::Value> = match request["type"].as_str() {
         Some("tab_self") => app
             .tab_self(&ancestor_pids, cx)
             .map(|tab| serde_json::json!({ "ok": true, "tab": tab })),
@@ -1534,9 +1577,34 @@ fn handle_cli_request(
             app.handle_tab_send_message(title, &selector, submit, from.as_deref(), text, cx)
                 .map(|()| serde_json::json!({ "ok": true }))
         }
+        Some("task_list") => Ok(serde_json::json!({ "ok": true, "tasks": app.task_list() })),
         other => Err(anyhow::anyhow!("unknown request type {other:?}")),
     };
-    result.unwrap_or_else(|error| serde_json::json!({ "ok": false, "error": format!("{error:#}") }))
+    Task::ready(
+        result.unwrap_or_else(|error| serde_json::json!({ "ok": false, "error": format!("{error:#}") })),
+    )
+}
+
+/// Folds a `task_info` result into the `{ ok, ... }` reply shape the CLI
+/// expects, by serializing `TaskInfoReply` and adding `ok: true` rather than
+/// hand-listing its fields (which would drift if the struct changes).
+fn task_info_reply_to_value(result: anyhow::Result<agentium::TaskInfoReply>) -> serde_json::Value {
+    let reply = match result {
+        Ok(reply) => reply,
+        Err(error) => return serde_json::json!({ "ok": false, "error": format!("{error:#}") }),
+    };
+    match serde_json::to_value(&reply) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("ok".to_string(), serde_json::json!(true));
+            }
+            value
+        }
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "error": format!("failed to serialize task_info reply: {error}"),
+        }),
+    }
 }
 
 fn start_ipc_listener(
@@ -2508,21 +2576,28 @@ fn main() {
                                                 .log_err();
                                         }
                                         IpcMessage::CliRequest { request, reply } => {
-                                            let response = window_handle
+                                            let task = window_handle
                                                 .update(cx, |app, _window, cx| {
                                                     handle_cli_request(app, &request, cx)
                                                 })
                                                 .unwrap_or_else(|error| {
-                                                    serde_json::json!({
+                                                    Task::ready(serde_json::json!({
                                                         "ok": false,
                                                         "error": format!("{error:#}"),
-                                                    })
+                                                    }))
                                                 });
-                                            if reply.send(response).is_err() {
-                                                log::warn!(
-                                                    "cli client disconnected before the reply"
-                                                );
-                                            }
+                                            // Must be detached: dropping this future would
+                                            // drop `reply` too, and the connection thread's
+                                            // `recv_timeout` would surface that as "request
+                                            // failed" instead of the real response.
+                                            cx.spawn(async move |_cx| {
+                                                if reply.send(task.await).is_err() {
+                                                    log::warn!(
+                                                        "cli client disconnected before the reply"
+                                                    );
+                                                }
+                                            })
+                                            .detach();
                                         }
                                         IpcMessage::TaskCommand(command) => {
                                             window_handle

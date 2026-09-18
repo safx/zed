@@ -67,6 +67,20 @@ pub struct TabInfo {
     pub arena: Option<PathBuf>,
 }
 
+/// Reply payload for the `task_info` CLI request.
+#[derive(serde::Serialize)]
+pub struct TaskInfoReply {
+    /// 1-based position in `task list` output; `None` for an archived task.
+    pub index: Option<usize>,
+    pub task: board::BoardTask,
+    /// Keyed by the same canonical path strings as `pr_cache`, one entry per
+    /// worktree of `task`.
+    pub prs: HashMap<String, Vec<PrInfo>>,
+    /// Non-fatal issues from an `--update` fetch (unavailable providers,
+    /// per-worktree or per-issue fetch failures). Empty otherwise.
+    pub warnings: Vec<String>,
+}
+
 pub enum PaneContentType {
     Terminal,
     Diff,
@@ -859,33 +873,26 @@ impl AgentiumApp {
     /// Snapshot the inputs `fetch_pr_list` needs so the background fetch never
     /// touches app state.
     fn pr_fetch_context(&self, entity_id: EntityId, cx: &App) -> PrFetchContext {
-        let mut task_issue_keys: Vec<String> = Vec::new();
-        let mut task_pr_refs: Vec<board::PrRef> = Vec::new();
-        if let Some(index) = self
+        let task_ids = self
             .arenas
             .iter()
             .position(|arena| arena.entity_id() == entity_id)
-        {
-            for task_id in self.tasks_containing_arena(index, cx) {
-                let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id) else {
-                    continue;
-                };
-                if self.bee_available {
-                    for issue in &task.issues {
-                        if let board::IssueRef::Backlog { issue_key } = &issue.reference {
-                            if !task_issue_keys.contains(issue_key) {
-                                task_issue_keys.push(issue_key.clone());
-                            }
-                        }
-                    }
-                }
-                for reference in &task.prs {
-                    if !task_pr_refs.contains(reference) {
-                        task_pr_refs.push(reference.clone());
-                    }
-                }
-            }
-        }
+            .map(|index| self.tasks_containing_arena(index, cx))
+            .unwrap_or_default();
+        self.pr_fetch_context_for_tasks(&task_ids)
+    }
+
+    /// Same as `pr_fetch_context`, but for an explicit set of task ids rather
+    /// than the tasks containing one arena. Used by `task_info`, which must
+    /// aggregate over every task that shares a worktree (§3.6): fetching with
+    /// only one such task's inputs would drop another task's manually linked
+    /// PRs from the shared `pr_cache` / `pr_info` entry.
+    fn pr_fetch_context_for_tasks(&self, task_ids: &[Uuid]) -> PrFetchContext {
+        let tasks: Vec<&board::BoardTask> = task_ids
+            .iter()
+            .filter_map(|task_id| self.board.tasks.iter().find(|task| task.id == *task_id))
+            .collect();
+        let (task_issue_keys, task_pr_refs) = task_fetch_inputs(&tasks, self.bee_available);
         PrFetchContext {
             gh_available: self.gh_available,
             bee_available: self.bee_available,
@@ -926,6 +933,54 @@ impl AgentiumApp {
         result: anyhow::Result<PrFetchOutcome>,
         cx: &mut Context<Self>,
     ) {
+        if self.apply_pr_fetch_result_without_persist(entity_id, result, cx) {
+            self.persist_pr_cache(cx);
+        }
+    }
+
+    /// Applies a PR fetch result to `pr_info` (and its CI-chain / pr-session
+    /// side effects) and mirrors it into `pr_cache`, without writing
+    /// `pr_cache` to disk. Returns whether `pr_cache` changed, so callers that
+    /// batch several fetches (`task_info --update`) can call `persist_pr_cache`
+    /// once at the end instead of once per worktree. Canonicalizes the
+    /// arena's `working_directory` on the caller's thread (fine for PR
+    /// polling and `fetch_pr_for_arena`, which already run on the
+    /// foreground); `task_info --update`'s apply stage must not do that (its
+    /// `this.update` closure runs on the foreground) and calls
+    /// `_at` directly with a path already canonicalized in the background.
+    fn apply_pr_fetch_result_without_persist(
+        &mut self,
+        entity_id: EntityId,
+        result: anyhow::Result<PrFetchOutcome>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let canonical_path = self
+            .arenas
+            .iter()
+            .find(|a| a.entity_id() == entity_id)
+            .and_then(|a| a.read(cx).working_directory.clone())
+            .map(|working_dir| {
+                std::fs::canonicalize(&working_dir)
+                    .unwrap_or(working_dir)
+                    .to_string_lossy()
+                    .to_string()
+            });
+        self.apply_pr_fetch_result_without_persist_at(entity_id, canonical_path.as_deref(), result, cx)
+    }
+
+    /// Same as `apply_pr_fetch_result_without_persist`, but takes the
+    /// worktree's canonical path (the `pr_cache` / pr.json key) as an
+    /// argument instead of recomputing it via `canonicalize` on the caller's
+    /// thread. `task_info --update` resolves the canonical path in its
+    /// background fetch step and passes it here, so its `this.update` apply
+    /// stage never touches the filesystem.
+    fn apply_pr_fetch_result_without_persist_at(
+        &mut self,
+        entity_id: EntityId,
+        canonical_path: Option<&str>,
+        result: anyhow::Result<PrFetchOutcome>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.pr_last_checked.insert(entity_id, Instant::now());
         match result {
             Ok(outcome) => {
@@ -956,8 +1011,13 @@ impl AgentiumApp {
                             self.fetch_ci_for_arena(entity_id, number, cx);
                         }
                     }
+                    // `canonical_path` is `None` only when no arena/working
+                    // directory could be found for `entity_id`, in which case
+                    // `save_pr_session_mapping`'s own lookup would also fail.
                     if self.pr_dirty.contains(&entity_id) {
-                        self.save_pr_session_mapping(entity_id, cx);
+                        if let Some(path) = canonical_path {
+                            self.save_pr_session_mapping_at(entity_id, path, cx);
+                        }
                     }
                 }
             }
@@ -969,30 +1029,63 @@ impl AgentiumApp {
         // Snapshot the fetch result to disk so `agentium task info` can show
         // arena PRs without an app instance running. Keyed the same way as
         // `save_pr_session_mapping` so both agree on one arena's identity.
-        if let Some(working_dir) = self
-            .arenas
-            .iter()
-            .find(|a| a.entity_id() == entity_id)
-            .and_then(|a| a.read(cx).working_directory.clone())
-        {
-            let path = std::fs::canonicalize(&working_dir)
-                .unwrap_or(working_dir)
-                .to_string_lossy()
-                .to_string();
-            let new_entry = self.pr_info.get(&entity_id).cloned();
-            let old_entry = match &new_entry {
-                Some(prs) => self.pr_cache.insert(path.clone(), prs.clone()),
-                None => self.pr_cache.remove(&path),
-            };
-            if old_entry != new_entry {
-                let snapshot = self.pr_cache.clone();
-                self._pr_cache_write_task = Some(cx.background_spawn(async move {
-                    write_pr_cache(&snapshot).log_err();
-                }));
+        let changed = match canonical_path {
+            Some(path) => {
+                let new_entry = self.pr_info.get(&entity_id).cloned();
+                self.update_pr_cache(path.to_string(), new_entry)
             }
-        }
+            None => false,
+        };
 
         cx.notify();
+        changed
+    }
+
+    /// Inserts or removes `pr_cache`'s entry for `path`, without touching
+    /// disk. Returns whether the entry actually changed, so callers can skip
+    /// a redundant `persist_pr_cache`.
+    fn update_pr_cache(&mut self, path: String, prs: Option<Vec<PrInfo>>) -> bool {
+        let old_entry = match &prs {
+            Some(prs) => self.pr_cache.insert(path, prs.clone()),
+            None => self.pr_cache.remove(&path),
+        };
+        old_entry != prs
+    }
+
+    /// Writes `pr_cache` to disk in the background, chained after any prior
+    /// pending write rather than replacing it, so two writes can never race
+    /// on the same `pr_cache.json.tmp` (dropping the earlier `Task` would not
+    /// have stopped it — it was already polling on a background thread).
+    fn persist_pr_cache(&mut self, cx: &mut Context<Self>) {
+        let previous = self._pr_cache_write_task.take();
+        let snapshot = self.pr_cache.clone();
+        self._pr_cache_write_task = Some(cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            write_pr_cache(&snapshot).log_err();
+        }));
+    }
+
+    /// Applies a PR fetch result for a worktree with no live arena (a
+    /// `Closed` row in `task_info --update`, or a `Live` one whose arena
+    /// closed while the fetch was in flight): absorbs the Backlog id caches
+    /// and mirrors into `pr_cache` by `path`, but never touches `pr_info`
+    /// (there is no `EntityId` to key it by). Does not persist to disk; the
+    /// caller batches every worktree of one `task_info --update` and persists
+    /// once at the end.
+    fn apply_detached_pr_fetch(
+        &mut self,
+        path: String,
+        outcome: PrFetchOutcome,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.backlog_issue_ids.extend(outcome.resolved_backlog_ids);
+        self.failed_backlog_issue_keys
+            .extend(outcome.failed_backlog_keys);
+        let changed = self.update_pr_cache(path, (!outcome.prs.is_empty()).then_some(outcome.prs));
+        cx.notify();
+        changed
     }
 
     fn start_ci_polling(&mut self, cx: &mut Context<Self>) {
@@ -1821,6 +1914,224 @@ impl AgentiumApp {
         Ok(())
     }
 
+    /// All tasks, active and archived (the CLI's `--json` and non-json list
+    /// modes filter differently; that choice is left to the caller).
+    pub fn task_list(&self) -> Vec<board::BoardTask> {
+        self.board.tasks.clone()
+    }
+
+    /// The task selected by `selector` (or, if `None`, the task containing
+    /// `cwd`): its issues and worktree PR state. With `update`, re-fetches PR
+    /// and issue metadata via `gh`/`bee`, applying the result through the same
+    /// path as PR polling before replying, instead of just reading the cache.
+    pub fn task_info(
+        &mut self,
+        selector: Option<&str>,
+        cwd: Option<&Path>,
+        update: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<TaskInfoReply>> {
+        let task_id = match self.board.resolve_target(selector, cwd) {
+            Ok(task_id) => task_id,
+            Err(error) => return Task::ready(Err(error)),
+        };
+
+        if !update {
+            return Task::ready(self.build_task_info_reply(task_id));
+        }
+
+        let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id) else {
+            return Task::ready(Err(anyhow::anyhow!("resolved task id not found in board")));
+        };
+        let gh_available = self.gh_available;
+        let bee_available = self.bee_available;
+
+        let mut issue_refs: Vec<board::IssueRef> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for issue in &task.issues {
+            let (provider_available, provider) = match &issue.reference {
+                board::IssueRef::GitHub { .. } => (gh_available, "gh"),
+                board::IssueRef::Backlog { .. } => (bee_available, "bee"),
+            };
+            if provider_available {
+                issue_refs.push(issue.reference.clone());
+            } else {
+                warnings.push(format!(
+                    "{provider} unavailable; cached issue {}",
+                    issue.reference.short_label()
+                ));
+            }
+        }
+
+        if !gh_available && !bee_available {
+            return match self.build_task_info_reply(task_id) {
+                Ok(mut reply) => {
+                    warnings.push("gh/bee not available; showing cached values".to_string());
+                    reply.warnings.extend(warnings);
+                    Task::ready(Ok(reply))
+                }
+                Err(error) => Task::ready(Err(error)),
+            };
+        }
+
+        // Snapshot worktree rows from the already-computed board cache: no
+        // canonicalize/exists on the foreground (§3.6). `rows` is built in
+        // the same order as `task.worktrees` by `rebuild_board_cache`.
+        let rows: Vec<WorktreeRow> = self
+            .board_cache
+            .task_worktrees
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default();
+
+        struct WorktreeFetch {
+            path: PathBuf,
+            entity_id: Option<EntityId>,
+            context: PrFetchContext,
+        }
+
+        let mut worktree_fetches: Vec<WorktreeFetch> = Vec::new();
+        for (worktree, row) in task.worktrees.iter().zip(rows.iter()) {
+            match row {
+                WorktreeRow::Missing { .. } => continue,
+                WorktreeRow::Live { arena_index } => {
+                    let Some(arena) = self.arenas.get(*arena_index) else {
+                        continue;
+                    };
+                    let entity_id = arena.entity_id();
+                    let shared_ids = tasks_sharing_arena(&self.board_cache.task_worktrees, *arena_index);
+                    worktree_fetches.push(WorktreeFetch {
+                        path: worktree.clone(),
+                        entity_id: Some(entity_id),
+                        context: self.pr_fetch_context_for_tasks(&shared_ids),
+                    });
+                }
+                WorktreeRow::Closed { .. } => {
+                    let shared_ids: Vec<Uuid> = self
+                        .board
+                        .active_tasks()
+                        .filter(|task| task.worktrees.contains(worktree))
+                        .map(|task| task.id)
+                        .collect();
+                    worktree_fetches.push(WorktreeFetch {
+                        path: worktree.clone(),
+                        entity_id: None,
+                        context: self.pr_fetch_context_for_tasks(&shared_ids),
+                    });
+                }
+            }
+        }
+
+        cx.spawn(async move |this, cx| {
+            let (pr_results, issue_results) = cx
+                .background_executor()
+                .spawn(async move {
+                    let pr_fetch =
+                        futures::future::join_all(worktree_fetches.into_iter().map(|fetch| {
+                            async move {
+                                // Resolved here (background thread), not in the
+                                // foreground apply stage below: `task_info` must
+                                // not call `canonicalize` on the foreground.
+                                let canonical_path = std::fs::canonicalize(&fetch.path)
+                                    .unwrap_or_else(|_| fetch.path.clone())
+                                    .to_string_lossy()
+                                    .to_string();
+                                let result = fetch_pr_list(&fetch.path, fetch.context).await;
+                                (canonical_path, fetch.entity_id, result)
+                            }
+                        }));
+                    let issue_fetch =
+                        futures::future::join_all(issue_refs.into_iter().map(|reference| async {
+                            let metadata = fetch_issue_metadata_for(&reference).await;
+                            (reference, metadata)
+                        }));
+                    futures::join!(pr_fetch, issue_fetch)
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                let mut pr_cache_changed = false;
+                for (path, entity_id, result) in pr_results {
+                    match result {
+                        Err(error) => {
+                            warnings.push(format!("failed to fetch PRs for {path}: {error:#}"));
+                        }
+                        Ok(outcome) if !outcome.failures.is_empty() => {
+                            for failure in &outcome.failures {
+                                warnings.push(format!("failed to fetch PRs for {path}: {failure}"));
+                            }
+                            this.backlog_issue_ids.extend(outcome.resolved_backlog_ids);
+                            this.failed_backlog_issue_keys
+                                .extend(outcome.failed_backlog_keys);
+                        }
+                        Ok(outcome) => {
+                            // An arena that closed while its fetch was in flight
+                            // has no live entity to key `pr_info` by anymore.
+                            let live_entity_id = entity_id
+                                .filter(|id| this.arenas.iter().any(|arena| arena.entity_id() == *id));
+                            let changed = match live_entity_id {
+                                Some(entity_id) => this.apply_pr_fetch_result_without_persist_at(
+                                    entity_id,
+                                    Some(&path),
+                                    Ok(outcome),
+                                    cx,
+                                ),
+                                None => this.apply_detached_pr_fetch(path, outcome, cx),
+                            };
+                            if changed {
+                                pr_cache_changed = true;
+                            }
+                        }
+                    }
+                }
+                if pr_cache_changed {
+                    this.persist_pr_cache(cx);
+                }
+
+                warnings.extend(this.apply_issue_metadata(issue_results, cx));
+
+                this.build_task_info_reply(task_id).map(|mut reply| {
+                    reply.warnings.extend(warnings);
+                    reply
+                })
+            })
+            .unwrap_or_else(|error| Err(error))
+        })
+    }
+
+    /// Builds a `task_info` reply straight from in-memory state (`board` and
+    /// `pr_cache`): the non-`--update` path, and the last step of the
+    /// `--update` path once fetches have been applied.
+    fn build_task_info_reply(&self, task_id: Uuid) -> anyhow::Result<TaskInfoReply> {
+        let task = self
+            .board
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| anyhow::anyhow!("resolved task id not found in board"))?;
+        // 1-based, matching `task list` output and the `--task <N>` selector.
+        let index = self
+            .board
+            .active_tasks()
+            .position(|task| task.id == task_id)
+            .map(|index| index + 1);
+        let prs = task
+            .worktrees
+            .iter()
+            .map(|worktree| {
+                let key = worktree.to_string_lossy().to_string();
+                let prs = self.pr_cache.get(&key).cloned().unwrap_or_default();
+                (key, prs)
+            })
+            .collect();
+        Ok(TaskInfoReply {
+            index,
+            task: task.clone(),
+            prs,
+            warnings: Vec::new(),
+        })
+    }
+
     /// The arena whose worktree contains `path`; the deepest one wins when worktrees nest.
     fn arena_containing_path(&self, path: &Path, cx: &App) -> Option<&Entity<Arena>> {
         self.arenas
@@ -1906,11 +2217,6 @@ impl AgentiumApp {
     }
 
     fn save_pr_session_mapping(&mut self, entity_id: EntityId, cx: &mut Context<Self>) {
-        let Some(prs) = self.pr_info.get(&entity_id) else {
-            return;
-        };
-        let pr_numbers: Vec<u32> = prs.iter().map(|pr| pr.number).collect();
-
         let working_dir = self
             .arenas
             .iter()
@@ -1923,21 +2229,52 @@ impl AgentiumApp {
             .unwrap_or(working_dir)
             .to_string_lossy()
             .to_string();
+        self.save_pr_session_mapping_at(entity_id, &project_path, cx);
+    }
+
+    /// Same as `save_pr_session_mapping`, but takes the arena's canonical
+    /// working-directory path (the pr.json project key) as an argument
+    /// instead of recomputing it via `canonicalize` on the caller's thread.
+    /// See `apply_pr_fetch_result_without_persist_at`.
+    fn save_pr_session_mapping_at(
+        &mut self,
+        entity_id: EntityId,
+        project_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prs) = self.pr_info.get(&entity_id) else {
+            return;
+        };
+        let pr_numbers: Vec<u32> = prs.iter().map(|pr| pr.number).collect();
 
         let session_ids = self.session_ids_for_arena(entity_id, cx);
         if session_ids.is_empty() {
             return;
         }
 
-        let project_entry = self.pr_session_db.entry(project_path).or_default();
+        let project_entry = self.pr_session_db.entry(project_path.to_string()).or_default();
         for sid in &session_ids {
             let data = project_entry.entry(sid.clone()).or_default();
             data.pr.extend(pr_numbers.iter().copied());
         }
 
-        let db_snapshot = self.pr_session_db.clone();
+        self.persist_pr_session_db(cx);
+    }
+
+    /// Writes `pr_session_db` to disk in the background, chained after any
+    /// prior pending write rather than replacing it — same reasoning as
+    /// `persist_pr_cache` / `persist_board`: dropping a `Task` does not
+    /// cancel the background write it already scheduled, so two writes could
+    /// otherwise race on `pr.json.tmp` when `task_info --update` applies
+    /// several `pr_dirty` arenas in one tick.
+    fn persist_pr_session_db(&mut self, cx: &mut Context<Self>) {
+        let previous = self._pr_session_db_write_task.take();
+        let snapshot = self.pr_session_db.clone();
         self._pr_session_db_write_task = Some(cx.background_spawn(async move {
-            write_pr_session_db(&db_snapshot).log_err();
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            write_pr_session_db(&snapshot).log_err();
         }));
     }
 
@@ -2015,9 +2352,17 @@ impl AgentiumApp {
         cx.notify();
     }
 
+    /// Chained after any prior pending write, for the same reason as
+    /// `persist_pr_cache`: dropping a `Task` does not cancel the background
+    /// write it already scheduled, so replacing the field would let two
+    /// writes race on `board.json.tmp`.
     fn persist_board(&mut self, cx: &mut Context<Self>) {
+        let previous = self._board_write_task.take();
         let snapshot = self.board.clone();
         self._board_write_task = Some(cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
             board::write_board(&snapshot).log_err();
         }));
     }
@@ -2504,51 +2849,57 @@ impl AgentiumApp {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let mut changed = false;
-                for (reference, metadata) in results {
-                    let metadata = match metadata {
-                        Ok(metadata) => metadata,
-                        Err(error) => {
-                            log::warn!(
-                                "failed to fetch metadata for {}: {error:#}",
-                                reference.short_label()
-                            );
-                            continue;
-                        }
-                    };
-                    if let (board::IssueRef::Backlog { issue_key }, Some(id)) =
-                        (&reference, metadata.backlog_id)
-                    {
-                        this.backlog_issue_ids.insert(issue_key.clone(), id);
-                        this.failed_backlog_issue_keys.remove(issue_key);
-                    }
-                    for task in &mut this.board.tasks {
-                        for issue in &mut task.issues {
-                            if issue.reference != reference {
-                                continue;
-                            }
-                            if metadata.title.is_some() && issue.title != metadata.title {
-                                issue.title = metadata.title.clone();
-                                changed = true;
-                            }
-                            if metadata.state.is_some() && issue.state != metadata.state {
-                                issue.state = metadata.state.clone();
-                                changed = true;
-                            }
-                            if issue.url.is_none() && metadata.url.is_some() {
-                                issue.url = metadata.url.clone();
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                if changed {
-                    this.persist_board(cx);
-                    cx.notify();
+                for failure in this.apply_issue_metadata(results, cx) {
+                    log::warn!("{failure}");
                 }
             })
             .ok();
         }));
+    }
+
+    /// Registers resolved Backlog ids and merges title/state/url into every
+    /// board issue matching each fetched reference, persisting on change.
+    /// Returns one message per issue whose fetch errored (no board mutation
+    /// happens for those), so callers can surface them (a `log::warn!` here;
+    /// `task_info --update`'s `warnings`).
+    fn apply_issue_metadata(
+        &mut self,
+        results: Vec<(board::IssueRef, anyhow::Result<IssueMetadata>)>,
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
+        let mut changed = false;
+        let mut failures = Vec::new();
+        for (reference, metadata) in results {
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    failures.push(format!(
+                        "failed to fetch issue {}: {error:#}",
+                        reference.short_label()
+                    ));
+                    continue;
+                }
+            };
+            if let (board::IssueRef::Backlog { issue_key }, Some(id)) =
+                (&reference, metadata.backlog_id)
+            {
+                self.backlog_issue_ids.insert(issue_key.clone(), id);
+                self.failed_backlog_issue_keys.remove(issue_key);
+            }
+            if self.board.merge_issue_metadata(
+                &reference,
+                metadata.title.as_deref(),
+                metadata.state.as_deref(),
+                metadata.url.as_deref(),
+            ) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_board(cx);
+            cx.notify();
+        }
+        failures
     }
 
     fn handle_terminal_title_state(
@@ -3423,6 +3774,51 @@ pub fn write_pr_cache(cache: &HashMap<String, Vec<PrInfo>>) -> anyhow::Result<()
     Ok(())
 }
 
+/// The ids of every task with a `Live { arena_index }` row in
+/// `task_worktrees`. Pure over the board cache so it can be unit tested
+/// without an `AgentiumApp`.
+fn tasks_sharing_arena(
+    task_worktrees: &HashMap<Uuid, Vec<WorktreeRow>>,
+    arena_index: usize,
+) -> Vec<Uuid> {
+    task_worktrees
+        .iter()
+        .filter(|(_, rows)| {
+            rows.iter()
+                .any(|row| matches!(row, WorktreeRow::Live { arena_index: index } if *index == arena_index))
+        })
+        .map(|(task_id, _)| *task_id)
+        .collect()
+}
+
+/// Deduplicated Backlog issue keys and manually linked PR references across
+/// `tasks`. Pure so it can be unit tested without an `AgentiumApp`; the order
+/// of first occurrence is preserved, matching `contains`-guarded pushes.
+fn task_fetch_inputs(
+    tasks: &[&board::BoardTask],
+    bee_available: bool,
+) -> (Vec<String>, Vec<board::PrRef>) {
+    let mut task_issue_keys: Vec<String> = Vec::new();
+    let mut task_pr_refs: Vec<board::PrRef> = Vec::new();
+    for task in tasks {
+        if bee_available {
+            for issue in &task.issues {
+                if let board::IssueRef::Backlog { issue_key } = &issue.reference {
+                    if !task_issue_keys.contains(issue_key) {
+                        task_issue_keys.push(issue_key.clone());
+                    }
+                }
+            }
+        }
+        for reference in &task.prs {
+            if !task_pr_refs.contains(reference) {
+                task_pr_refs.push(reference.clone());
+            }
+        }
+    }
+    (task_issue_keys, task_pr_refs)
+}
+
 /// Per-fetch inputs snapshotted on the main thread so the background fetch
 /// never touches app state.
 pub struct PrFetchContext {
@@ -3444,6 +3840,11 @@ pub struct PrFetchOutcome {
     pub resolved_backlog_ids: Vec<(String, u64)>,
     // Keys Backlog reported as nonexistent, for the negative cache.
     pub failed_backlog_keys: Vec<String>,
+    // Non-empty means part of this fetch failed to reach its provider, so
+    // callers (task_info) must not treat an empty `prs` as "no PRs" and must
+    // not overwrite a cached value with it. Polling's `apply_pr_fetch_result`
+    // deliberately does not consult this (see §6 in the plan doc).
+    pub failures: Vec<String>,
 }
 
 pub struct BacklogRemote {
@@ -3678,7 +4079,11 @@ pub async fn fetch_pr_list(
         context.gh_available
     };
     if !provider_available {
-        return Ok(PrFetchOutcome::default());
+        let provider = if backlog_remote.is_some() { "bee" } else { "gh" };
+        return Ok(PrFetchOutcome {
+            failures: vec![format!("{provider} not available")],
+            ..PrFetchOutcome::default()
+        });
     }
 
     // PRs linked with `agentium task add-pr` that belong to this repository.
@@ -3695,15 +4100,16 @@ pub async fn fetch_pr_list(
     };
     let manual_fetch = futures::future::join_all(manual_refs.iter().map(|reference| async move {
         match fetch_pr_by_ref(reference).await {
-            Ok(pr) => Some(pr),
+            Ok(pr) => Ok(pr),
             // Isolated per PR: an error here must not become an `Err` for the
             // whole fetch, which would wipe the arena's discovered PRs.
             Err(error) => {
-                log::warn!(
+                let message = format!(
                     "failed to fetch linked PR {}: {error:#}",
                     reference.short_label()
                 );
-                None
+                log::warn!("{message}");
+                Err(message)
             }
         }
     }));
@@ -3716,9 +4122,14 @@ pub async fn fetch_pr_list(
     let (discovered, manual_prs) = futures::join!(discovered_fetch, manual_fetch);
 
     let mut outcome = discovered?;
-    for pr in manual_prs.into_iter().flatten() {
-        if !outcome.prs.iter().any(|existing| existing.number == pr.number) {
-            outcome.prs.push(pr);
+    for result in manual_prs {
+        match result {
+            Ok(pr) => {
+                if !outcome.prs.iter().any(|existing| existing.number == pr.number) {
+                    outcome.prs.push(pr);
+                }
+            }
+            Err(message) => outcome.failures.push(message),
         }
     }
     outcome.prs.sort_by_key(|pr| pr.number);
@@ -3729,6 +4140,7 @@ async fn fetch_github_pr_list(
     working_dir: &std::path::Path,
     branch: Option<String>,
 ) -> anyhow::Result<PrFetchOutcome> {
+    let mut failures: Vec<String> = Vec::new();
     let mut gh_prs: Vec<GhPr> = Vec::new();
     if let Some(branch) = branch {
         let output = smol::process::Command::new("gh")
@@ -3750,10 +4162,12 @@ async fn fetch_github_pr_list(
         if output.status.success() {
             gh_prs = serde_json::from_slice(&output.stdout)?;
         } else {
-            log::warn!(
+            let message = format!(
                 "gh pr list failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            log::warn!("{message}");
+            failures.push(message);
         }
     }
 
@@ -3768,9 +4182,14 @@ async fn fetch_github_pr_list(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("no pull requests found") {
-                log::warn!("gh pr view failed: {stderr}");
+                let message = format!("gh pr view failed: {stderr}");
+                log::warn!("{message}");
+                failures.push(message);
             }
-            return Ok(PrFetchOutcome::default());
+            return Ok(PrFetchOutcome {
+                failures,
+                ..PrFetchOutcome::default()
+            });
         }
         gh_prs = vec![serde_json::from_slice(&output.stdout)?];
     }
@@ -3803,6 +4222,7 @@ async fn fetch_github_pr_list(
         .collect();
     Ok(PrFetchOutcome {
         prs,
+        failures,
         ..PrFetchOutcome::default()
     })
 }
@@ -3928,7 +4348,9 @@ async fn fetch_backlog_pr_list(
                 outcome.failed_backlog_keys.push(key);
             }
             Err(BacklogIssueIdError::Other(error)) => {
-                log::warn!("failed to resolve backlog issue id for {key}: {error:#}");
+                let message = format!("failed to resolve backlog issue id for {key}: {error:#}");
+                log::warn!("{message}");
+                outcome.failures.push(message);
             }
         }
     }
@@ -3962,10 +4384,12 @@ async fn fetch_backlog_pr_list(
 
     let output = smol::process::Command::new("bee").args(&args).output().await?;
     if !output.status.success() {
-        log::warn!(
+        let message = format!(
             "bee pr list failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        log::warn!("{message}");
+        outcome.failures.push(message);
         return Ok(outcome);
     }
 
@@ -5887,11 +6311,37 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
-        ClaudeSessionState, backlog_issue_keys_in_branch, next_title_driven_state,
-        parse_backlog_remote, pr_ref_matches_remote, with_from_line,
+        ClaudeSessionState, WorktreeRow, backlog_issue_keys_in_branch, next_title_driven_state,
+        parse_backlog_remote, pr_ref_matches_remote, task_fetch_inputs, tasks_sharing_arena,
+        with_from_line,
     };
     use crate::arena::TitleState;
-    use crate::board::PrRef;
+    use crate::board::{BoardTask, IssueLink, IssueRef, PrRef};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn task_with(title: &str, issues: Vec<IssueLink>, prs: Vec<PrRef>) -> BoardTask {
+        BoardTask {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            issues,
+            worktrees: Vec::new(),
+            archived: false,
+            prs,
+        }
+    }
+
+    fn backlog_issue(issue_key: &str) -> IssueLink {
+        IssueLink {
+            reference: IssueRef::Backlog {
+                issue_key: issue_key.to_string(),
+            },
+            title: None,
+            state: None,
+            url: None,
+        }
+    }
 
     #[test]
     fn with_from_line_adds_the_sender_once() {
@@ -6004,5 +6454,72 @@ mod tests {
             backlog_issue_keys_in_branch("FIX-123/things"),
             vec!["FIX-123".to_string()]
         );
+    }
+
+    #[test]
+    fn task_fetch_inputs_omits_backlog_keys_when_bee_unavailable() {
+        let task = task_with("t", vec![backlog_issue("PROJ-1")], Vec::new());
+        let (keys, _prs) = task_fetch_inputs(&[&task], false);
+        assert!(keys.is_empty());
+        let (keys, _prs) = task_fetch_inputs(&[&task], true);
+        assert_eq!(keys, vec!["PROJ-1".to_string()]);
+    }
+
+    #[test]
+    fn task_fetch_inputs_dedupes_shared_keys_and_prs_across_tasks() {
+        let pr = PrRef::GitHub {
+            repo: "safx/zed".to_string(),
+            number: 1,
+        };
+        let task_a = task_with("a", vec![backlog_issue("PROJ-1")], vec![pr.clone()]);
+        let task_b = task_with("b", vec![backlog_issue("PROJ-1")], vec![pr.clone()]);
+        let (keys, prs) = task_fetch_inputs(&[&task_a, &task_b], true);
+        assert_eq!(keys, vec!["PROJ-1".to_string()]);
+        assert_eq!(prs, vec![pr]);
+    }
+
+    #[test]
+    fn task_fetch_inputs_includes_a_pr_only_the_second_shared_task_linked() {
+        // Regression case for §3.6: worktree shared by task A and task B,
+        // where only B manually linked a PR. Aggregating from A alone would
+        // drop B's PR from the shared pr_cache/pr_info entry.
+        let pr = PrRef::GitHub {
+            repo: "safx/zed".to_string(),
+            number: 7,
+        };
+        let task_a = task_with("a", Vec::new(), Vec::new());
+        let task_b = task_with("b", Vec::new(), vec![pr.clone()]);
+        let (_keys, prs) = task_fetch_inputs(&[&task_a, &task_b], false);
+        assert_eq!(prs, vec![pr]);
+    }
+
+    #[test]
+    fn tasks_sharing_arena_finds_only_tasks_live_on_that_arena_index() {
+        let shared_task = Uuid::new_v4();
+        let other_arena_task = Uuid::new_v4();
+        let closed_task = Uuid::new_v4();
+        let mut task_worktrees: HashMap<Uuid, Vec<WorktreeRow>> = HashMap::new();
+        // Two tasks share arena 0 (mirrors §3.6's shared-worktree regression case).
+        task_worktrees.insert(shared_task, vec![WorktreeRow::Live { arena_index: 0 }]);
+        task_worktrees.insert(
+            other_arena_task,
+            vec![WorktreeRow::Live { arena_index: 1 }],
+        );
+        task_worktrees.insert(
+            closed_task,
+            vec![WorktreeRow::Closed {
+                path: PathBuf::from("/tmp/example"),
+            }],
+        );
+        // A second, non-shared task also lives on arena 0.
+        let second_shared_task = Uuid::new_v4();
+        task_worktrees.insert(second_shared_task, vec![WorktreeRow::Live { arena_index: 0 }]);
+
+        let mut result = tasks_sharing_arena(&task_worktrees, 0);
+        result.sort();
+        let mut expected = vec![shared_task, second_shared_task];
+        expected.sort();
+        assert_eq!(result, expected);
+        assert!(tasks_sharing_arena(&task_worktrees, 2).is_empty());
     }
 }

@@ -127,12 +127,12 @@ agentium tab list [--arena <PATH>] [--json]
 
 ### `agentium task`
 
-Manage the task board. When an Agentium instance is running, commands are handed to it over IPC (changes appear in the Tasks tab immediately); otherwise `board.json` is modified directly.
+Manage the task board. `new` / `add-issue` / `add-arena` / `add-pr` / `done` mutate the board: when an Agentium instance is running, they are handed to it as datagrams over `agentium.sock` (changes appear in the Tasks tab immediately); otherwise `board.json` is modified directly. `list` / `info` are read-only: when an Agentium instance is running, they are answered over the CLI socket (`~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`) from its in-memory board and PR cache, avoiding a race with the app's own background writes to `board.json`; without a running instance, they read `board.json` (and, for `info`, `pr_cache.json`) directly.
 
 ```
 agentium task new <TITLE> [--issue <ISSUE>]... [--arena <PATH>]...
 agentium task list [--json]
-agentium task info [--task <TASK>] [--update]
+agentium task info [--task <TASK>] [--update] [--json]
 agentium task add-issue <ISSUE> [--task <TASK>]
 agentium task add-arena [<PATH>] [--task <TASK>]
 agentium task add-pr <PR> [--task <TASK>]
@@ -145,7 +145,9 @@ agentium task done <TASK>
 - When `--task` is omitted, the task containing the current directory's worktree (or a subdirectory of it) is used (errors with candidates if ambiguous)
 - `task add-arena` defaults to the current directory; paths are canonicalized; it refuses a path that is already inside a worktree linked to the task
 - `task list --json` includes archived tasks and task ids; the plain listing hides archived tasks
-- `task info` prints the task's issues and its arenas with their PR state; PRs linked via `add-pr` are marked `(linked)`, and linked PRs whose repository matches none of the task's arenas are listed under `unlinked:`. Arena PRs are read from `pr_cache.json`, written by the running app, so values for arenas that were not recently active can be stale. `--update` re-fetches everything via `gh`/`bee` for the printed output only — it never writes board.json or pr_cache.json
+- `task info` prints the task's issues and its arenas with their PR state; PRs linked via `add-pr` are marked `(linked)`, and linked PRs whose repository matches none of the task's arenas are listed under `unlinked:`. Branch/commit/origin are always read locally via `git`. Arena PR data comes from the running app's PR cache (or, with no app running, `pr_cache.json` on disk), so values for arenas that were not recently active can be stale
+- `task info --update` re-fetches PRs and issue metadata via `gh`/`bee`. This requires a running Agentium: the app performs the fetch and applies the result through the same path as PR polling, so `board.json` / `pr_cache.json` are updated and the Tasks sidebar reflects the refreshed values immediately. Without a running instance, `--update` errors instead of fetching. A fetch failure for one worktree or issue (provider unavailable, `gh`/`bee` error) is printed to stderr as a warning and leaves that worktree's/issue's cached value untouched
+- `task list --json` prints the array of tasks (the app's reply's `tasks` field, or, with no app running, `board.json`'s tasks). `task info --json` prints the whole reply object (`ok`, `index`, `task`, `prs`, `warnings`) as JSON, whether or not an app is running
 
 Issue metadata (title, state, URL) is fetched by the running app via `gh issue view` for GitHub and `bee issue view` for Backlog. Backlog integration requires the [`bee`](https://nulab.github.io/bee/) CLI, authenticated via `bee auth login`; without it, issues are shown by key only.
 
