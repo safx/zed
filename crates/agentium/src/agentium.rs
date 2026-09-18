@@ -1779,20 +1779,41 @@ impl AgentiumApp {
         });
     }
 
+    /// Adds a tab to the arena `selector` names. A caller outside every arena
+    /// (a shell in some other terminal app) falls back to the active arena,
+    /// where `tab new` always went before it learned about arenas. A tab that
+    /// lands in a hidden arena must not take focus: focusing an unrendered
+    /// item blurs the visible arena and swallows keystrokes. Only terminals
+    /// can be added that way; the other views focus themselves (some
+    /// asynchronously) and switch the git store's active repository.
     pub fn handle_tab_new(
         &mut self,
+        selector: &ArenaSelector,
         content_type: PaneContentType,
         title: Option<String>,
         command: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(arena) = self.active_arena().cloned() else {
-            return;
-        };
+    ) -> anyhow::Result<()> {
+        let arena = match selector {
+            ArenaSelector::Path(_) => self.resolve_arena(selector, cx)?,
+            ArenaSelector::Caller { .. } => self
+                .resolve_arena(selector, cx)
+                .ok()
+                .or_else(|| self.active_arena())
+                .ok_or_else(|| anyhow::anyhow!("no arena is open"))?,
+        }
+        .clone();
+        let in_active_arena = self
+            .active_arena()
+            .is_some_and(|active| active.entity_id() == arena.entity_id());
+        if !in_active_arena && !matches!(content_type, PaneContentType::Terminal) {
+            anyhow::bail!("only terminal tabs can be added to an arena other than the active one");
+        }
         arena.update(cx, |arena, cx| {
-            arena.add_tab(content_type, title, command, window, cx);
+            arena.add_tab(content_type, title, command, in_active_arena, window, cx);
         });
+        Ok(())
     }
 
     fn resolve_arena(

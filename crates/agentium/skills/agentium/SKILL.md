@@ -25,7 +25,7 @@ agentium tab list
 
 Columns are title, kind (`terminal` or `other`), and state. Pick the terminal tab named after the target agent, such as `Codex`. If none or several fit, ask the user. `state` (`permission`, `running`, `ready`, `idle`) comes from Claude Code hooks for Claude tabs and from the terminal title (spinner, "Action Required") for Codex tabs; for other tabs it is always `idle` and carries no information.
 
-Do not create tabs (`agentium tab new --title Codex -- codex`) unless the user asks for a new agent.
+Do not create tabs (`agentium tab new --title Codex -- codex`) unless the user asks for a new agent. A tab created this way opens in your arena.
 
 ## Send
 
