@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
@@ -113,13 +113,17 @@ enum PaneAction {
 
 #[derive(clap::Subcommand)]
 enum TabAction {
-    /// Add a new tab to the active pane
+    /// Add a new tab to the active pane of the arena this command runs in
     New {
         #[arg(long, default_value = "terminal")]
         r#type: PaneContentType,
         /// Override the tab title (only applied for --type terminal with a command)
         #[arg(long)]
         title: Option<String>,
+        /// Arena worktree to add the tab to; defaults to the arena this command runs in
+        /// (by process ancestry, then by current directory), else to the active arena
+        #[arg(long)]
+        arena: Option<PathBuf>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -552,30 +556,6 @@ fn claude_project_dir_name(path: &str) -> String {
         .collect()
 }
 
-// macOS caps AF_UNIX datagrams at net.local.dgram.maxdgram (2048); larger sends fail with EMSGSIZE.
-const MAX_DATAGRAM_BYTES: usize = 2048;
-
-fn send_datagrams(socket_path: &Path, payloads: &[String]) -> std::io::Result<()> {
-    let socket = UnixDatagram::unbound()?;
-    socket.connect(socket_path)?;
-    for payload in payloads {
-        let mut attempts = 0;
-        loop {
-            match socket.send(payload.as_bytes()) {
-                Ok(_) => break,
-                // The receive queue holds only ~2 datagrams (net.local.dgram.recvspace) and macOS
-                // returns ENOBUFS instead of blocking, so wait for the listener to drain it.
-                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) && attempts < 400 => {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    Ok(())
-}
-
 fn agentium_socket_path() -> PathBuf {
     util::paths::home_dir()
         .join(".local")
@@ -650,11 +630,11 @@ fn cli_request(request: serde_json::Value) -> anyhow::Result<serde_json::Value> 
 }
 
 fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
-    use anyhow::Context as _;
     match action {
         TabAction::New {
             r#type,
             title,
+            arena,
             command,
         } => {
             let content_type_str = match r#type {
@@ -665,23 +645,17 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
                 PaneContentType::ProjectSearch => "project-search",
                 PaneContentType::GitGraph => "git-graph",
             };
-            let payload = serde_json::json!({
+            let arena = arena
+                .map(|path| canonicalize_existing_path(&path))
+                .transpose()?;
+            cli_request(serde_json::json!({
                 "type": "tab_new",
                 "content_type": content_type_str,
                 "title": title,
+                "arena": arena,
                 "command": command,
-            })
-            .to_string();
-            if payload.len() > MAX_DATAGRAM_BYTES {
-                anyhow::bail!(
-                    "command too long ({} bytes with envelope, limit {})",
-                    payload.len(),
-                    MAX_DATAGRAM_BYTES
-                );
-            }
-            let socket_path = agentium_socket_path();
-            send_datagrams(&socket_path, &[payload])
-                .with_context(|| format!("cannot reach Agentium at {}", socket_path.display()))
+            }))?;
+            Ok(())
         }
         TabAction::SendMessage {
             title,
@@ -748,11 +722,6 @@ enum IpcMessage {
         direction: SplitDirection,
         content_type: agentium::PaneContentType,
         keep_focus: bool,
-        command: Vec<String>,
-    },
-    TabNew {
-        content_type: agentium::PaneContentType,
-        title: Option<String>,
         command: Vec<String>,
     },
     /// A request from the CLI stream socket; the reply is written back on that connection.
@@ -1523,10 +1492,23 @@ fn cli_connection_reply(
     Ok(reply_receiver.recv_timeout(CLI_REPLY_TIMEOUT)?)
 }
 
+fn parse_content_type(value: Option<&str>) -> Option<agentium::PaneContentType> {
+    Some(match value? {
+        "terminal" => agentium::PaneContentType::Terminal,
+        "diff" => agentium::PaneContentType::Diff,
+        "branch-diff" => agentium::PaneContentType::BranchDiff,
+        "git-status" => agentium::PaneContentType::GitStatus,
+        "project-search" => agentium::PaneContentType::ProjectSearch,
+        "git-graph" => agentium::PaneContentType::GitGraph,
+        _ => return None,
+    })
+}
+
 /// Runs one CLI request on the foreground thread and builds its JSON reply.
 fn handle_cli_request(
     app: &mut agentium::AgentiumApp,
     request: &serde_json::Value,
+    window: &mut Window,
     cx: &mut Context<agentium::AgentiumApp>,
 ) -> Task<serde_json::Value> {
     let ancestor_pids: Vec<u32> = request["ancestor_pids"]
@@ -1577,6 +1559,21 @@ fn handle_cli_request(
             app.handle_tab_send_message(title, &selector, submit, from.as_deref(), text, cx)
                 .map(|()| serde_json::json!({ "ok": true }))
         }
+        Some("tab_new") => parse_content_type(request["content_type"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("unknown content type {}", request["content_type"]))
+            .and_then(|content_type| {
+                let command: Vec<String> = request["command"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let title = request["title"].as_str().map(String::from);
+                app.handle_tab_new(&selector, content_type, title, command, window, cx)
+            })
+            .map(|()| serde_json::json!({ "ok": true })),
         Some("task_list") => Ok(serde_json::json!({ "ok": true, "tasks": app.task_list() })),
         other => Err(anyhow::anyhow!("unknown request type {other:?}")),
     };
@@ -1689,14 +1686,10 @@ fn start_ipc_listener(
                                     Some("up") => SplitDirection::Up,
                                     _ => continue,
                                 };
-                                let content_type = match json["content_type"].as_str() {
-                                    Some("terminal") => agentium::PaneContentType::Terminal,
-                                    Some("diff") => agentium::PaneContentType::Diff,
-                                    Some("branch-diff") => agentium::PaneContentType::BranchDiff,
-                                    Some("git-status") => agentium::PaneContentType::GitStatus,
-                                    Some("project-search") => agentium::PaneContentType::ProjectSearch,
-                                    Some("git-graph") => agentium::PaneContentType::GitGraph,
-                                    _ => continue,
+                                let Some(content_type) =
+                                    parse_content_type(json["content_type"].as_str())
+                                else {
+                                    continue;
                                 };
                                 let keep_focus = json["keep_focus"].as_bool().unwrap_or(false);
                                 let command: Vec<String> = json["command"]
@@ -1725,31 +1718,6 @@ fn start_ipc_listener(
                                     seven_day_resets_at: seven_day["resets_at"]
                                         .as_i64()
                                         .unwrap_or(0),
-                                }
-                            }
-                            Some("tab_new") => {
-                                let content_type = match json["content_type"].as_str() {
-                                    Some("terminal") => agentium::PaneContentType::Terminal,
-                                    Some("diff") => agentium::PaneContentType::Diff,
-                                    Some("branch-diff") => agentium::PaneContentType::BranchDiff,
-                                    Some("git-status") => agentium::PaneContentType::GitStatus,
-                                    Some("project-search") => agentium::PaneContentType::ProjectSearch,
-                                    Some("git-graph") => agentium::PaneContentType::GitGraph,
-                                    _ => continue,
-                                };
-                                let command: Vec<String> = json["command"]
-                                    .as_array()
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let title = json["title"].as_str().map(String::from);
-                                IpcMessage::TabNew {
-                                    content_type,
-                                    title,
-                                    command,
                                 }
                             }
                             Some("change_theme") => {
@@ -2558,27 +2526,10 @@ fn main() {
                                                 })
                                                 .log_err();
                                         }
-                                        IpcMessage::TabNew {
-                                            content_type,
-                                            title,
-                                            command,
-                                        } => {
-                                            window_handle
-                                                .update(cx, |app, window, cx| {
-                                                    app.handle_tab_new(
-                                                        content_type,
-                                                        title,
-                                                        command,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })
-                                                .log_err();
-                                        }
                                         IpcMessage::CliRequest { request, reply } => {
                                             let task = window_handle
-                                                .update(cx, |app, _window, cx| {
-                                                    handle_cli_request(app, &request, cx)
+                                                .update(cx, |app, window, cx| {
+                                                    handle_cli_request(app, &request, window, cx)
                                                 })
                                                 .unwrap_or_else(|error| {
                                                     Task::ready(serde_json::json!({
