@@ -95,14 +95,15 @@ agentium pane split [--horizontal|--vertical] [--before] [--type <TYPE>] [--keep
 
 ### `agentium tab new`
 
-Add a new tab to the active pane.
+Add a new tab to the active pane of an arena.
 
 ```
-agentium tab new [--type <TYPE>] [-- <COMMAND>...]
+agentium tab new [--type <TYPE>] [--title <TITLE>] [--arena <PATH>] [-- <COMMAND>...]
 ```
 
 - `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
 - `--title` — tab title override (terminal with a command only)
+- `--arena` — arena worktree to add the tab to; defaults to the arena the command runs in (process ancestry, then current directory). A caller outside every arena, such as a shell in another terminal app, gets the active arena. Only `terminal` tabs can be added to an arena other than the active one; they are added without taking focus
 
 ### `agentium tab send-message`
 
@@ -123,7 +124,7 @@ agentium tab self [--json]
 agentium tab list [--arena <PATH>] [--json]
 ```
 
-`self` prints the title of the terminal tab the command runs in. `list` prints title, kind, and Claude hook state (`permission`, `running`, `ready`, `idle`) for each tab of the arena. Both use the CLI socket `~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`.
+`self` prints the title of the terminal tab the command runs in. `list` prints title, kind, and Claude hook state (`permission`, `running`, `ready`, `idle`) for each tab of the arena. All `agentium tab` subcommands use the CLI socket `~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`.
 
 ### `agentium task`
 

@@ -116,6 +116,7 @@ impl Arena {
                     project_weak,
                     pids_for_terminal,
                     &active_pane,
+                    true,
                     window,
                     cx,
                 );
@@ -187,6 +188,7 @@ impl Arena {
                     project_weak,
                     pids,
                     &active_pane,
+                    true,
                     window,
                     cx,
                 );
@@ -219,6 +221,7 @@ impl Arena {
                     project_weak,
                     pids,
                     &active_pane,
+                    true,
                     window,
                     cx,
                 );
@@ -398,11 +401,13 @@ impl Arena {
         });
     }
 
+    /// `focus` is honored by terminal tabs only; every other view focuses itself.
     pub(crate) fn add_tab(
         &mut self,
         content_type: PaneContentType,
         title: Option<String>,
         command: Vec<String>,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -441,6 +446,7 @@ impl Arena {
                             project_weak,
                             pids,
                             &active_pane,
+                            focus,
                             window,
                             cx,
                         );
@@ -718,6 +724,7 @@ impl Arena {
                     project.downgrade(),
                     session_state.ready_shell_pids,
                     &pane,
+                    true,
                     window,
                     cx,
                 );
@@ -1366,6 +1373,7 @@ impl Render for Arena {
                                         project_weak,
                                         ready_shell_pids,
                                         &pane,
+                                        true,
                                         window,
                                         cx,
                                     );
@@ -1430,6 +1438,7 @@ fn add_terminal_view_to_pane(
     project: WeakEntity<Project>,
     ready_shell_pids: Rc<RefCell<HashSet<u32>>>,
     pane: &Entity<Pane>,
+    focus: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -1439,7 +1448,7 @@ fn add_terminal_view_to_pane(
         view
     }));
     pane.update(cx, |pane, cx| {
-        pane.add_item(terminal_view, true, true, None, window, cx);
+        pane.add_item(terminal_view, true, focus, None, window, cx);
     });
 }
 
