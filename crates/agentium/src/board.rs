@@ -260,6 +260,71 @@ impl Board {
         Vec::new()
     }
 
+    /// Resolve a task from an explicit `selector` (see `resolve_task`), or
+    /// failing that, from `cwd` via `tasks_containing_path` (already
+    /// canonicalized by the caller). `selector` takes priority: `cwd` is not
+    /// consulted at all when it is present.
+    pub fn resolve_target(&self, selector: Option<&str>, cwd: Option<&Path>) -> anyhow::Result<Uuid> {
+        if let Some(selector) = selector {
+            return self.resolve_task(selector);
+        }
+        let cwd = cwd.context("no task selector given and no current directory to resolve from")?;
+        let active: Vec<&BoardTask> = self.active_tasks().collect();
+        let containing = self.tasks_containing_path(cwd);
+        match containing.len() {
+            1 => Ok(containing[0].id),
+            0 => anyhow::bail!(
+                "current directory is not linked to any task; pass --task <TASK>. Tasks:\n{}",
+                format_candidates(&active)
+            ),
+            _ => anyhow::bail!(
+                "current directory belongs to multiple tasks; pass --task <TASK>. Tasks:\n{}",
+                format_candidates(&active)
+            ),
+        }
+    }
+
+    /// Merge freshly-fetched title/state/url into every issue link matching
+    /// `reference`, across all tasks (including archived ones, matching the
+    /// existing in-place merge this replaces). `title` / `state` overwrite on
+    /// any change; `url` only fills in when the existing value is `None`.
+    /// Returns whether anything changed.
+    pub fn merge_issue_metadata(
+        &mut self,
+        reference: &IssueRef,
+        title: Option<&str>,
+        state: Option<&str>,
+        url: Option<&str>,
+    ) -> bool {
+        let mut changed = false;
+        for task in &mut self.tasks {
+            for issue in &mut task.issues {
+                if issue.reference != *reference {
+                    continue;
+                }
+                if let Some(title) = title {
+                    if issue.title.as_deref() != Some(title) {
+                        issue.title = Some(title.to_string());
+                        changed = true;
+                    }
+                }
+                if let Some(state) = state {
+                    if issue.state.as_deref() != Some(state) {
+                        issue.state = Some(state.to_string());
+                        changed = true;
+                    }
+                }
+                if issue.url.is_none() {
+                    if let Some(url) = url {
+                        issue.url = Some(url.to_string());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     pub fn task_mut(&mut self, task_id: Uuid) -> anyhow::Result<&mut BoardTask> {
         self.tasks
             .iter_mut()
@@ -753,6 +818,112 @@ mod tests {
             board
                 .tasks_containing_path(Path::new("/unrelated/path"))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_target_prefers_selector_over_cwd() {
+        let board = sample_board();
+        let id = board.tasks[0].id;
+        // A selector that could not possibly match the cwd's task still wins,
+        // proving cwd is not consulted at all when a selector is given.
+        assert_eq!(
+            board
+                .resolve_target(Some("1"), Some(Path::new("/unrelated/path")))
+                .unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_cwd_subdirectory() {
+        let board = sample_board();
+        let id = board.tasks[0].id;
+        let subdirectory = board.tasks[0].worktrees[0].join("src");
+        assert_eq!(board.resolve_target(None, Some(&subdirectory)).unwrap(), id);
+    }
+
+    #[test]
+    fn resolve_target_errors_on_no_match_multiple_matches_or_no_input() {
+        let mut board = sample_board();
+        let worktree = board.tasks[0].worktrees[0].clone();
+        // No match: an unrelated cwd.
+        let error = board
+            .resolve_target(None, Some(Path::new("/unrelated/path")))
+            .unwrap_err();
+        assert!(error.to_string().contains(&board.tasks[0].title));
+
+        // Multiple matches: a second task sharing the same worktree.
+        board.tasks.push(BoardTask {
+            id: Uuid::new_v4(),
+            title: "second".to_string(),
+            issues: Vec::new(),
+            worktrees: vec![worktree.clone()],
+            archived: false,
+            prs: Vec::new(),
+        });
+        let error = board.resolve_target(None, Some(&worktree)).unwrap_err();
+        assert!(error.to_string().contains("multiple tasks"));
+
+        // Neither selector nor cwd.
+        assert!(board.resolve_target(None, None).is_err());
+    }
+
+    #[test]
+    fn merge_issue_metadata_updates_title_and_conditionally_url() {
+        let mut board = sample_board();
+        let reference = IssueRef::GitHub {
+            repo: "safx/zed".to_string(),
+            number: 12,
+        };
+        // Same title/state: no change.
+        assert!(!board.merge_issue_metadata(&reference, Some("A bug"), Some("open"), None));
+        // Different title: changes and updates.
+        assert!(board.merge_issue_metadata(&reference, Some("A different bug"), None, None));
+        assert_eq!(
+            board.tasks[0].issues[0].title.as_deref(),
+            Some("A different bug")
+        );
+        // Existing url is Some, so a new url must not overwrite it.
+        let before_url = board.tasks[0].issues[0].url.clone();
+        assert!(!board.merge_issue_metadata(&reference, None, None, Some("https://example.com")));
+        assert_eq!(board.tasks[0].issues[0].url, before_url);
+
+        // url fills in only when previously None.
+        let backlog_reference = IssueRef::Backlog {
+            issue_key: "PROJ-198".to_string(),
+        };
+        assert!(board.tasks[0].issues[1].url.is_none());
+        assert!(board.merge_issue_metadata(&backlog_reference, None, None, Some("https://x")));
+        assert_eq!(
+            board.tasks[0].issues[1].url.as_deref(),
+            Some("https://x")
+        );
+    }
+
+    #[test]
+    fn merge_issue_metadata_applies_to_every_matching_task() {
+        let mut board = sample_board();
+        let reference = IssueRef::GitHub {
+            repo: "safx/zed".to_string(),
+            number: 12,
+        };
+        board.tasks.push(BoardTask {
+            id: Uuid::new_v4(),
+            title: "second".to_string(),
+            issues: vec![IssueLink::from_reference(reference.clone())],
+            worktrees: Vec::new(),
+            archived: false,
+            prs: Vec::new(),
+        });
+        assert!(board.merge_issue_metadata(&reference, Some("shared title"), None, None));
+        assert_eq!(
+            board.tasks[0].issues[0].title.as_deref(),
+            Some("shared title")
+        );
+        assert_eq!(
+            board.tasks[1].issues[0].title.as_deref(),
+            Some("shared title")
         );
     }
 }
