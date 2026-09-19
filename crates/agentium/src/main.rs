@@ -2134,7 +2134,7 @@ fn main() {
             client::init(&client, cx);
             project::Project::init(&client, cx);
 
-            let fs = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+            let fs: Arc<dyn fs::Fs> = fs::RealFs::new(None, cx.background_executor().clone());
             <dyn fs::Fs>::set_global(fs.clone(), cx);
 
             let mut languages = language::LanguageRegistry::new(
