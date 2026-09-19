@@ -292,8 +292,10 @@ impl Arena {
     fn new_project_search(&self, cx: &mut Context<Self>) -> Entity<ProjectSearch> {
         let worktree_id = self.worktree_id(cx);
         cx.new(|cx| match worktree_id {
-            Some(id) => ProjectSearch::new_scoped(self.project.clone(), id, cx),
-            None => ProjectSearch::new(self.project.clone(), cx),
+            Some(id) => {
+                ProjectSearch::new_scoped(self.project.clone(), self.workspace.clone(), id, cx)
+            }
+            None => ProjectSearch::new(self.project.clone(), self.workspace.clone(), cx),
         })
     }
 
@@ -1009,7 +1011,7 @@ impl Arena {
             cx,
         );
 
-        if let Some(existing_idx) = existing_preview_idx {
+        if let Some((_, existing_idx)) = existing_preview_idx {
             target_pane.update(cx, |pane, cx| {
                 pane.activate_item(existing_idx, true, true, window, cx);
             });
@@ -1075,7 +1077,7 @@ impl Arena {
         let target_pane = self.pane_to_the_right(window, cx);
         workspace_entity.update(cx, |workspace, cx| {
             workspace.open_project_item::<editor::Editor>(
-                target_pane,
+                Some(target_pane),
                 buffer,
                 true,
                 true,
