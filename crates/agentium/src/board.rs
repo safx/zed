@@ -673,6 +673,9 @@ mod tests {
     #[test]
     fn resolve_task_by_index_uuid_prefix_and_title() {
         let mut board = sample_board();
+        // A random v4 id can start with eight digits, which resolve_task would
+        // read as a task index instead of a uuid prefix.
+        board.tasks[0].id = Uuid::from_u128(0xabcdef01_2345_4678_8abc_def012345678);
         board.tasks.push(BoardTask {
             id: Uuid::new_v4(),
             title: "archived one".to_string(),
