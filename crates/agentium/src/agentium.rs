@@ -3402,6 +3402,9 @@ fn format_resets_at_day(resets_at: i64) -> String {
     if resets_at <= now {
         return "Weekly reset".to_string();
     }
+    if resets_at - now < 24 * 3600 {
+        return format_resets_in(resets_at);
+    }
     let Some(dt) = Local.timestamp_opt(resets_at, 0).single() else {
         return "Unknown".to_string();
     };
@@ -3418,6 +3421,14 @@ fn render_rate_limit_row(
     let colors = cx.theme().colors();
     let now = chrono::Local::now().timestamp();
     let expired = resets_at > 0 && resets_at <= now;
+    let status = cx.theme().status();
+    let fg_color = if used_pct >= 90.0 {
+        status.error
+    } else if used_pct >= 70.0 {
+        status.warning
+    } else {
+        status.info
+    };
     v_flex()
         .id(SharedString::from(format!("rate-limit-row-{label}")))
         .px_1()
@@ -3447,7 +3458,8 @@ fn render_rate_limit_row(
                     100.0,
                     cx,
                 )
-                .bg_color(colors.border),
+                .bg_color(colors.border)
+                .fg_color(fg_color),
             )
             .tooltip(Tooltip::text(format!("{:.0}%", used_pct)))
         })
