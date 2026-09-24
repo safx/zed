@@ -471,10 +471,37 @@ impl GitRepository for FakeGitRepository {
     fn checkout_files(
         &self,
         _commit: String,
-        _paths: Vec<RepoPath>,
+        paths: Vec<RepoPath>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
-        unimplemented!()
+        Box::pin(async move {
+            let contents = self
+                .with_state_async(false, move |state| {
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            let Some(content) = state.head_contents.get(&path).cloned() else {
+                                bail!("path {path:?} is not present in HEAD");
+                            };
+                            Ok((path, content))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .await?;
+
+            for (path, content) in &contents {
+                let abs_path = self.dot_git_path.parent().unwrap().join(path.as_std_path());
+                self.fs.write(&abs_path, content).await?;
+            }
+
+            self.with_state_async(true, move |state| {
+                for (path, content) in contents {
+                    state.index_contents.insert(path, content);
+                }
+                Ok(())
+            })
+            .await
+        })
     }
 
     fn path(&self) -> PathBuf {
