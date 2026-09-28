@@ -10699,8 +10699,13 @@ impl Editor {
                                     .enable_keep_preview_on_code_navigation;
                                 let allow_new_preview = PreviewTabsSettings::get_global(cx)
                                     .enable_preview_from_multibuffer;
+                                // Agentium never updates `active_pane` (it points at an unrendered
+                                // pane), so pass the pane explicitly whenever it differs; passing
+                                // `None` otherwise keeps `reveal_if_open` working in Zed.
+                                let requested_pane = (split || &pane != workspace.active_pane())
+                                    .then(|| pane.clone());
                                 workspace.open_project_item::<Self>(
-                                    split.then_some(pane.clone()),
+                                    requested_pane,
                                     buffer,
                                     true,
                                     true,
