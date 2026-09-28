@@ -1959,7 +1959,9 @@ impl Editor {
                                         .enable_preview_file_from_code_navigation;
 
                                     let editor = workspace.open_project_item(
-                                        split.then_some(requested_pane.clone()),
+                                        // See `open_buffers_in_workspace`: Agentium's `active_pane` is unrendered.
+                                        (split || &requested_pane != workspace.active_pane())
+                                            .then(|| requested_pane.clone()),
                                         target_buffer.clone(),
                                         true,
                                         true,
