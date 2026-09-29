@@ -2056,6 +2056,11 @@ fn main() {
         }
     }
 
+    // Finder launches inherit launchd's soft limit of 256, which terminals,
+    // worktree watchers, and IPC sockets exhaust.
+    #[cfg(unix)]
+    util::increase_open_file_limit().log_err();
+
     let socket_path = agentium_socket_path();
 
     let app = Application::with_platform(gpui_platform::current_platform(false))
