@@ -3150,8 +3150,13 @@ impl AgentiumApp {
                     continue;
                 };
                 let shell_pid = getter.fallback_pid().as_u32();
+                // A title-driven entry settles at Idle instead of being removed,
+                // including for non-agent programs whose title once spun.
                 if claude_pids.contains_key(&shell_pid)
-                    || self.title_driven_states.contains_key(&shell_pid)
+                    || self
+                        .title_driven_states
+                        .get(&shell_pid)
+                        .is_some_and(|state| *state != ClaudeSessionState::Idle)
                 {
                     continue;
                 }
