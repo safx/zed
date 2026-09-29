@@ -40,6 +40,8 @@ pub struct BoardTask {
     pub worktrees: Vec<PathBuf>,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
     // Manually linked PRs. Each belongs to the arena(s) of this task whose
     // origin is the same repository; see `pr_ref_matches_remote`.
     #[serde(default)]
@@ -350,6 +352,7 @@ impl Board {
                     issues,
                     worktrees,
                     archived: false,
+                    collapsed: false,
                     prs: Vec::new(),
                 });
             }
@@ -600,6 +603,7 @@ mod tests {
                 ],
                 worktrees: vec![PathBuf::from("/tmp/example")],
                 archived: false,
+                collapsed: false,
                 prs: Vec::new(),
             }],
         }
@@ -612,6 +616,18 @@ mod tests {
         let parsed: Board = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tasks[0].issues, board.tasks[0].issues);
         assert_eq!(parsed.tasks[0].id, board.tasks[0].id);
+    }
+
+    #[test]
+    fn collapsed_round_trips_and_is_omitted_when_false() {
+        let mut board = sample_board();
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(!json.contains("collapsed"));
+        assert!(!serde_json::from_str::<Board>(&json).unwrap().tasks[0].collapsed);
+
+        board.tasks[0].collapsed = true;
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(serde_json::from_str::<Board>(&json).unwrap().tasks[0].collapsed);
     }
 
     #[test]
@@ -682,6 +698,7 @@ mod tests {
             issues: Vec::new(),
             worktrees: Vec::new(),
             archived: true,
+            collapsed: false,
             prs: Vec::new(),
         });
         let id = board.tasks[0].id;
@@ -863,6 +880,7 @@ mod tests {
             issues: Vec::new(),
             worktrees: vec![worktree.clone()],
             archived: false,
+            collapsed: false,
             prs: Vec::new(),
         });
         let error = board.resolve_target(None, Some(&worktree)).unwrap_err();
@@ -917,6 +935,7 @@ mod tests {
             issues: vec![IssueLink::from_reference(reference.clone())],
             worktrees: Vec::new(),
             archived: false,
+            collapsed: false,
             prs: Vec::new(),
         });
         assert!(board.merge_issue_metadata(&reference, Some("shared title"), None, None));

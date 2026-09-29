@@ -1266,6 +1266,7 @@ mod task_action_tests {
             issues: Vec::new(),
             worktrees,
             archived: false,
+            collapsed: false,
             prs: Vec::new(),
         }
     }
