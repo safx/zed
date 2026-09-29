@@ -11,7 +11,7 @@ use git::Oid;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiffStatus};
 use gpui::{prelude::*, *};
-use language::{Buffer, BufferSnapshot, Capability, LanguageRegistry, Point};
+use language::{Buffer, BufferId, BufferSnapshot, Capability, LanguageRegistry, Point};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, WrapButtonVisibility,
 };
@@ -20,7 +20,7 @@ use project::{Project, ProjectEntryId, ProjectItem as _, ProjectPath};
 use settings::{DiffViewStyle, Settings};
 use std::any::TypeId;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -455,6 +455,9 @@ pub struct ReviewView {
     item: Entity<ReviewItem>,
     active_group: usize,
     show_reading: bool,
+    // Buffer-level folds survive `rebuild_splittable`, which otherwise starts
+    // every group with a fresh DisplayMap.
+    folded_buffers: HashSet<BufferId>,
     splittable: Entity<SplittableEditor>,
     project: Entity<Project>,
     language_registry: Arc<LanguageRegistry>,
@@ -568,6 +571,21 @@ impl ReviewView {
     }
 
     fn rebuild_splittable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        {
+            let rhs_editor = self.splittable.read(cx).rhs_editor().read(cx);
+            let shown_buffer_ids: Vec<BufferId> = rhs_editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .all_buffer_ids()
+                .collect();
+            carry_folded_buffers(
+                &mut self.folded_buffers,
+                shown_buffer_ids,
+                rhs_editor.folded_buffers(cx).iter().copied(),
+            );
+        }
+
         let weak_review = cx.entity().downgrade();
         let (splittable, sub) = build_splittable_for_group(
             &self.item,
@@ -579,6 +597,11 @@ impl ReviewView {
             window,
             cx,
         );
+        // Folding the RHS before the deferred side-by-side split is enough:
+        // `split()` mirrors RHS buffer folds onto the LHS.
+        splittable.read(cx).rhs_editor().clone().update(cx, |editor, cx| {
+            editor.fold_buffers(self.folded_buffers.iter().copied(), cx);
+        });
         self.splittable = splittable;
         self._split_subscription = sub;
 
@@ -868,6 +891,7 @@ impl ProjectItem for ReviewView {
             item,
             active_group: 0,
             show_reading: false,
+            folded_buffers: HashSet::new(),
             splittable,
             project,
             language_registry,
@@ -877,6 +901,19 @@ impl ProjectItem for ReviewView {
             _split_subscription: split_subscription,
         }
     }
+}
+
+/// Replaces the fold state of the buffers shown in the outgoing editor with
+/// what that editor reports, keeping folds of buffers it did not show.
+fn carry_folded_buffers(
+    folded: &mut HashSet<BufferId>,
+    shown: impl IntoIterator<Item = BufferId>,
+    shown_folded: impl IntoIterator<Item = BufferId>,
+) {
+    for id in shown {
+        folded.remove(&id);
+    }
+    folded.extend(shown_folded);
 }
 
 // Per-file aggregation of a group's hunks. Vec preserves first-occurrence
@@ -1275,10 +1312,12 @@ fn render_review_comment(
 mod tests {
     // No `use super::*`: it would pull in `gpui::test` and shadow `#[test]`.
     use super::{
-        Finding, OverrideHunk, PathRanges, ReviewDocument, ReviewHunk, ShowBlock, finding_body,
-        raw_ranges, reading_ranges,
+        Finding, OverrideHunk, PathRanges, ReviewDocument, ReviewHunk, ShowBlock,
+        carry_folded_buffers, finding_body, raw_ranges, reading_ranges,
     };
     use anyhow::Context as _;
+    use language::BufferId;
+    use std::collections::HashSet;
 
     fn hunk(path: &str, new_start: u32, new_lines: u32) -> ReviewHunk {
         ReviewHunk {
@@ -1422,5 +1461,16 @@ mod tests {
     fn raw_ranges_keep_hunk_rows() {
         let ranges = raw_ranges(&[hunk("a.ts", 119, 12), hunk("a.ts", 10, 0)]);
         assert_eq!(rows(&ranges, "a.ts"), vec![(118, 130), (9, 9)]);
+    }
+
+    #[test]
+    fn carry_folded_buffers_keeps_folds_of_hidden_buffers() -> anyhow::Result<()> {
+        let [a, b, c] = [BufferId::new(1)?, BufferId::new(2)?, BufferId::new(3)?];
+        // `c` was folded in an earlier group and is not shown now.
+        let mut folded = HashSet::from([a, c]);
+        // The outgoing group showed `a` and `b`; the user unfolded `a`, folded `b`.
+        carry_folded_buffers(&mut folded, [a, b], [b]);
+        assert_eq!(folded, HashSet::from([b, c]));
+        Ok(())
     }
 }
