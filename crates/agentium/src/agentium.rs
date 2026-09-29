@@ -362,7 +362,6 @@ pub struct AgentiumApp {
     failed_backlog_issue_keys: HashSet<String>,
     _issue_fetch_task: Option<Task<()>>,
     sidebar_tab: SidebarTab,
-    collapsed_tasks: HashSet<Uuid>,
     renaming_task: Option<Uuid>,
     task_rename_editor: Entity<Editor>,
     adding_issue_to_task: Option<Uuid>,
@@ -681,7 +680,6 @@ impl AgentiumApp {
             failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
             sidebar_tab: SidebarTab::Repositories,
-            collapsed_tasks: HashSet::new(),
             renaming_task: None,
             task_rename_editor,
             adding_issue_to_task: None,
@@ -2473,7 +2471,12 @@ impl AgentiumApp {
         self.issue_input_error = None;
         // The input row renders under the task header, so the task must be
         // expanded for the editor to be visible and focusable.
-        self.collapsed_tasks.remove(&task_id);
+        if let Ok(task) = self.board.task_mut(task_id)
+            && task.collapsed
+        {
+            task.collapsed = false;
+            self.persist_board(cx);
+        }
         self.issue_input_editor.update(cx, |editor, cx| {
             editor.set_text("", window, cx);
         });
@@ -5391,7 +5394,7 @@ impl AgentiumApp {
                     .get(&task.id)
                     .cloned()
                     .unwrap_or_default(),
-                collapsed: self.collapsed_tasks.contains(&task.id),
+                collapsed: task.collapsed,
             })
             .collect();
         let unassigned = self.board_cache.unassigned_arenas.clone();
@@ -5452,8 +5455,9 @@ impl AgentiumApp {
                     if this.renaming_task == Some(task_id) {
                         return;
                     }
-                    if !this.collapsed_tasks.remove(&task_id) {
-                        this.collapsed_tasks.insert(task_id);
+                    if let Ok(task) = this.board.task_mut(task_id) {
+                        task.collapsed = !task.collapsed;
+                        this.persist_board(cx);
                     }
                     cx.notify();
                 }))
@@ -6361,6 +6365,7 @@ mod tests {
             issues,
             worktrees: Vec::new(),
             archived: false,
+            collapsed: false,
             prs,
         }
     }
