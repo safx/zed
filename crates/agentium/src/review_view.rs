@@ -1210,14 +1210,26 @@ fn insert_review_blocks(
 }
 
 fn finding_body(finding: &Finding) -> String {
-    match finding
+    let body = match finding
         .failure_scenario
         .as_deref()
         .filter(|scenario| !scenario.trim().is_empty())
     {
         Some(scenario) => format!("{}\n\n**Failure scenario:** {}", finding.summary, scenario),
         None => finding.summary.clone(),
-    }
+    };
+    unescape_html_entities(&body)
+}
+
+// Reviewers sometimes emit HTML-escaped text, which Markdown renders verbatim inside code spans.
+// `&amp;` goes last so `&amp;lt;` becomes `&lt;`, not `<`.
+fn unescape_html_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
 }
 
 // Findings are long wrapped paragraphs, so count wrapped rows, not just newlines.
@@ -1408,6 +1420,11 @@ mod tests {
             ..finding
         };
         assert_eq!(finding_body(&bare), "s");
+        let escaped = Finding {
+            summary: "`a &amp;&amp; b` &lt;T&gt; &amp;lt;".into(),
+            ..bare
+        };
+        assert_eq!(finding_body(&escaped), "`a && b` <T> &lt;");
     }
 
     #[test]
