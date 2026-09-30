@@ -117,6 +117,17 @@ agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--no-from
 - `--submit` — send Enter after pasting
 - `--no-from` — do not prepend the sender line. By default a message sent from inside an Agentium terminal tab starts with `[from: <that tab's title>]` on its own line (the same title `agentium tab self` prints), unless the message already begins with `[from:` or is empty
 
+### `agentium tab log`
+
+Print the last lines of the terminal tab whose title matches, as plain text. Fails unless exactly one tab in the target arena matches.
+
+```
+agentium tab log --title <TITLE> [--arena <PATH>] [-n|--lines <N>]
+```
+
+- `--arena` — arena worktree to search; defaults to the arena the command runs in (process ancestry, then current directory)
+- `-n`, `--lines` — number of lines from the end (default 200); `0` prints the whole scrollback, which is capped by `terminal.max_scroll_history_lines`. Wrapped rows are joined into one line, and blank rows below the cursor are dropped. While a full-screen program (alternate screen) is running, only its current screen is available
+
 ### `agentium tab self` / `agentium tab list`
 
 ```
