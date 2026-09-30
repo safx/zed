@@ -145,6 +145,19 @@ enum TabAction {
         no_from: bool,
         message: String,
     },
+    /// Print the last lines of the terminal tab whose title matches; fails unless exactly one tab matches
+    Log {
+        /// Tab title to match exactly (errors on zero or multiple matches)
+        #[arg(long)]
+        title: String,
+        /// Arena worktree to search; defaults to the arena this command runs in
+        /// (by process ancestry, then by current directory)
+        #[arg(long)]
+        arena: Option<PathBuf>,
+        /// Number of lines to print from the end; 0 prints the whole scrollback
+        #[arg(long, short = 'n', default_value_t = 200)]
+        lines: usize,
+    },
     /// Print the title of the terminal tab this command runs in
     #[command(name = "self")]
     SelfTab {
@@ -675,6 +688,23 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
                 "no_from": no_from,
                 "text": message,
             }))?;
+            Ok(())
+        }
+        TabAction::Log {
+            title,
+            arena,
+            lines,
+        } => {
+            let arena = arena
+                .map(|path| canonicalize_existing_path(&path))
+                .transpose()?;
+            let response = cli_request(serde_json::json!({
+                "type": "tab_log",
+                "title": title,
+                "arena": arena,
+                "lines": lines,
+            }))?;
+            print!("{}", response["text"].as_str().unwrap_or_default());
             Ok(())
         }
         TabAction::SelfTab { json } => {
@@ -1559,6 +1589,12 @@ fn handle_cli_request(
             };
             app.handle_tab_send_message(title, &selector, submit, from.as_deref(), text, cx)
                 .map(|()| serde_json::json!({ "ok": true }))
+        }
+        Some("tab_log") => {
+            let title = request["title"].as_str().unwrap_or_default();
+            let lines = request["lines"].as_u64().unwrap_or(0) as usize;
+            app.tab_log(title, &selector, lines, cx)
+                .map(|text| serde_json::json!({ "ok": true, "text": text }))
         }
         Some("tab_new") => parse_content_type(request["content_type"].as_str())
             .ok_or_else(|| anyhow::anyhow!("unknown content type {}", request["content_type"]))

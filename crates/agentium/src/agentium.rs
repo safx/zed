@@ -144,6 +144,25 @@ fn with_from_line(from: Option<&str>, text: &str) -> String {
     }
 }
 
+/// Unlike terminal's `last_n_non_empty_lines`, keeps blank lines inside the
+/// output and only drops the empty screen rows below the cursor.
+fn tail_lines(content: &str, count: usize) -> String {
+    let mut lines: Vec<&str> = content.lines().map(str::trim_end).collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    let start = if count == 0 {
+        0
+    } else {
+        lines.len().saturating_sub(count)
+    };
+    let mut text = lines[start..].join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
 /// Next state of a hook-less agent (Codex) tracked from its terminal title.
 /// `None` means "not tracked": a plain title never starts tracking, so a shell
 /// that sets its own title after the agent exited is left alone.
@@ -1894,15 +1913,12 @@ impl AgentiumApp {
         Ok(tabs)
     }
 
-    pub fn handle_tab_send_message(
-        &mut self,
+    fn unique_terminal_view_by_title(
+        &self,
         title: &str,
         selector: &ArenaSelector,
-        submit: bool,
-        from: Option<&str>,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
+        cx: &App,
+    ) -> anyhow::Result<Entity<TerminalView>> {
         let arena = self.resolve_arena(selector, cx)?;
         let mut matches = Vec::new();
         for pane in arena.read(cx).center.panes() {
@@ -1917,9 +1933,33 @@ impl AgentiumApp {
             [] => anyhow::bail!("no tab titled {title:?}"),
             _ => anyhow::bail!("{} tabs titled {title:?}", matches.len()),
         };
-        let terminal_view = item
-            .act_as::<TerminalView>(cx)
-            .ok_or_else(|| anyhow::anyhow!("tab {title:?} is not a terminal"))?;
+        item.act_as::<TerminalView>(cx)
+            .ok_or_else(|| anyhow::anyhow!("tab {title:?} is not a terminal"))
+    }
+
+    /// The last `lines` lines (all when 0) of the terminal tab titled `title`.
+    pub fn tab_log(
+        &self,
+        title: &str,
+        selector: &ArenaSelector,
+        lines: usize,
+        cx: &App,
+    ) -> anyhow::Result<String> {
+        let terminal_view = self.unique_terminal_view_by_title(title, selector, cx)?;
+        let content = terminal_view.read(cx).terminal().read(cx).get_content();
+        Ok(tail_lines(&content, lines))
+    }
+
+    pub fn handle_tab_send_message(
+        &mut self,
+        title: &str,
+        selector: &ArenaSelector,
+        submit: bool,
+        from: Option<&str>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let terminal_view = self.unique_terminal_view_by_title(title, selector, cx)?;
         let terminal = terminal_view.read(cx).terminal().clone();
         let text = with_from_line(from, text);
         terminal.update(cx, |terminal, _cx| {
@@ -6354,8 +6394,8 @@ mod tests {
     // scope and make `#[test]` expand recursively.
     use super::{
         ClaudeSessionState, WorktreeRow, backlog_issue_keys_in_branch, next_title_driven_state,
-        parse_backlog_remote, pr_ref_matches_remote, task_fetch_inputs, tasks_sharing_arena,
-        with_from_line,
+        parse_backlog_remote, pr_ref_matches_remote, tail_lines, task_fetch_inputs,
+        tasks_sharing_arena, with_from_line,
     };
     use crate::arena::TitleState;
     use crate::board::{BoardTask, IssueLink, IssueRef, PrRef};
@@ -6384,6 +6424,16 @@ mod tests {
             state: None,
             url: None,
         }
+    }
+
+    #[test]
+    fn tail_lines_keeps_inner_blank_lines_and_drops_trailing_rows() {
+        let content = "one  \n\ntwo\nthree\n   \n\n";
+        assert_eq!(tail_lines(content, 2), "two\nthree\n");
+        assert_eq!(tail_lines(content, 3), "\ntwo\nthree\n");
+        assert_eq!(tail_lines(content, 0), "one\n\ntwo\nthree\n");
+        assert_eq!(tail_lines(content, 100), "one\n\ntwo\nthree\n");
+        assert_eq!(tail_lines("  \n\n", 5), "");
     }
 
     #[test]
