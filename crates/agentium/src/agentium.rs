@@ -3222,7 +3222,7 @@ impl AgentiumApp {
         system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&pids),
             true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
         );
 
         let mut infos = Vec::new();
@@ -3230,7 +3230,15 @@ impl AgentiumApp {
             let Some(process) = system.process(sysinfo::Pid::from_u32(c.live_pid)) else {
                 continue;
             };
-            let Some(name) = process.name().to_str() else {
+            // `process.name()` is captured once per PID and survives `exec`, so a
+            // shell forked for `sbt` would keep reporting "zsh" after it becomes
+            // java. argv[0] is re-read on every refresh.
+            let Some(name) = process
+                .cmd()
+                .first()
+                .and_then(|arg0| Path::new(arg0).file_name())
+                .and_then(|name| name.to_str())
+            else {
                 continue;
             };
             if matches!(name, "claude" | "codex") || is_shell_process_name(name) {
