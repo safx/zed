@@ -13,7 +13,9 @@ Agentium runs coding agents in terminal tabs, grouped into arenas (one git workt
 test "${TERM_PROGRAM:-}" = agentium && agentium tab self
 ```
 
-Exit 0 prints the title other agents must use to reach you (a Claude Code tab prints `Claude` unless the user renamed the tab). Any failure means you are not inside an Agentium terminal or Agentium is not running; say so and stop. Do not fall back to files or other channels.
+Exit 0 prints the title other agents must use to reach you (a Claude Code tab prints `Claude` unless the user renamed the tab).
+
+`tab self` resolves your tab from process ancestry, which can fail even inside Agentium (`caller is not running inside an Agentium terminal`, e.g. when the agent runs commands outside the tab's process tree). That failure only means your own title is unknown; it does not block sending or replying. Continue if `agentium tab list` succeeds, and pass `--arena` explicitly (see Send). Stop only when `TERM_PROGRAM` is not `agentium` or `tab list` also fails; say so and do not fall back to files or other channels.
 
 ## Find the peer
 
@@ -23,7 +25,7 @@ Use the title the user gave. Otherwise list the tabs of your arena:
 agentium tab list
 ```
 
-Columns are title, kind (`terminal` or `other`), and state. Pick the terminal tab named after the target agent, such as `Codex`. If none or several fit, ask the user. `state` (`permission`, `running`, `ready`, `idle`) comes from Claude Code hooks for Claude tabs and from the terminal title (spinner, "Action Required") for Codex tabs; for other tabs it is always `idle` and carries no information.
+Columns are title, kind (`terminal` or `other`), and state. Pick the terminal tab named after the target agent, such as `Codex`. If none or several fit, ask the user. Also check that your own title appears exactly once: if two tabs share it, the peer's reply fails with `2 tabs titled`, so ask the user to rename one before sending. `state` (`permission`, `running`, `ready`, `idle`) comes from Claude Code hooks for Claude tabs and from the terminal title (spinner, "Action Required") for Codex tabs; for other tabs it is always `idle` and carries no information.
 
 Do not create tabs (`agentium tab new --title Codex -- codex`) unless the user asks for a new agent. A tab created this way opens in your arena.
 
@@ -34,10 +36,12 @@ agentium tab send-message --submit --title Codex "$(cat <<'EOF'
 Review /abs/path/to/file.md for <criteria>. Report only must-fix findings.
 
 Reply in a single message with:
-agentium tab send-message --submit --title Claude "<your reply>"
+agentium tab send-message --submit --arena /abs/path/to/worktree --title Claude "<your reply>"
 EOF
 )"
 ```
+
+Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplevel`) in the reply command: the peer's `tab self` and ancestry-based arena resolution may fail, and an explicit arena makes the reply work anyway.
 
 - Pass the body inline as above. Never write it to a temp file and `cat` it back: sandboxed and unsandboxed commands resolve `$TMPDIR` to different directories, and you would send an empty message.
 - One message per turn. Repeat absolute paths, the criteria, and the exact reply command in every message; the peer does not remember earlier ones.
@@ -48,7 +52,7 @@ EOF
 
 ## Wait for the reply
 
-End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` (the CLI adds the sender line for any message sent from an Agentium tab). Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
+End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` (the CLI adds the sender line for any message sent from an Agentium tab; it is missing when the sender's tab could not be resolved or `--no-from` was used). Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
 
 ## Message conventions (both directions)
 
