@@ -36,12 +36,12 @@ agentium tab send-message --submit --title Codex "$(cat <<'EOF'
 Review /abs/path/to/file.md for <criteria>. Report only must-fix findings.
 
 Reply in a single message with:
-agentium tab send-message --submit --arena /abs/path/to/worktree --title Claude "<your reply>"
+agentium tab send-message --submit --arena /abs/path/to/worktree --title Claude --from Codex "<your reply>"
 EOF
 )"
 ```
 
-Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplevel`) in the reply command: the peer's `tab self` and ancestry-based arena resolution may fail, and an explicit arena makes the reply work anyway.
+Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplevel`) in the reply command: the peer's `tab self` and ancestry-based arena resolution may fail, and an explicit arena makes the reply work anyway. Put `--from <the peer's tab title>` in it too: Codex runs commands under its app-server daemon, outside its tab's process tree, so its sender line is otherwise missing.
 
 - Pass the body inline as above. Never write it to a temp file and `cat` it back: sandboxed and unsandboxed commands resolve `$TMPDIR` to different directories, and you would send an empty message.
 - One message per turn. Repeat absolute paths, the criteria, and the exact reply command in every message; the peer does not remember earlier ones.
@@ -52,7 +52,7 @@ Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplev
 
 ## Wait for the reply
 
-End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` (the CLI adds the sender line for any message sent from an Agentium tab; it is missing when the sender's tab could not be resolved or `--no-from` was used). Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
+End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` (the CLI adds the sender line for any message sent from an Agentium tab; it is missing when the sender's tab could not be resolved and no `--from` was given, or `--no-from` was used; the sender then sees a `warning:` on stderr). Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
 
 ## Message conventions (both directions)
 

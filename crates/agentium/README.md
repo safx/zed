@@ -110,12 +110,13 @@ agentium tab new [--type <TYPE>] [--title <TITLE>] [--arena <PATH>] [-- <COMMAND
 Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches.
 
 ```
-agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--no-from] <MESSAGE>
+agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--no-from | --from <SENDER>] <MESSAGE>
 ```
 
 - `--arena` — arena worktree to search; defaults to the arena the command runs in (process ancestry, then current directory)
 - `--submit` — send Enter after pasting
 - `--no-from` — do not prepend the sender line. By default a message sent from inside an Agentium terminal tab starts with `[from: <that tab's title>]` on its own line (the same title `agentium tab self` prints), unless the message already begins with `[from:` or is empty
+- `--from` — use this sender title instead of resolving the tab the command runs in. Needed when the command runs outside the tab's process tree, such as Codex 0.159+, which runs commands (including `!`) under its shared app-server daemon. When the sender cannot be resolved, the message is sent without the line and a warning is printed to stderr
 
 ### `agentium tab log`
 
