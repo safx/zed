@@ -1961,6 +1961,7 @@ impl AgentiumApp {
     ) -> anyhow::Result<()> {
         let terminal_view = self.unique_terminal_view_by_title(title, selector, cx)?;
         let terminal = terminal_view.read(cx).terminal().clone();
+        self.ensure_safe_message_target(title, terminal.read(cx))?;
         let text = with_from_line(from, text);
         terminal.update(cx, |terminal, _cx| {
             if !text.is_empty() {
@@ -1970,6 +1971,52 @@ impl AgentiumApp {
                 terminal.input(&b"\r"[..]);
             }
         });
+        Ok(())
+    }
+
+    /// The CLI socket is reachable from inside agent sandboxes, so pasting into
+    /// a shell would run commands outside the sandbox, and pasting into a
+    /// permission dialog would answer it without the user.
+    fn ensure_safe_message_target(
+        &self,
+        title: &str,
+        terminal: &terminal::Terminal,
+    ) -> anyhow::Result<()> {
+        let getter = terminal
+            .pid_getter()
+            .ok_or_else(|| anyhow::anyhow!("tab {title:?} has no process"))?;
+        let shell_pid = getter.fallback_pid().as_u32();
+        if self
+            .session_state
+            .permission_shell_pids
+            .borrow()
+            .contains(&shell_pid)
+        {
+            anyhow::bail!(
+                "tab {title:?} is waiting for a permission answer; ask the user instead"
+            );
+        }
+        let live_pid = terminal
+            .pid()
+            .ok_or_else(|| anyhow::anyhow!("tab {title:?} has no foreground process"))?;
+        let mut system = self.sysinfo_system.borrow_mut();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[live_pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let name = system.process(live_pid).and_then(argv0_name).ok_or_else(|| {
+            anyhow::anyhow!("cannot identify the foreground process of tab {title:?}")
+        })?;
+        // An allowlist rather than a shell denylist: text pasted while any
+        // other program (including this CLI, when sending to its own tab) is in
+        // the foreground stays in the tty queue and the shell runs it once that
+        // program exits.
+        if !is_agent_process_name(name) {
+            anyhow::bail!(
+                "tab {title:?} is running {name}, not a coding agent; refusing to paste"
+            );
+        }
         Ok(())
     }
 
@@ -3230,18 +3277,10 @@ impl AgentiumApp {
             let Some(process) = system.process(sysinfo::Pid::from_u32(c.live_pid)) else {
                 continue;
             };
-            // `process.name()` is captured once per PID and survives `exec`, so a
-            // shell forked for `sbt` would keep reporting "zsh" after it becomes
-            // java. argv[0] is re-read on every refresh.
-            let Some(name) = process
-                .cmd()
-                .first()
-                .and_then(|arg0| Path::new(arg0).file_name())
-                .and_then(|name| name.to_str())
-            else {
+            let Some(name) = argv0_name(process) else {
                 continue;
             };
-            if matches!(name, "claude" | "codex") || is_shell_process_name(name) {
+            if is_agent_process_name(name) || is_shell_process_name(name) {
                 continue;
             }
             infos.push(BadgeEntryInfo {
@@ -3803,6 +3842,22 @@ pub fn remote_url_to_browser_url(url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Refresh with `ProcessRefreshKind::with_cmd(UpdateKind::Always)` first.
+/// `process.name()` is captured once per PID and survives `exec`, so a shell
+/// forked for `sbt` would keep reporting "zsh" after it becomes java; argv[0]
+/// is re-read on every refresh.
+fn argv0_name(process: &sysinfo::Process) -> Option<&str> {
+    process
+        .cmd()
+        .first()
+        .and_then(|arg0| Path::new(arg0).file_name())
+        .and_then(|name| name.to_str())
+}
+
+fn is_agent_process_name(name: &str) -> bool {
+    matches!(name, "claude" | "codex")
 }
 
 fn is_shell_process_name(name: &str) -> bool {

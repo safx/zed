@@ -107,7 +107,7 @@ agentium tab new [--type <TYPE>] [--title <TITLE>] [--arena <PATH>] [-- <COMMAND
 
 ### `agentium tab send-message`
 
-Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches.
+Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches. Also refuses, sending nothing, when the target's foreground process is not a coding agent (`claude` or `codex`): text pasted into a shell, or into any other program that later exits back to the shell (including this CLI, when sending to its own tab), runs as a command outside any agent sandbox. It also refuses when the target is waiting for a permission answer (the text would answer the dialog without the user).
 
 ```
 agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--no-from | --from <SENDER>] <MESSAGE>
