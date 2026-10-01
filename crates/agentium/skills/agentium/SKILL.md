@@ -48,7 +48,7 @@ Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplev
 - Exit 0 means the text was pasted and Enter was pressed in exactly one matching tab. It does not prove the peer started a turn; for a Claude Code peer, `agentium tab list` showing `running` does.
 - Exit 1 with `no tab titled`, `N tabs titled`, `is not a terminal`, or `no arena` means nothing was sent. Fix `--title` or `--arena` with `agentium tab list`; do not retry the same command.
 - `cannot reach Agentium` means the app is not running or predates the CLI socket.
-- If a Claude Code peer shows `permission`, it is waiting at a dialog; your text could answer it. Ask the user instead of sending.
+- Exit 1 with `not a coding agent` means the tab is not running Claude Code or Codex (or is your own tab); nothing was sent. Exit 1 with `waiting for a permission answer` means the peer is at a dialog; ask the user instead of retrying.
 
 ## Wait for the reply
 
