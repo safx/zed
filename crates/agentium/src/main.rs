@@ -141,8 +141,13 @@ enum TabAction {
         #[arg(long)]
         submit: bool,
         /// Do not prepend the `[from: <your tab title>]` line
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from")]
         no_from: bool,
+        /// Sender title for the `[from: ...]` line instead of resolving the tab
+        /// this command runs in (needed when it runs outside the tab's process
+        /// tree, e.g. under Codex's app-server daemon)
+        #[arg(long)]
+        from: Option<String>,
         message: String,
     },
     /// Print the last lines of the terminal tab whose title matches; fails unless exactly one tab matches
@@ -675,19 +680,24 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
             arena,
             submit,
             no_from,
+            from,
             message,
         } => {
             let arena = arena
                 .map(|path| canonicalize_existing_path(&path))
                 .transpose()?;
-            cli_request(serde_json::json!({
+            let response = cli_request(serde_json::json!({
                 "type": "tab_send_message",
                 "title": title,
                 "arena": arena,
                 "submit": submit,
                 "no_from": no_from,
+                "from": from,
                 "text": message,
             }))?;
+            if let Some(warning) = response["warning"].as_str() {
+                eprintln!("warning: {warning}");
+            }
             Ok(())
         }
         TabAction::Log {
@@ -1582,13 +1592,24 @@ fn handle_cli_request(
             let text = request["text"].as_str().unwrap_or_default();
             let submit = request["submit"].as_bool().unwrap_or(false);
             // The sender is the tab the CLI runs in; outside Agentium there is none.
+            let mut warning = None;
             let from = if request["no_from"].as_bool().unwrap_or(false) {
                 None
+            } else if let Some(from) = request["from"].as_str() {
+                Some(from.to_owned())
             } else {
-                app.tab_self(&ancestor_pids, cx).ok().map(|tab| tab.title)
+                match app.tab_self(&ancestor_pids, cx) {
+                    Ok(tab) => Some(tab.title),
+                    Err(error) => {
+                        warning = Some(format!(
+                            "sent without the [from: ...] line: {error}; pass --from <title> to name the sender"
+                        ));
+                        None
+                    }
+                }
             };
             app.handle_tab_send_message(title, &selector, submit, from.as_deref(), text, cx)
-                .map(|()| serde_json::json!({ "ok": true }))
+                .map(|()| serde_json::json!({ "ok": true, "warning": warning }))
         }
         Some("tab_log") => {
             let title = request["title"].as_str().unwrap_or_default();
