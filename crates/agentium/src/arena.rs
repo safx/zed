@@ -1190,6 +1190,7 @@ impl Render for Arena {
                                     workspace,
                                     action.separate_history,
                                     None,
+                                    None,
                                     window,
                                     cx,
                                 )
