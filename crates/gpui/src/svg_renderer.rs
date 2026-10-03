@@ -7,6 +7,7 @@ use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
     hash::Hash,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, OnceLock},
 };
 
@@ -91,6 +92,7 @@ pub struct RenderSvgParams {
 /// A struct holding everything necessary to render SVGs.
 pub struct SvgRenderer {
     asset_source: Arc<dyn AssetSource>,
+    enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>>,
     usvg_options: Arc<usvg::Options<'static>>,
 }
 
@@ -122,21 +124,34 @@ impl From<f32> for SvgSize {
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
+        // Build the enriched font DB lazily on first SVG render rather than
+        // eagerly at construction time. This avoids the expensive deep-clone
+        // of the system font database for code paths that never render SVGs
+        // (e.g. tests).
+        let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
+        let options = Self::build_options(asset_source.clone(), enriched_fontdb.clone(), None);
+        Self {
+            asset_source,
+            enriched_fontdb,
+            usvg_options: Arc::new(options),
+        }
+    }
+
+    // `usvg::Options` is not `Clone` (its font resolvers are boxed closures), so
+    // options with a different `resources_dir` have to be built from scratch.
+    fn build_options(
+        asset_source: Arc<dyn AssetSource>,
+        enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>>,
+        resources_dir: Option<PathBuf>,
+    ) -> usvg::Options<'static> {
         static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
             Arc::new(db)
         });
 
-        // Build the enriched font DB lazily on first SVG render rather than
-        // eagerly at construction time. This avoids the expensive deep-clone
-        // of the system font database for code paths that never render SVGs
-        // (e.g. tests).
-        let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
-
         let default_font_resolver = usvg::FontResolver::default_font_selector();
-        let font_resolver = Box::new({
-            let asset_source = asset_source.clone();
+        let font_resolver = Box::new(
             move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
                 if db.is_empty() {
                     let fontdb = enriched_fontdb.get_or_init(|| {
@@ -158,8 +173,8 @@ impl SvgRenderer {
                 };
                 db.query(&sans_query)
                     .or_else(|| db.faces().next().map(|f| f.id))
-            }
-        });
+            },
+        );
         let default_fallback_selection = usvg::FontResolver::default_fallback_selector();
         let fallback_selection = Box::new(
             move |ch: char, fonts: &[usvg::fontdb::ID], db: &mut Arc<usvg::fontdb::Database>| {
@@ -173,22 +188,37 @@ impl SvgRenderer {
                 default_fallback_selection(ch, fonts, db)
             },
         );
-        let options = usvg::Options {
+        usvg::Options {
+            resources_dir,
             font_resolver: usvg::FontResolver {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
             ..Default::default()
-        };
-        Self {
-            asset_source,
-            usvg_options: Arc::new(options),
         }
     }
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
         usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+    }
+
+    /// Like [`Self::parse_svg`], but resolves relative `<image href>` paths
+    /// against `resources_dir`.
+    pub fn parse_svg_with_resources_dir(
+        &self,
+        bytes: &[u8],
+        resources_dir: Option<&Path>,
+    ) -> Result<ParsedSvg, usvg::Error> {
+        let Some(resources_dir) = resources_dir else {
+            return self.parse_svg(bytes);
+        };
+        let options = Self::build_options(
+            self.asset_source.clone(),
+            self.enriched_fontdb.clone(),
+            Some(resources_dir.to_path_buf()),
+        );
+        usvg::Tree::from_data(bytes, &options).map(ParsedSvg)
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -361,6 +391,40 @@ mod tests {
     const IBM_PLEX_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+
+    #[test]
+    fn parse_svg_with_resources_dir_resolves_relative_images() {
+        let resources_dir = std::env::temp_dir().join(format!(
+            "gpui-svg-resources-dir-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&resources_dir).unwrap();
+        image::RgbaImage::new(1, 1)
+            .save(resources_dir.join("pixel.png"))
+            .unwrap();
+
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+            <image href="pixel.png" width="10" height="10"/>
+        </svg>"#;
+        fn contains_image(group: &usvg::Group) -> bool {
+            group.children().iter().any(|node| match node {
+                usvg::Node::Image(_) => true,
+                usvg::Node::Group(group) => contains_image(group),
+                _ => false,
+            })
+        }
+        let has_image = |svg: &ParsedSvg| contains_image(svg.0.root());
+
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let without_dir = renderer.parse_svg(svg).unwrap();
+        let with_dir = renderer
+            .parse_svg_with_resources_dir(svg, Some(&resources_dir))
+            .unwrap();
+        std::fs::remove_dir_all(&resources_dir).ok();
+
+        assert!(!has_image(&without_dir));
+        assert!(has_image(&with_dir));
+    }
 
     #[test]
     fn renders_parsed_svg_at_requested_size() -> Result<()> {

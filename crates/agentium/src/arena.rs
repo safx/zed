@@ -34,6 +34,7 @@ use crate::{
     file_browser_view::FileBrowserView,
     git_status_view::GitStatusView,
     questionnaire_view::{OpenAsText, QuestionnaireView},
+    svg_view::SvgView,
 };
 
 pub(crate) enum ArenaEvent {
@@ -1061,19 +1062,24 @@ impl Arena {
     }
 
     // Same-pane is impossible: panes dedupe items by entry id.
-    fn open_questionnaire_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_active_item_as_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace_entity) = self.workspace.upgrade() else {
             return;
         };
-        let Some(view) = self
-            .active_pane
-            .read(cx)
-            .active_item()
-            .and_then(|item| item.act_as::<QuestionnaireView>(cx))
+        let Some(active_item) = self.active_pane.read(cx).active_item() else {
+            return;
+        };
+        let Some(buffer) = active_item
+            .act_as::<QuestionnaireView>(cx)
+            .map(|view| view.read(cx).buffer(cx))
+            .or_else(|| {
+                active_item
+                    .act_as::<SvgView>(cx)
+                    .map(|view| view.read(cx).buffer(cx))
+            })
         else {
             return;
         };
-        let buffer = view.read(cx).buffer(cx);
         let target_pane = self.pane_to_the_right(window, cx);
         workspace_entity.update(cx, |workspace, cx| {
             workspace.open_project_item::<editor::Editor>(
@@ -1212,7 +1218,7 @@ impl Render for Arena {
                         this.open_markdown_preview(true, window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &OpenAsText, window, cx| {
-                        this.open_questionnaire_as_text(window, cx);
+                        this.open_active_item_as_text(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &NewClaudeCode, window, cx| {
                         this.add_claude_code(window, cx);
