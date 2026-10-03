@@ -9,7 +9,7 @@ use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
     hash::Hash,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, OnceLock},
 };
 
@@ -94,6 +94,7 @@ pub struct RenderSvgParams {
 /// A struct holding everything necessary to render SVGs.
 pub struct SvgRenderer {
     asset_source: Arc<dyn AssetSource>,
+    enriched_fontdb: Arc<OnceLock<Mutex<FontDatabase>>>,
     usvg_options: Arc<usvg::Options<'static>>,
 }
 
@@ -138,17 +139,31 @@ impl From<f32> for SvgSize {
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
-        static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
-            let mut db = usvg::fontdb::Database::new();
-            db.load_system_fonts();
-            Arc::new(db)
-        });
-
         // Build the enriched font DB lazily on first SVG render rather than
         // eagerly at construction time. This avoids the expensive deep-clone
         // of the system font database for code paths that never render SVGs
         // (e.g. tests).
         let enriched_fontdb = Arc::new(OnceLock::<Mutex<FontDatabase>>::new());
+        let options = Self::build_options(asset_source.clone(), enriched_fontdb.clone(), None);
+        Self {
+            asset_source,
+            enriched_fontdb,
+            usvg_options: Arc::new(options),
+        }
+    }
+
+    // `usvg::Options` is not `Clone` (its font resolvers are boxed closures), so
+    // options with a different `resources_dir` have to be built from scratch.
+    fn build_options(
+        asset_source: Arc<dyn AssetSource>,
+        enriched_fontdb: Arc<OnceLock<Mutex<FontDatabase>>>,
+        resources_dir: Option<PathBuf>,
+    ) -> usvg::Options<'static> {
+        static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        });
 
         let default_font_resolver = usvg::FontResolver::default_font_selector();
         let font_resolver = Box::new({
@@ -208,22 +223,37 @@ impl SvgRenderer {
                 })
             },
         );
-        let options = usvg::Options {
+        usvg::Options {
+            resources_dir,
             font_resolver: usvg::FontResolver {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
             ..Default::default()
-        };
-        Self {
-            asset_source,
-            usvg_options: Arc::new(options),
         }
     }
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
         usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+    }
+
+    /// Like [`Self::parse_svg`], but resolves relative `<image href>` paths
+    /// against `resources_dir`.
+    pub fn parse_svg_with_resources_dir(
+        &self,
+        bytes: &[u8],
+        resources_dir: Option<&Path>,
+    ) -> Result<ParsedSvg, usvg::Error> {
+        let Some(resources_dir) = resources_dir else {
+            return self.parse_svg(bytes);
+        };
+        let options = Self::build_options(
+            self.asset_source.clone(),
+            self.enriched_fontdb.clone(),
+            Some(resources_dir.to_path_buf()),
+        );
+        usvg::Tree::from_data(bytes, &options).map(ParsedSvg)
     }
 
     /// Returns the advance of `text` drawn by this renderer as a single line of SVG `<text>`.
