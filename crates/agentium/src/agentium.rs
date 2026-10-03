@@ -4,9 +4,11 @@ pub mod file_browser_view;
 mod git_status_view;
 pub mod questionnaire_view;
 mod review_view;
+mod svg_view;
 
 pub use questionnaire_view::QuestionnaireView;
 pub use review_view::ReviewView;
+pub use svg_view::SvgView;
 
 #[derive(Clone)]
 pub struct AgentiumWorkspaceHandle(pub Entity<Workspace>);
