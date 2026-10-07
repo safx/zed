@@ -110,13 +110,14 @@ agentium tab new [--type <TYPE>] [--title <TITLE>] [--arena <PATH>] [-- <COMMAND
 Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches. Also refuses, sending nothing, when the target's foreground process is not a coding agent (`claude` or `codex`): text pasted into a shell, or into any other program that later exits back to the shell (including this CLI, when sending to its own tab), runs as a command outside any agent sandbox. It also refuses when the target is waiting for a permission answer (the text would answer the dialog without the user).
 
 ```
-agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--no-from | --from <SENDER>] <MESSAGE>
+agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--from <SENDER>] <MESSAGE>
 ```
 
 - `--arena` — arena worktree to search; defaults to the arena the command runs in (process ancestry, then current directory)
 - `--submit` — send Enter after pasting
-- `--no-from` — do not prepend the sender line. By default a message sent from inside an Agentium terminal tab starts with `[from: <that tab's title>]` on its own line (the same title `agentium tab self` prints), unless the message already begins with `[from:` or is empty
-- `--from` — use this sender title instead of resolving the tab the command runs in. Needed when the command runs outside the tab's process tree, such as Codex 0.159+, which runs commands (including `!`) under its shared app-server daemon. When the sender cannot be resolved, the message is sent without the line and a warning is printed to stderr
+- `--from` — sender title to show when the sending tab cannot be verified. Needed when the command runs outside the tab's process tree, such as Codex 0.159+, which runs commands (including `!`) under its shared app-server daemon
+
+Every non-empty message starts with a sender line on its own line, even if the message itself begins with `[from:`. The app identifies the sender from the CLI process's PID as reported by the kernel (`LOCAL_PEERPID`) and its ancestry, not from anything the CLI sends: a verified tab shows as `[from: <tab title>]`, otherwise the line is `[from: <--from value> (unverified)]`, or `[from: unknown (unverified)]` with a warning on stderr. `--from` is ignored, with a warning, when it disagrees with a verified tab. `]` and control characters are removed from names so the line cannot be closed early or split. A verified title is still the sender tab's current title, which a program in that tab may be able to change.
 
 ### `agentium tab log`
 

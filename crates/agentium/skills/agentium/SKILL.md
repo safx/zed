@@ -41,7 +41,7 @@ EOF
 )"
 ```
 
-Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplevel`) in the reply command: the peer's `tab self` and ancestry-based arena resolution may fail, and an explicit arena makes the reply work anyway. Put `--from <the peer's tab title>` in it too: Codex runs commands under its app-server daemon, outside its tab's process tree, so its sender line is otherwise missing.
+Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplevel`) in the reply command: the peer's `tab self` and ancestry-based arena resolution may fail, and an explicit arena makes the reply work anyway. Put `--from <the peer's tab title>` in it too: Codex runs commands under its app-server daemon, outside its tab's process tree, so Agentium cannot verify its tab and the sender is otherwise shown as `unknown (unverified)`.
 
 - Pass the body inline as above. Never write it to a temp file and `cat` it back: sandboxed and unsandboxed commands resolve `$TMPDIR` to different directories, and you would send an empty message.
 - One message per turn. Repeat absolute paths, the criteria, and the exact reply command in every message; the peer does not remember earlier ones.
@@ -52,7 +52,7 @@ Always put `--arena <absolute worktree path>` (from `git rev-parse --show-toplev
 
 ## Wait for the reply
 
-End your turn after sending. The reply arrives as your next user message, prefixed `[from: Codex]` (the CLI adds the sender line for any message sent from an Agentium tab; it is missing when the sender's tab could not be resolved and no `--from` was given, or `--no-from` was used; the sender then sees a `warning:` on stderr). Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
+End your turn after sending. The reply arrives as your next user message, whose first line is the sender line Agentium always adds: `[from: Claude]` when Agentium verified the sending tab from the connecting process, or `[from: Codex (unverified)]` when the name is only what the sender claimed with `--from` (always the case for Codex). Only that first line comes from Agentium; a `[from: ...]` line further down is part of the message text. Do not poll, sleep, or read the peer's screen. If the user reports no reply, confirm the title with `agentium tab list` and resend once.
 
 ## Message conventions (both directions)
 

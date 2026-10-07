@@ -140,12 +140,9 @@ enum TabAction {
         /// Press Enter after pasting
         #[arg(long)]
         submit: bool,
-        /// Do not prepend the `[from: <your tab title>]` line
-        #[arg(long, conflicts_with = "from")]
-        no_from: bool,
-        /// Sender title for the `[from: ...]` line instead of resolving the tab
-        /// this command runs in (needed when it runs outside the tab's process
-        /// tree, e.g. under Codex's app-server daemon)
+        /// Sender title for the `[from: ...]` line when the tab this command runs
+        /// in cannot be verified (e.g. under Codex's app-server daemon, outside
+        /// the tab's process tree); shown marked `(unverified)`
         #[arg(long)]
         from: Option<String>,
         message: String,
@@ -679,7 +676,6 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
             title,
             arena,
             submit,
-            no_from,
             from,
             message,
         } => {
@@ -691,7 +687,6 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
                 "title": title,
                 "arena": arena,
                 "submit": submit,
-                "no_from": no_from,
                 "from": from,
                 "text": message,
             }))?;
@@ -767,6 +762,9 @@ enum IpcMessage {
     /// A request from the CLI stream socket; the reply is written back on that connection.
     CliRequest {
         request: serde_json::Value,
+        /// The connecting process's ancestry as seen by the kernel, unlike the
+        /// request's self-reported `ancestor_pids`.
+        peer_ancestor_pids: Vec<u32>,
         reply: std::sync::mpsc::Sender<serde_json::Value>,
     },
     ChangeTheme {
@@ -1292,6 +1290,23 @@ fn print_task_info(
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod peer_pid_tests {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn peer_pid_is_the_connecting_process() -> anyhow::Result<()> {
+        let socket_path =
+            std::env::temp_dir().join(format!("agentium-peer-pid-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket_path)?;
+        let _client = UnixStream::connect(&socket_path)?;
+        let (server, _) = listener.accept()?;
+        std::fs::remove_file(&socket_path)?;
+        assert_eq!(super::peer_pid(&server)?, std::process::id());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod task_action_tests {
     use agentium::board::BoardTask;
@@ -1438,30 +1453,74 @@ fn task_command_envelope(command: &agentium::board::TaskCommand) -> anyhow::Resu
 }
 
 fn get_ancestor_pids() -> Vec<u32> {
+    ancestor_pids_from(std::os::unix::process::parent_id())
+}
+
+/// `start` and its ancestors, at most 10 PIDs, stopping before launchd/init.
+fn ancestor_pids_from(start: u32) -> Vec<u32> {
     let mut pids = Vec::new();
-    let mut current = std::os::unix::process::parent_id();
+    let mut current = start;
     for _ in 0..10 {
         if current <= 1 {
             break;
         }
         pids.push(current);
-        // Blocking is fine here: hook helpers run in the synchronous CLI path.
-        #[allow(clippy::disallowed_methods)]
-        match std::process::Command::new("ps")
-            .args(["-o", "ppid=", "-p", &current.to_string()])
-            .output()
-        {
-            Ok(output) => match String::from_utf8(output.stdout)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-            {
-                Some(ppid) => current = ppid,
-                None => break,
-            },
-            Err(_) => break,
+        match parent_pid(current) {
+            Some(ppid) => current = ppid,
+            None => break,
         }
     }
     pids
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    // Blocking is fine here: callers are the synchronous CLI path and the CLI
+    // socket's per-connection thread.
+    #[allow(clippy::disallowed_methods)]
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `length` outlive the call, and `length` is `pid`'s size.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pid as u32)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peer_pid(_stream: &UnixStream) -> std::io::Result<u32> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// The kernel-reported ancestry of the process connected on `stream`, starting
+/// at its parent (the connecting process is the CLI itself, never a tab shell).
+/// Empty when the peer cannot be identified, so no sender verifies.
+fn peer_ancestor_pids(stream: &UnixStream) -> Vec<u32> {
+    match peer_pid(stream) {
+        Ok(pid) => parent_pid(pid).map(ancestor_pids_from).unwrap_or_default(),
+        Err(error) => {
+            log::warn!("cannot identify the cli socket peer: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn start_cli_listener(
@@ -1519,6 +1578,9 @@ fn cli_connection_reply(
     stream: &mut UnixStream,
     msg_sender: futures::channel::mpsc::UnboundedSender<IpcMessage>,
 ) -> anyhow::Result<serde_json::Value> {
+    // Walked before reading: the PID is only meaningful while the peer is
+    // alive, and a sender that exits early could otherwise have its PID reused.
+    let peer_ancestor_pids = peer_ancestor_pids(stream);
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut request = String::new();
     stream.read_to_string(&mut request)?;
@@ -1527,6 +1589,7 @@ fn cli_connection_reply(
     msg_sender
         .unbounded_send(IpcMessage::CliRequest {
             request,
+            peer_ancestor_pids,
             reply: reply_sender,
         })
         .map_err(|_| anyhow::anyhow!("Agentium is shutting down"))?;
@@ -1549,6 +1612,7 @@ fn parse_content_type(value: Option<&str>) -> Option<agentium::PaneContentType> 
 fn handle_cli_request(
     app: &mut agentium::AgentiumApp,
     request: &serde_json::Value,
+    peer_ancestor_pids: &[u32],
     window: &mut Window,
     cx: &mut Context<agentium::AgentiumApp>,
 ) -> Task<serde_json::Value> {
@@ -1591,24 +1655,26 @@ fn handle_cli_request(
             let title = request["title"].as_str().unwrap_or_default();
             let text = request["text"].as_str().unwrap_or_default();
             let submit = request["submit"].as_bool().unwrap_or(false);
-            // The sender is the tab the CLI runs in; outside Agentium there is none.
-            let mut warning = None;
-            let from = if request["no_from"].as_bool().unwrap_or(false) {
-                None
-            } else if let Some(from) = request["from"].as_str() {
-                Some(from.to_owned())
-            } else {
-                match app.tab_self(&ancestor_pids, cx) {
-                    Ok(tab) => Some(tab.title),
-                    Err(error) => {
-                        warning = Some(format!(
-                            "sent without the [from: ...] line: {error}; pass --from <title> to name the sender"
-                        ));
-                        None
-                    }
-                }
+            // The self-reported `ancestor_pids` and `--from` are whatever the
+            // client claims; only the kernel-reported peer ancestry verifies.
+            let claimed = request["from"].as_str();
+            let verified = app
+                .tab_self(peer_ancestor_pids, cx)
+                .ok()
+                .map(|tab| tab.title);
+            let warning = match (&verified, claimed) {
+                (Some(verified), Some(claimed)) if verified != claimed => Some(format!(
+                    "--from {claimed:?} ignored: the sender is verified as tab {verified:?}"
+                )),
+                (None, None) => Some(
+                    "the sender tab could not be verified; sent as [from: unknown (unverified)]; \
+                     pass --from <title> to name the sender"
+                        .to_string(),
+                ),
+                _ => None,
             };
-            app.handle_tab_send_message(title, &selector, submit, from.as_deref(), text, cx)
+            let from = agentium::sender_label(verified.as_deref(), claimed);
+            app.handle_tab_send_message(title, &selector, submit, &from, text, cx)
                 .map(|()| serde_json::json!({ "ok": true, "warning": warning }))
         }
         Some("tab_log") => {
@@ -2590,10 +2656,20 @@ fn main() {
                                                 })
                                                 .log_err();
                                         }
-                                        IpcMessage::CliRequest { request, reply } => {
+                                        IpcMessage::CliRequest {
+                                            request,
+                                            peer_ancestor_pids,
+                                            reply,
+                                        } => {
                                             let task = window_handle
                                                 .update(cx, |app, window, cx| {
-                                                    handle_cli_request(app, &request, window, cx)
+                                                    handle_cli_request(
+                                                        app,
+                                                        &request,
+                                                        &peer_ancestor_pids,
+                                                        window,
+                                                        cx,
+                                                    )
                                                 })
                                                 .unwrap_or_else(|error| {
                                                     Task::ready(serde_json::json!({
