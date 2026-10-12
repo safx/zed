@@ -1,6 +1,6 @@
 # Codex ACPタブの実装・検証記録
 
-2026-10-12。実験用ブランチ `experiment/codex-acp-tabs`。計画は[Claude承認済みのRev 3](codex-acp-tab-plan.md)。コードレビューは依頼前。
+2026-10-12。実験用ブランチ `experiment/codex-acp-tabs`。計画は[Claude承認済みのRev 3](codex-acp-tab-plan.md)。コードレビュー第1回のC1・C2を修正し、再レビュー待ち。
 
 ## 実装
 
@@ -16,14 +16,14 @@ Agentium向けホスト処理は通知の表示判定・クリック先・ログ
 
 - AgentConnectionStoreの接続監視タスクは従来detachされていた。タブ専用の`new_isolated`では保持してキャンセルし、接続中のcloseでfutureを解放する。
 - 差分タブがthreadを保持してもadapterを止めるため、専用storeのrelease時に接続プロセスを明示終了する。
-- `Pane::take_active_item`で最後のItemを移すとtoolbarが旧Itemを保持していた。Item削除後にtoolbarを更新し、空のPaneからも解放する。変更は1行で、既存Paneテスト83件を実行した。
+- `Pane::take_active_item`で最後のItemを移すとtoolbarが旧Itemを保持していた。空になったPaneでは、`close_pane_if_empty`にかかわらずtoolbarを更新して解放する。既存の呼び出しを1行移動し、既存Paneテスト83件を実行した。
 - TerminalPanelが存在しないAgentiumでも、認証が要求する端末を作成元Arenaに開けるようにした。
 
 ## 自動検証
 
 | 検証 | 結果 |
 | --- | --- |
-| `cargo test -p agentium --lib --offline` | 112件成功 |
+| `cargo test -p agentium --lib --offline` | 118件成功 |
 | `cargo test -p agent_servers --lib --offline` | 58件成功 |
 | `cargo test -p agent_ui --lib --offline` | 497件成功 |
 | `cargo test -p workspace --lib pane::tests --offline` | 83件成功 |
@@ -33,7 +33,18 @@ Agentium向けホスト処理は通知の表示判定・クリック先・ログ
 | `rustfmt --edition 2024 --check crates/agentium/src/codex_acp_view.rs` | 成功 |
 | `git diff --check` | 成功 |
 
-計750件成功。新規ケースは接続中のキャンセル、タブ・cwdの独立性、Pane移動とセッション解放、thread参照が残るclose、古い完了イベント、設定保存、差分タブ別のKeep All、プロセス群のDrop/Quit、明示cwd/env、未導入コマンドの終了コード127を扱う。
+計756件成功。新規ケースは接続中のキャンセル、タブ・cwdの独立性、Pane移動とセッション解放、thread参照が残るclose、古い完了イベント、設定保存、差分タブ別のKeep All、プロセス群のDrop/Quit、明示cwd/env、未導入コマンドの終了コード127を扱う。レビュー後には起動設定の純粋関数テスト5件と、本番connectの無効ディレクトリ拒否テスト1件を追加した。
+
+## コードレビュー第1回
+
+Claudeは初回実装コミット`37d95929a3`に対して必須修正C1・C2を指摘した。所有ガード、独立storeの寿命、ログインシェル待ち、cwd/envの取得経路、既定Zed経路は問題なしと確認した。
+
+- C1: `build_launch`を切り出し、connectが戻り値のcommand、options、mode、config、warningをそのまま使うようにした。2つのcwdとsession cwdの一致、explicit > proxy > directoryの環境優先順、None時の警告と空env、Registry拒否、Customのcommand/args/env/default保持をテストした。未指定・不存在・通常ファイルの作業先が本番connectで拒否されることも検証した。
+- C2: Item削除後の無条件toolbar更新を撤回し、空になったPaneだけで既存の更新を行う。バックグラウンドのタブ削除で検索やBreadcrumbsを再初期化しない。
+- I1: 終了コード127のCodex導入案内を、ホストの存在に加えてagent IDがCODEX_IDのときだけ表示する。
+- I2: 未使用の`AcpLaunchOptions.client_version`を削除した。client_info.versionには従来どおりアプリのバージョンを使う。
+
+修正後に上記全テスト、Zedを含むcheck、Clippy、fmtを再実行して成功した。別Paneにフォーカスがある場合の承認通知の仕様もREADMEに記載した。手動UI検証の未実施項目は後述のとおり。
 
 workspace全体のfmtは基準コミットでも失敗する。`pane.rs`と`persistence.rs`をHEADから一時ファイルへ取り出して同じ失敗を確認したため、既存箇所の整形は含めていない。デバッグテストのリンク時には大きな`__eh_frame`についてApple linkerの警告が出るが、テストは成功する。依存する`block 0.1.6`のfuture-incompatibility通知も残る。
 
