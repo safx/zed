@@ -711,7 +711,6 @@ fn client_capabilities_for_agent(
 pub struct AcpLaunchOptions {
     pub working_directory: Option<PathBuf>,
     pub client_name: &'static str,
-    pub client_version: Option<String>,
     pub terminate_on_drop_and_quit: bool,
 }
 
@@ -720,7 +719,6 @@ impl Default for AcpLaunchOptions {
         Self {
             working_directory: None,
             client_name: "zed",
-            client_version: None,
             terminate_on_drop_and_quit: false,
         }
     }
@@ -793,7 +791,6 @@ impl AcpConnection {
             )
         });
 
-        let version = options.client_version.clone().unwrap_or(version);
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());

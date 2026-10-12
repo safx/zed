@@ -302,23 +302,54 @@ fn fallback_command() -> AgentServerCommand {
     }
 }
 
-fn launch_configuration(
-    cx: &App,
-) -> Result<(
-    AgentServerCommand,
-    Option<acp::SessionModeId>,
-    HashMap<String, AgentConfigOptionValue>,
-)> {
-    cx.read_global(|store: &SettingsStore, _| {
-        match store.get::<AllAgentServersSettings>(None).get(CODEX_ID) {
-            None => Ok((fallback_command(), None, HashMap::default())),
-            Some(CustomAgentServerSettings::Custom { command, default_mode, default_config_options, .. }) => {
-                Ok((command.clone(), default_mode.clone().map(acp::SessionModeId::new), default_config_options.clone()))
-            }
-            Some(CustomAgentServerSettings::Registry { .. }) => anyhow::bail!(
-                "Codex (ACP) is experimental and requires a custom agent_servers.codex-acp command in {}. ACP Registry installation is not supported yet.", paths::settings_file().display()
-            ),
-        }
+struct CodexAcpLaunch {
+    command: AgentServerCommand,
+    options: AcpLaunchOptions,
+    default_mode: Option<acp::SessionModeId>,
+    default_config_options: HashMap<String, AgentConfigOptionValue>,
+    warning: Option<String>,
+}
+
+fn build_launch(
+    directory: PathBuf,
+    directory_environment: Option<HashMap<String, String>>,
+    proxy_environment: HashMap<String, String>,
+    settings: Option<&CustomAgentServerSettings>,
+) -> Result<CodexAcpLaunch> {
+    let (mut command, default_mode, default_config_options) = match settings {
+        None => (fallback_command(), None, HashMap::default()),
+        Some(CustomAgentServerSettings::Custom {
+            command,
+            default_mode,
+            default_config_options,
+            ..
+        }) => (
+            command.clone(),
+            default_mode.clone().map(acp::SessionModeId::new),
+            default_config_options.clone(),
+        ),
+        Some(CustomAgentServerSettings::Registry { .. }) => anyhow::bail!(
+            "Codex (ACP) is experimental and requires a custom agent_servers.codex-acp command. ACP Registry installation is not supported yet."
+        ),
+    };
+    let warning = directory_environment.is_none().then(|| {
+        "Could not load the directory environment. Using the inherited environment.".to_owned()
+    });
+    let explicit_environment = command.env.take().unwrap_or_default();
+    let mut environment = directory_environment.unwrap_or_default();
+    environment.extend(proxy_environment);
+    environment.extend(explicit_environment);
+    command.env = Some(environment);
+    Ok(CodexAcpLaunch {
+        command,
+        options: AcpLaunchOptions {
+            working_directory: Some(directory),
+            client_name: "agentium",
+            terminate_on_drop_and_quit: true,
+        },
+        default_mode,
+        default_config_options,
+        warning,
     })
 }
 
@@ -463,30 +494,26 @@ impl AgentServer for CodexAcpServer {
                     )
                 })
                 .await;
-            *warning.lock() = directory_environment.is_none().then(|| {
-                "Could not load the directory environment. Using the inherited environment."
-                    .to_owned()
-            });
-            let (mut command, mode, configs) = cx.update(|cx| launch_configuration(cx))?;
-            let explicit_environment = command.env.take().unwrap_or_default();
-            let mut environment = directory_environment.unwrap_or_default();
-            environment.extend(cx.update(agent_servers::load_proxy_env));
-            environment.extend(explicit_environment);
-            command.env = Some(environment);
-            let options = AcpLaunchOptions {
-                working_directory: Some(directory),
-                client_name: "agentium",
-                client_version: None,
-                terminate_on_drop_and_quit: true,
-            };
+            let proxy_environment = cx.update(agent_servers::load_proxy_env);
+            let launch = cx.update(|cx| {
+                cx.read_global(|store: &SettingsStore, _| {
+                    build_launch(
+                        directory,
+                        directory_environment,
+                        proxy_environment,
+                        store.get::<AllAgentServersSettings>(None).get(CODEX_ID),
+                    )
+                })
+            })?;
+            *warning.lock() = launch.warning;
             let connection = AcpConnection::stdio_with_options(
                 CODEX_ID.into(),
                 project,
-                command,
+                launch.command,
                 store,
-                mode,
-                configs,
-                options,
+                launch.default_mode,
+                launch.default_config_options,
+                launch.options,
                 cx,
             )
             .await;
@@ -505,6 +532,186 @@ mod tests {
     use fs::FakeFs;
     use gpui::{Action as _, TestAppContext, VisualTestContext};
     use workspace::{MultiWorkspace, Pane};
+
+    #[test]
+    fn codex_acp_launch_uses_each_arena_directory() {
+        for directory in [PathBuf::from("/first"), PathBuf::from("/second")] {
+            let launch = build_launch(
+                directory.clone(),
+                Some(HashMap::default()),
+                HashMap::default(),
+                None,
+            )
+            .expect("build Arena launch");
+            assert_eq!(launch.options.working_directory, Some(directory));
+            assert_eq!(launch.options.client_name, "agentium");
+            assert!(launch.options.terminate_on_drop_and_quit);
+            assert!(launch.warning.is_none());
+        }
+    }
+
+    #[test]
+    fn codex_acp_launch_prioritizes_explicit_environment() {
+        let settings = CustomAgentServerSettings::Custom {
+            command: AgentServerCommand {
+                path: "configured-codex-acp".into(),
+                args: Vec::new(),
+                env: Some(HashMap::from_iter([
+                    ("COLLISION".into(), "explicit".into()),
+                    ("EXPLICIT_ONLY".into(), "explicit".into()),
+                ])),
+            },
+            default_mode: None,
+            default_config_options: HashMap::default(),
+            favorite_config_option_values: HashMap::default(),
+        };
+        let launch = build_launch(
+            "/arena".into(),
+            Some(HashMap::from_iter([
+                ("COLLISION".into(), "directory".into()),
+                ("PROXY_COLLISION".into(), "directory".into()),
+                ("DIRECTORY_ONLY".into(), "directory".into()),
+            ])),
+            HashMap::from_iter([
+                ("COLLISION".into(), "proxy".into()),
+                ("PROXY_COLLISION".into(), "proxy".into()),
+                ("PROXY_ONLY".into(), "proxy".into()),
+            ]),
+            Some(&settings),
+        )
+        .expect("build configured launch");
+        assert_eq!(
+            launch.command.env,
+            Some(HashMap::from_iter([
+                ("COLLISION".into(), "explicit".into()),
+                ("PROXY_COLLISION".into(), "proxy".into()),
+                ("DIRECTORY_ONLY".into(), "directory".into()),
+                ("PROXY_ONLY".into(), "proxy".into()),
+                ("EXPLICIT_ONLY".into(), "explicit".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn codex_acp_launch_warns_when_directory_environment_is_unavailable() {
+        let launch = build_launch("/arena".into(), None, HashMap::default(), None)
+            .expect("build inherited-environment launch");
+        assert_eq!(launch.command.path, PathBuf::from("codex-acp"));
+        assert!(launch.command.args.is_empty());
+        assert_eq!(launch.command.env, Some(HashMap::default()));
+        assert!(
+            launch
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("inherited environment"))
+        );
+        let launch = build_launch(
+            "/arena".into(),
+            Some(HashMap::default()),
+            HashMap::default(),
+            None,
+        )
+        .expect("build empty directory environment launch");
+        assert!(launch.warning.is_none());
+    }
+
+    #[test]
+    fn codex_acp_launch_rejects_registry_configuration() {
+        let settings = CustomAgentServerSettings::Registry {
+            env: HashMap::default(),
+            default_mode: None,
+            default_config_options: HashMap::default(),
+            favorite_config_option_values: HashMap::default(),
+        };
+        let error = build_launch(
+            "/arena".into(),
+            Some(HashMap::default()),
+            HashMap::default(),
+            Some(&settings),
+        )
+        .err()
+        .expect("Registry must not be launched as a custom command");
+        assert!(
+            error
+                .to_string()
+                .contains("ACP Registry installation is not supported")
+        );
+    }
+
+    #[test]
+    fn codex_acp_launch_preserves_custom_command_arguments_and_defaults() {
+        let command = AgentServerCommand {
+            path: "/installed/codex-acp".into(),
+            args: vec!["--log-level".into(), "debug".into()],
+            env: Some(HashMap::from_iter([(
+                "CUSTOM_VALUE".into(),
+                "value with spaces $literal".into(),
+            )])),
+        };
+        let defaults = HashMap::from_iter([
+            (
+                "model".into(),
+                AgentConfigOptionValue::ValueId("configured-model".into()),
+            ),
+            ("fast-mode".into(), AgentConfigOptionValue::Boolean(true)),
+        ]);
+        let settings = CustomAgentServerSettings::Custom {
+            command: command.clone(),
+            default_mode: Some("read-only".into()),
+            default_config_options: defaults.clone(),
+            favorite_config_option_values: HashMap::default(),
+        };
+        let launch = build_launch(
+            "/arena".into(),
+            Some(HashMap::default()),
+            HashMap::default(),
+            Some(&settings),
+        )
+        .expect("build custom launch");
+        assert_eq!(launch.command, command);
+        assert_eq!(
+            launch.default_mode,
+            Some(acp::SessionModeId::new("read-only"))
+        );
+        assert_eq!(launch.default_config_options, defaults);
+    }
+
+    #[gpui::test]
+    async fn codex_acp_connect_rejects_invalid_arena_directories(cx: &mut TestAppContext) {
+        init(cx);
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/arena", serde_json::json!({"file.txt": "regular file"}))
+            .await;
+        let project = Project::test(filesystem, [], cx).await;
+        for directory in [
+            None,
+            Some(PathBuf::from("/missing")),
+            Some(PathBuf::from("/arena/file.txt")),
+        ] {
+            let server = CodexAcpServer {
+                working_directory: directory.clone(),
+                warning: Arc::new(Mutex::new(None)),
+            };
+            let error = cx
+                .update(|cx| {
+                    let delegate = AgentServerDelegate::new(
+                        project.read(cx).agent_server_store().clone(),
+                        None,
+                        None,
+                    );
+                    server.connect(delegate, project.clone(), cx)
+                })
+                .await
+                .map(|_| ())
+                .expect_err("invalid directory must fail before launching a process");
+            if let Some(directory) = directory {
+                assert!(error.to_string().contains(&directory.display().to_string()));
+            } else {
+                assert!(error.to_string().contains("no working directory"));
+            }
+        }
+    }
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -632,6 +839,24 @@ mod tests {
         let first_thread = thread(&first, cx);
         let second_thread = thread(&second, cx);
         assert_ne!(first_thread.entity_id(), second_thread.entity_id());
+        for (directory, thread) in [("/first", &first_thread), ("/second", &second_thread)] {
+            let launch = build_launch(
+                directory.into(),
+                Some(HashMap::default()),
+                HashMap::default(),
+                None,
+            )
+            .expect("build actual launch options");
+            thread.read_with(cx, |thread, _| {
+                assert_eq!(
+                    launch.options.working_directory.as_ref(),
+                    thread
+                        .work_dirs()
+                        .and_then(|directories| directories.ordered_paths().next()),
+                    "process cwd and session cwd must match",
+                );
+            });
+        }
         first_thread.read_with(cx, |thread, _| {
             assert_eq!(
                 thread.work_dirs(),

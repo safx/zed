@@ -3031,7 +3031,10 @@ impl ConversationView {
                     message.push_str("\n");
                     message.push_str(stderr);
                 };
-                if cx.try_global::<crate::AgentUiHost>().is_some() && status.code() == Some(127) {
+                if cx.try_global::<crate::AgentUiHost>().is_some()
+                    && self.agent.agent_id().as_ref() == agent_servers::CODEX_ID
+                    && status.code() == Some(127)
+                {
                     message.push_str(&format!(
                         "\nInstall @agentclientprotocol/codex-acp and make codex-acp available on PATH, or configure agent_servers.codex-acp in {} with type custom and an absolute command path.",
                         paths::settings_file().display()

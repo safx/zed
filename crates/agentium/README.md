@@ -54,6 +54,8 @@ The adapter includes a compatible Codex binary. It offers ChatGPT and API key au
 
 Review file changes in the conversation's edit cards or its review tab, which provides **Keep All** and **Reject All** controls. Editor inline review (`single_file_review`) is not provided in this first version.
 
+Approval notifications can appear while another pane has focus, even when the Codex conversation remains visible.
+
 This feature is experimental. Automatic ACP Registry installation, conversation restoration after restart, remote Arenas, and ACP support in terminal-specific CLI commands are not available yet. ACP tabs appear as `other` in `agentium tab list`. If a directory's environment cannot be loaded, the tab shows a warning and the adapter uses the inherited environment.
 
 ## Keyboard Shortcuts
