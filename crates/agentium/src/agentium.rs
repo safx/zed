@@ -1,4 +1,5 @@
 mod arena;
+pub mod codex_acp_view;
 pub mod board;
 pub mod file_browser_view;
 mod git_status_view;
@@ -93,7 +94,119 @@ pub enum PaneContentType {
     GitGraph,
 }
 
-actions!(agentium, [NewClaudeCode, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
+actions!(agentium, [NewClaudeCode, NewCodexAcp, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
+
+pub fn init_acp_host(cx: &mut App) {
+    cx.set_global(agent_ui::AgentUiHost {
+        is_conversation_visible: |conversation_id, window, cx| {
+            let Some(application) = window.root::<AgentiumApp>().flatten() else {
+                return false;
+            };
+            let application = application.read(cx);
+            application.active_arena().is_some_and(|arena| {
+                arena.read(cx).center.panes().iter().any(|pane| {
+                    pane.read(cx)
+                        .active_item()
+                        .and_then(|item| item.downcast::<codex_acp_view::CodexAcpView>())
+                        .is_some_and(|view| {
+                            view.read(cx).conversation_id() == conversation_id
+                                && view.focus_handle(cx).contains_focused(window, cx)
+                        })
+                })
+            })
+        },
+        activate_conversation: |conversation_id, window, cx| {
+            let Some(application) = window.root::<AgentiumApp>().flatten() else {
+                return;
+            };
+            application.update(cx, |application, cx| {
+                let target =
+                    application
+                        .arenas
+                        .iter()
+                        .enumerate()
+                        .find_map(|(arena_index, arena)| {
+                            arena.read(cx).center.panes().iter().find_map(|pane| {
+                                pane.read(cx)
+                                    .items_of_type::<codex_acp_view::CodexAcpView>()
+                                    .find(|view| view.read(cx).conversation_id() == conversation_id)
+                                    .map(|view| (arena_index, (*pane).clone(), view))
+                            })
+                        });
+                if let Some((arena_index, pane, view)) = target {
+                    application.switch_arena(arena_index, window, cx);
+                    let index = pane.read(cx).index_for_item(&view);
+                    pane.update(cx, |pane, cx| {
+                        if let Some(index) = index {
+                            pane.activate_item(index, true, true, window, cx);
+                        }
+                        pane.zoom_out(&ZoomOut, window, cx);
+                    });
+                    window.focus(&view.focus_handle(cx), cx);
+                }
+            });
+        },
+        spawn_terminal_login: |conversation_id, mut login, project, window, cx| {
+            let target = window
+                .root::<AgentiumApp>()
+                .flatten()
+                .and_then(|application| {
+                    application.read(cx).arenas.iter().find_map(|arena| {
+                        arena
+                            .read(cx)
+                            .center
+                            .panes()
+                            .iter()
+                            .any(|pane| {
+                                pane.read(cx)
+                                    .items_of_type::<codex_acp_view::CodexAcpView>()
+                                    .any(|view| view.read(cx).conversation_id() == conversation_id)
+                            })
+                            .then(|| arena.clone())
+                    })
+                });
+            let Some(arena) = target else {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "The Codex (ACP) tab is no longer open"
+                )));
+            };
+            login.cwd = arena.read(cx).working_directory.clone();
+            let terminal =
+                project.update(cx, |project, cx| project.create_terminal_task(login, cx));
+            let workspace = arena.read(cx).workspace.clone();
+            let arena = arena.downgrade();
+            window.spawn(cx, async move |cx| {
+                let terminal = terminal.await?;
+                arena.update_in(cx, |arena, window, cx| {
+                    let focus_login =
+                        window
+                            .root::<AgentiumApp>()
+                            .flatten()
+                            .is_some_and(|application| {
+                                application
+                                    .read(cx)
+                                    .active_arena()
+                                    .is_some_and(|active| active.entity_id() == cx.entity_id())
+                            });
+                    let view = cx.new(|cx| {
+                        TerminalView::new(
+                            terminal.clone(),
+                            workspace,
+                            None,
+                            project.downgrade(),
+                            window,
+                            cx,
+                        )
+                    });
+                    arena.active_pane.update(cx, |pane, cx| {
+                        pane.add_item(Box::new(view), true, focus_login, None, window, cx);
+                    });
+                })?;
+                Ok(terminal.downgrade())
+            })
+        },
+    });
+}
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
 #[action(namespace = agentium)]
@@ -216,7 +329,7 @@ struct RateLimits {
 #[derive(Clone)]
 struct BadgeEntryInfo {
     pane: Entity<Pane>,
-    terminal_view: Entity<TerminalView>,
+    item: Box<dyn workspace::ItemHandle>,
     primary: String,
     secondary: String,
 }
@@ -418,7 +531,7 @@ impl AgentiumApp {
         workspace_entity: Entity<Workspace>,
         project: Entity<Project>,
         app_state: Arc<AppState>,
-        env_loaded: futures::channel::oneshot::Receiver<()>,
+        env_loaded: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -3151,9 +3264,6 @@ impl AgentiumApp {
         pids: &HashSet<u32>,
         cx: &App,
     ) -> Vec<BadgeEntryInfo> {
-        if pids.is_empty() {
-            return vec![];
-        }
         let arena = arena_entity.read(cx);
         let mut infos = Vec::new();
         for pane in arena.center.panes() {
@@ -3184,12 +3294,19 @@ impl AgentiumApp {
                     });
                 infos.push(BadgeEntryInfo {
                     pane: pane.clone(),
-                    terminal_view: tv,
+                    item: Box::new(tv),
                     primary,
                     secondary,
                 });
             }
         }
+        let codex_state = match state {
+            ClaudeSessionState::Completed => codex_acp_view::CodexAcpState::Completed,
+            ClaudeSessionState::WaitingPermission => codex_acp_view::CodexAcpState::Permission,
+            ClaudeSessionState::Running => codex_acp_view::CodexAcpState::Running,
+            ClaudeSessionState::Idle => codex_acp_view::CodexAcpState::Idle,
+        };
+        infos.extend(codex_badge_entries(arena, codex_state, cx));
         infos
     }
 
@@ -3305,7 +3422,7 @@ impl AgentiumApp {
             }
             infos.push(BadgeEntryInfo {
                 pane: c.pane,
-                terminal_view: c.terminal_view,
+                item: Box::new(c.terminal_view),
                 primary: name.to_owned(),
                 secondary: format!("PID {}", c.live_pid),
             });
@@ -3326,7 +3443,7 @@ impl AgentiumApp {
         let context_menu = ContextMenu::build(window, cx, |mut menu, window, _cx| {
             for info in terminal_infos {
                 let pane = info.pane.clone();
-                let terminal_view = info.terminal_view.clone();
+                let item = info.item.clone();
                 let primary_label = if info.primary.is_empty() {
                     "(no prompt)".to_string()
                 } else {
@@ -3357,7 +3474,7 @@ impl AgentiumApp {
                             .into_any_element()
                     },
                     window.handler_for(&this, move |this, window, cx| {
-                        this.navigate_to_terminal(arena_index, &pane, &terminal_view, window, cx);
+                        this.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
                     }),
                 );
             }
@@ -3373,11 +3490,11 @@ impl AgentiumApp {
         cx.notify();
     }
 
-    fn navigate_to_terminal(
+    fn navigate_to_item(
         &mut self,
         arena_index: usize,
         target_pane: &Entity<Pane>,
-        terminal_view: &Entity<TerminalView>,
+        item: &dyn workspace::ItemHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3403,23 +3520,47 @@ impl AgentiumApp {
         window.focus(&target_pane.focus_handle(cx), cx);
         let item_index = target_pane
             .read(cx)
-            .index_for_item(terminal_view);
+            .index_for_item(item);
         if let Some(index) = item_index {
             target_pane.update(cx, |pane, cx| {
                 pane.activate_item(index, true, true, window, cx);
             });
         }
 
-        let shell_pid = terminal_view
+        if let Some(terminal_view) = item.act_as::<TerminalView>(cx) {
+            let shell_pid = terminal_view.read(cx).terminal().read(cx).pid_getter()
+                .map(|getter| getter.fallback_pid().as_u32());
+            if let Some(pid) = shell_pid { self.clear_session_for_shell_pid(pid, cx); }
+        }
+        if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
+            view.update(cx, |view, cx| view.acknowledge(cx));
+        }
+        item.item_focus_handle(cx).focus(window, cx);
+    }
+}
+
+fn codex_badge_entries(
+    arena: &Arena,
+    state: codex_acp_view::CodexAcpState,
+    cx: &App,
+) -> Vec<BadgeEntryInfo> {
+    let mut entries = Vec::new();
+    for pane in arena.center.panes() {
+        for view in pane
             .read(cx)
-            .terminal()
-            .read(cx)
-            .pid_getter()
-            .map(|g| g.fallback_pid().as_u32());
-        if let Some(pid) = shell_pid {
-            self.clear_session_for_shell_pid(pid, cx);
+            .items_of_type::<codex_acp_view::CodexAcpView>()
+        {
+            if view.read(cx).state() == state {
+                entries.push(BadgeEntryInfo {
+                    pane: pane.clone(),
+                    primary: workspace::Item::tab_content_text(view.read(cx), 0, cx).to_string(),
+                    secondary: "Codex (ACP)".to_owned(),
+                    item: Box::new(view),
+                });
+            }
         }
     }
+    entries
 }
 
 fn truncate_for_menu(s: &str) -> String {
@@ -5014,10 +5155,12 @@ impl AgentiumApp {
                                     let running_infos = self.collect_running_terminal_infos(arena_entity, cx);
                                     let ready_infos = self.collect_ready_terminal_infos(arena_entity, cx);
                                     let busy_infos = self.collect_busy_terminal_infos(arena_entity, cx);
+                                    let error_infos = codex_badge_entries(arena, codex_acp_view::CodexAcpState::Error, cx);
                                     let has_pills = !permission_infos.is_empty()
                                         || !running_infos.is_empty()
                                         || !ready_infos.is_empty()
-                                        || !busy_infos.is_empty();
+                                        || !busy_infos.is_empty()
+                                        || !error_infos.is_empty();
                                     div()
                                         .flex()
                                         .flex_row()
@@ -5113,6 +5256,31 @@ impl AgentiumApp {
                                                                 ("arena-ready-badge", arena.id),
                                                                 entries.len(),
                                                                 colors.text_accent,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!error_infos.is_empty(), |d| {
+                                                        let entries = error_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-acp-error-badge", arena.id),
+                                                                entries.len(),
+                                                                status_colors.error,
                                                                 colors.surface_background,
                                                             )
                                                             .cursor_pointer()

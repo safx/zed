@@ -693,7 +693,7 @@ impl Conversation {
     }
 }
 
-pub(crate) struct RootThreadUpdated;
+pub struct RootThreadUpdated;
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
@@ -813,6 +813,7 @@ pub struct ConversationView {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     thread_store: Option<Entity<ThreadStore>>,
+    initial_work_dirs: Option<PathList>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp_v2::SessionId>,
     server_state: ServerState,
@@ -836,6 +837,13 @@ pub struct ConversationView {
 }
 
 impl ConversationView {
+    pub fn load_error(&self) -> Option<&LoadError> {
+        match &self.server_state {
+            ServerState::LoadError { error } => Some(error),
+            _ => None,
+        }
+    }
+
     pub fn has_auth_methods(&self) -> bool {
         self.as_connected().map_or(false, |connected| {
             connected
@@ -888,7 +896,7 @@ impl ConversationView {
         })
     }
 
-    pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
+    pub fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
     }
@@ -1079,6 +1087,7 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let initial_work_dirs = work_dirs.clone();
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let code_span_resolver = AgentCodeSpanResolver::new(&project.downgrade(), cx);
         let mut subscriptions = vec![
@@ -1149,6 +1158,7 @@ impl ConversationView {
             ),
             recovery: None,
             saved_submissions: Vec::new(),
+            initial_work_dirs,
             pending_selections: Vec::new(),
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
@@ -1294,7 +1304,7 @@ impl ConversationView {
             self.connection_store.clone(),
             self.connection_key.clone(),
             resume_session_id,
-            work_dirs,
+            work_dirs.or_else(|| self.initial_work_dirs.clone()),
             title,
             self.project.clone(),
             None,
@@ -1839,7 +1849,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         // Reattachment after observation loss must not reuse the cached, closed connection.
-        if self.recovery.is_some() {
+        if self.recovery.is_some() || cx.try_global::<crate::AgentUiHost>().is_some() {
             return;
         }
         // If we're in a LoadError state OR have a thread_error set (which can happen
@@ -2419,6 +2429,7 @@ impl ConversationView {
                         let login = login_task.await?;
                         this.update_in(cx, |_this, window, cx| {
                             Self::spawn_external_agent_login(
+                                cx.entity_id(),
                                 login,
                                 workspace,
                                 project,
@@ -2651,6 +2662,7 @@ impl ConversationView {
     }
 
     fn spawn_external_agent_login(
+        conversation_id: gpui::EntityId,
         login: task::SpawnInTerminal,
         workspace: Entity<Workspace>,
         project: Entity<Project>,
@@ -2659,9 +2671,13 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+        let terminal_panel = workspace.read(cx).panel::<TerminalPanel>(cx);
+        let host_spawn = cx
+            .try_global::<crate::AgentUiHost>()
+            .map(|host| host.spawn_terminal_login);
+        if terminal_panel.is_none() && host_spawn.is_none() {
             return Task::ready(Err(anyhow!("Terminal panel is unavailable")));
-        };
+        }
 
         window.spawn(cx, async move |cx| {
             let mut task = login.clone();
@@ -2685,16 +2701,22 @@ impl ConversationView {
                 }
             }
             task.shell = task::Shell::WithArguments {
-                program: task.command.take().expect("login command should be set"),
+                program: task.command.take().context("Login command is missing")?,
                 args: std::mem::take(&mut task.args),
                 title_override: None,
             };
 
-            let terminal = terminal_panel
-                .update_in(cx, |terminal_panel, window, cx| {
-                    terminal_panel.spawn_task(&task, window, cx)
-                })?
-                .await?;
+            let terminal = if let Some(spawn) = host_spawn {
+                cx.update(|window, cx| spawn(conversation_id, task, project.clone(), window, cx))?
+                    .await?
+            } else {
+                terminal_panel
+                    .context("Terminal panel is unavailable")?
+                    .update_in(cx, |terminal_panel, window, cx| {
+                        terminal_panel.spawn_task(&task, window, cx)
+                    })?
+                    .await?
+            };
 
             let success_patterns = match method.0.as_ref() {
                 "claude-login" | GEMINI_TERMINAL_AUTH_METHOD_ID => vec![
@@ -2757,6 +2779,7 @@ impl ConversationView {
                             return cx
                                 .update(|window, cx| {
                                     Self::spawn_external_agent_login(
+                                        conversation_id,
                                         login,
                                         workspace,
                                         project.clone(),
@@ -3302,6 +3325,13 @@ impl ConversationView {
                     message.push_str("\n");
                     message.push_str(stderr);
                 };
+                if cx.try_global::<crate::AgentUiHost>().is_some() && status.code() == Some(127) {
+                    message.push_str(&format!(
+                        "\nInstall @agentclientprotocol/codex-acp and make codex-acp available on PATH, or configure agent_servers.codex-acp in {} with type custom and an absolute command path.",
+                        paths::settings_file().display()
+                    ));
+                    message.push_str("\n{\"agent_servers\":{\"codex-acp\":{\"type\":\"custom\",\"command\":\"/absolute/path/to/codex-acp\",\"args\":[],\"env\":{}}}}");
+                }
                 ("Failed to Launch", message)
             }
             LoadError::Other(msg) => ("Failed to Launch", msg.to_string()),
@@ -3445,6 +3475,10 @@ impl ConversationView {
             return false;
         }
 
+        if let Some(host) = cx.try_global::<crate::AgentUiHost>() {
+            return (host.is_conversation_visible)(cx.entity_id(), window, cx);
+        }
+
         if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
             self.is_visible(&multi_workspace, cx)
         } else {
@@ -3456,14 +3490,7 @@ impl ConversationView {
 
     #[cfg(feature = "audio")]
     fn play_notification_sound(&self, window: &Window, cx: &mut Context<Self>) {
-        let visible = window.is_window_active()
-            && if let Some(mw) = window.root::<MultiWorkspace>().flatten() {
-                self.is_visible(&mw, cx)
-            } else {
-                self.workspace
-                    .upgrade()
-                    .is_some_and(|workspace| self.is_visible_in_agent_panel(&workspace, cx))
-            };
+        let visible = self.agent_status_visible(window, cx);
         let settings = AgentSettings::get_global(cx);
         if settings.play_sound_when_agent_done.should_play(visible) {
             Audio::play_sound(Sound::AgentDone, cx);
@@ -3580,6 +3607,14 @@ impl ConversationView {
                 .push(cx.subscribe_in(&pop_up, window, {
                     move |this, _, event, window, cx| match event {
                         AgentNotificationEvent::Accepted => {
+                            if let Some(host) = cx.try_global::<crate::AgentUiHost>() {
+                                let activate = host.activate_conversation;
+                                cx.activate(true);
+                                activate(cx.entity_id(), window, cx);
+                                window.activate_window();
+                                this.dismiss_notifications(cx);
+                                return;
+                            }
                             let Some(handle) = window.window_handle().downcast::<MultiWorkspace>()
                             else {
                                 log::error!("root view should be a MultiWorkspace");
@@ -3697,7 +3732,7 @@ impl ConversationView {
         }
     }
 
-    pub(crate) fn dismiss_notifications(&mut self, cx: &mut Context<Self>) -> bool {
+    pub fn dismiss_notifications(&mut self, cx: &mut Context<Self>) -> bool {
         let had_notifications = !self.notifications.is_empty();
         for window in self.notifications.drain(..) {
             window
