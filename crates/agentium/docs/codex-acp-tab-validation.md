@@ -1,6 +1,6 @@
 # Codex ACPタブの実装・検証記録
 
-2026-10-12。実験用ブランチ `experiment/codex-acp-tabs`。計画は[Claude承認済みのRev 3](codex-acp-tab-plan.md)。コードレビュー第1回のC1・C2を修正し、再レビュー待ち。
+2026-10-12。実験用ブランチ `experiment/codex-acp-tabs`。計画は[Claude承認済みのRev 3](codex-acp-tab-plan.md)。コードレビュー第2回で必須修正0件、Claude承認済み。
 
 ## 実装
 
@@ -45,6 +45,12 @@ Claudeは初回実装コミット`37d95929a3`に対して必須修正C1・C2を�
 - I2: 未使用の`AcpLaunchOptions.client_version`を削除した。client_info.versionには従来どおりアプリのバージョンを使う。
 
 修正後に上記全テスト、Zedを含むcheck、Clippy、fmtを再実行して成功した。別Paneにフォーカスがある場合の承認通知の仕様もREADMEに記載した。手動UI検証の未実施項目は後述のとおり。
+
+## コードレビュー第2回
+
+Claudeは修正コミット`9e1e05db6b`を承認した。必須修正C1・C2とインターフェース指摘I1・I2は解決済み、残る境界契約上の問題もなしと確認した。Claude自身もCodex関連テスト12件とPaneテスト83件を実行し、すべて成功した。Agentiumスキル経由の2回のコードレビューで収束した。
+
+任意指摘として、Registry拒否の本文に設定ファイルの実パスを追加する改善案が残る。現在はCustom設定が必要であることをタブに表示し、設定ファイルのパスはREADMEに記載している。未導入のCodexに対する終了コード127の案内には実パスを表示する。
 
 workspace全体のfmtは基準コミットでも失敗する。`pane.rs`と`persistence.rs`をHEADから一時ファイルへ取り出して同じ失敗を確認したため、既存箇所の整形は含めていない。デバッグテストのリンク時には大きな`__eh_frame`についてApple linkerの警告が出るが、テストは成功する。依存する`block 0.1.6`のfuture-incompatibility通知も残る。
 
