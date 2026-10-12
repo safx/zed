@@ -42,7 +42,6 @@ use task::SpawnInTerminal;
 use thiserror::Error;
 use util::ResultExt as _;
 use util::path_list::PathList;
-use util::process::Child;
 
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
@@ -280,7 +279,7 @@ pub struct AcpConnection {
     agent_capabilities: acp::AgentCapabilities,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
-    child: Option<Child>,
+    child: RefCell<Option<transport::AcpProcess>>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -709,7 +708,32 @@ fn client_capabilities_for_agent(
         .meta(meta)
 }
 
+pub struct AcpLaunchOptions {
+    pub working_directory: Option<PathBuf>,
+    pub client_name: &'static str,
+    pub client_version: Option<String>,
+    pub terminate_on_drop_and_quit: bool,
+}
+
+impl Default for AcpLaunchOptions {
+    fn default() -> Self {
+        Self {
+            working_directory: None,
+            client_name: "zed",
+            client_version: None,
+            terminate_on_drop_and_quit: false,
+        }
+    }
+}
+
 impl AcpConnection {
+    pub fn terminate_process(&self) -> Result<()> {
+        if let Some(child) = self.child.borrow_mut().as_mut() {
+            child.terminate()?;
+        }
+        Ok(())
+    }
+
     pub fn subscribe_debug_messages(
         &self,
     ) -> (
@@ -728,6 +752,29 @@ impl AcpConnection {
         default_config_options: HashMap<String, AgentConfigOptionValue>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        Self::stdio_with_options(
+            agent_id,
+            project,
+            command,
+            agent_server_store,
+            default_mode,
+            default_config_options,
+            AcpLaunchOptions::default(),
+            cx,
+        )
+        .await
+    }
+
+    pub async fn stdio_with_options(
+        agent_id: AgentId,
+        project: Entity<Project>,
+        command: AgentServerCommand,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        default_mode: Option<acp::SessionModeId>,
+        default_config_options: HashMap<String, AgentConfigOptionValue>,
+        options: AcpLaunchOptions,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
         let original_command = command.clone();
         let transport::StdioProcess {
             mut child,
@@ -735,7 +782,7 @@ impl AcpConnection {
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
+        } = transport::spawn_stdio_with_options(&project, command, &options, cx)?;
         let sessions = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
@@ -746,6 +793,7 @@ impl AcpConnection {
             )
         });
 
+        let version = options.client_version.clone().unwrap_or(version);
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
@@ -762,8 +810,12 @@ impl AcpConnection {
             .shared();
 
         let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
-        let connection_future =
-            connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
+        let connection_future = connect_client_future(
+            options.client_name,
+            transport,
+            dispatch_tx.clone(),
+            connection_tx,
+        );
         let io_task = cx.background_spawn(async move {
             if let Err(err) = connection_future.await {
                 log::error!("ACP connection error: {err}");
@@ -776,10 +828,18 @@ impl AcpConnection {
                 .context("Failed to receive ACP connection handle")
         }
         .boxed_local();
+        let exited = child.exit_flag();
         let status_fut = child
             .status()
-            .map(|status| {
-                status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
+            .map(move |status| {
+                // A wait error can mean the child was already reaped; its PID may be reused.
+                if let Some(exited) = exited {
+                    exited.set(true);
+                }
+                status.map_err(|error| {
+                    log::error!("Failed to wait for agent server exit: {error}");
+                    anyhow!("failed to wait for agent server exit: {error}")
+                })
             })
             .boxed_local();
         let (connection, status_fut) = match futures::future::select(connection_rx, status_fut)
@@ -841,7 +901,7 @@ impl AcpConnection {
                         beta_features_enabled,
                     ))
                     .client_info(
-                        acp::Implementation::new("zed", version)
+                        acp::Implementation::new(options.client_name, version)
                             .title(release_channel.map(ToOwned::to_owned)),
                     ),
             )
@@ -969,7 +1029,7 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            child: Some(child),
+            child: RefCell::new(Some(child)),
         })
     }
 
@@ -1005,7 +1065,7 @@ impl AcpConnection {
             agent_capabilities,
             request_elicitations,
             defaults,
-            child: None,
+            child: RefCell::new(None),
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
@@ -1530,8 +1590,8 @@ fn emit_load_error_to_all_sessions(
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            child.kill().log_err();
+        if let Some(child) = self.child.get_mut().as_mut() {
+            child.terminate().log_err();
         }
     }
 }

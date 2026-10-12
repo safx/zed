@@ -755,19 +755,17 @@ pub fn open_markdown_in_workspace(
         workspace.update_in(cx, |workspace, window, cx| {
             let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.clone()));
 
-            workspace.add_item_to_active_pane(
-                Box::new(cx.new(|cx| {
-                    let mut editor =
-                        Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
-                    editor.set_breadcrumb_header(title);
-                    editor.disable_mouse_wheel_zoom();
-                    editor
-                })),
-                None,
-                true,
-                window,
-                cx,
-            );
+            let item = Box::new(cx.new(|cx| {
+                let mut editor = Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
+                editor.set_breadcrumb_header(title);
+                editor.disable_mouse_wheel_zoom();
+                editor
+            }));
+            if cx.try_global::<crate::AgentUiHost>().is_some() {
+                workspace.add_item_to_center(item, window, cx);
+            } else {
+                workspace.add_item_to_active_pane(item, None, true, window, cx);
+            }
         })?;
         anyhow::Ok(())
     })
@@ -5983,6 +5981,7 @@ impl ThreadView {
             .is_some_and(|panel| !panel.read(cx).terminal_selections(cx).is_empty());
 
         let has_selection = has_editor_selection || has_terminal_selection;
+        let embedded_host = cx.try_global::<crate::AgentUiHost>().is_some();
 
         ContextMenu::build(window, cx, move |menu, _window, _cx| {
             menu.key_context("AddContextMenu")
@@ -6018,6 +6017,7 @@ impl ThreadView {
                 )
                 .item(
                     ContextMenuEntry::new("Threads")
+                        .disabled(embedded_host)
                         .icon(IconName::Thread)
                         .icon_color(Color::Muted)
                         .icon_size(IconSize::XSmall)
@@ -6065,7 +6065,7 @@ impl ThreadView {
                         .icon(IconName::CursorIBeam)
                         .icon_color(Color::Muted)
                         .icon_size(IconSize::XSmall)
-                        .disabled(!has_selection)
+                        .disabled(!has_selection || embedded_host)
                         .handler({
                             move |window, cx| {
                                 window.dispatch_action(

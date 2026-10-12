@@ -78,8 +78,24 @@ pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
+pub use conversation_view::RootThreadUpdated;
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
+
+pub struct AgentUiHost {
+    pub is_conversation_visible: fn(gpui::EntityId, &gpui::Window, &App) -> bool,
+    pub activate_conversation: fn(gpui::EntityId, &mut gpui::Window, &mut App),
+    pub spawn_terminal_login:
+        fn(
+            gpui::EntityId,
+            task::SpawnInTerminal,
+            Entity<project::Project>,
+            &mut gpui::Window,
+            &mut App,
+        ) -> gpui::Task<anyhow::Result<gpui::WeakEntity<terminal::Terminal>>>,
+}
+
+impl gpui::Global for AgentUiHost {}
 pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;

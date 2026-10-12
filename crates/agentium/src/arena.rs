@@ -29,7 +29,7 @@ use workspace::{
 };
 
 use crate::{
-    NewBranchDiff, NewClaudeCode, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
+    NewBranchDiff, NewClaudeCode, NewCodexAcp, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
     NewProjectSearch, OpenNewItemMenu, OpenSplitMenu, PaneContentType,
     file_browser_view::FileBrowserView,
     git_status_view::GitStatusView,
@@ -82,6 +82,22 @@ pub(crate) struct Arena {
 }
 
 impl Arena {
+    fn add_codex_acp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_context(cx);
+        let view = cx.new(|cx| {
+            crate::codex_acp_view::CodexAcpView::new(
+                self.project.clone(),
+                self.workspace.clone(),
+                self.working_directory.clone(),
+                window,
+                cx,
+            )
+        });
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(view), true, true, None, window, cx);
+        });
+    }
+
     pub(crate) fn new(
         id: usize,
         name: String,
@@ -1224,6 +1240,9 @@ impl Render for Arena {
                     .on_action(cx.listener(|this, _: &NewClaudeCode, window, cx| {
                         this.add_claude_code(window, cx);
                     }))
+                    .on_action(cx.listener(|this, _: &NewCodexAcp, window, cx| {
+                        this.add_codex_acp(window, cx);
+                    }))
                     .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                         this.add_terminal(window, cx);
                     }))
@@ -1406,6 +1425,23 @@ struct AgentiumPaneDecorator<'a> {
 
 impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
+        if let Some(view) = pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<crate::codex_acp_view::CodexAcpView>())
+        {
+            use crate::codex_acp_view::CodexAcpState;
+            let border = match view.read(cx).state() {
+                CodexAcpState::Permission => Some(cx.theme().status().warning),
+                CodexAcpState::Completed => Some(cx.theme().colors().border_focused),
+                CodexAcpState::Error => Some(cx.theme().status().error),
+                _ => None,
+            };
+            return LeaderDecoration {
+                border,
+                status_box: None,
+            };
+        }
         let active_pid = pane
             .read(cx)
             .active_item()
@@ -1627,6 +1663,8 @@ pub(crate) fn new_agentium_pane(
         let project_search_bar = cx.new(|_| ProjectSearchBar::new());
         toolbar.update(cx, |toolbar, cx| {
             toolbar.add_item(project_search_bar, window, cx);
+            let agent_diff_toolbar = cx.new(agent_ui::AgentDiffToolbar::new);
+            toolbar.add_item(agent_diff_toolbar, window, cx);
         });
 
         pane
@@ -1656,6 +1694,7 @@ pub(crate) fn new_agentium_pane(
                                         menu.key_context("AgentiumNewItemMenu")
                                             .context(focus_handle.clone())
                                             .action("Claude Code", NewClaudeCode.boxed_clone())
+                                            .action("Codex (ACP)", NewCodexAcp.boxed_clone())
                                             .action("Terminal", NewTerminal::default().boxed_clone())
                                             .action("Git Status", NewGitStatus.boxed_clone())
                                             .action("Git Graph", NewGitGraph.boxed_clone())
@@ -1720,6 +1759,9 @@ pub(crate) fn new_agentium_pane(
         let acknowledged_pids = session_state.acknowledged_task_pids.clone();
         let terminal_pid_cache = session_state.terminal_pid_cache.clone();
         pane.set_render_item_indicator(move |item, cx| {
+            if let Some(view) = item.downcast::<crate::codex_acp_view::CodexAcpView>() {
+                return view.read(cx).state().indicator();
+            }
             if let Some(tv) = item.downcast::<TerminalView>() {
                 let cached = terminal_pid_cache.borrow().get(&tv.entity_id()).copied();
                 if let Some(info) = cached {

@@ -398,6 +398,7 @@ dependencies = [
  "http_client",
  "indoc",
  "language_model",
+ "libc",
  "log",
  "project",
  "release_channel",
@@ -565,6 +566,10 @@ dependencies = [
 name = "agentium"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
+ "agent-client-protocol",
+ "agent_servers",
+ "agent_ui",
  "anyhow",
  "assets",
  "buffer_diff",
@@ -573,6 +578,7 @@ dependencies = [
  "clap_complete",
  "client",
  "clock",
+ "collections",
  "db",
  "editor",
  "file_finder",
@@ -587,6 +593,7 @@ dependencies = [
  "http_client",
  "image_viewer",
  "language",
+ "language_model",
  "languages",
  "libc",
  "log",

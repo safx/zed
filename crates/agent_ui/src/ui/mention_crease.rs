@@ -335,8 +335,12 @@ fn open_skill_content_buffer(
             .update(cx, |buffer, cx| buffer.set_title(title, cx));
         editor
     });
-    let pane = workspace.active_pane().clone();
-    workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+    if cx.try_global::<crate::AgentUiHost>().is_some() {
+        workspace.add_item_to_center(Box::new(editor), window, cx);
+    } else {
+        let pane = workspace.active_pane().clone();
+        workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+    }
 }
 
 fn reveal_in_project_panel(

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::*;
 use settings::{
     ActivePaneModifiers, InactiveOpacity, KeymapFile, SettingsStore, ThemeName, ThemeSelection,
@@ -2208,12 +2208,16 @@ fn main() {
     app.run(move |cx: &mut App| {
             release_channel::init(semver::Version::new(0, 1, 0), cx);
             settings::init(cx);
+            language_model::init(cx);
+            agentium::init_acp_host(cx);
 
             // gh/bee availability checks in AgentiumApp wait for this signal:
             // Finder launches start with a minimal PATH, so probing before the
             // login shell environment lands would permanently disable those
             // integrations for the session.
             let (env_loaded_tx, env_loaded_rx) = futures::channel::oneshot::channel::<()>();
+            let env_loaded_rx = env_loaded_rx.shared();
+            cx.set_global(agentium::codex_acp_view::LoginEnvironmentReady(env_loaded_rx.clone()));
             #[cfg(unix)]
             cx.background_executor()
                 .spawn(async {

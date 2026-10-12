@@ -25,6 +25,37 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **Codex state** — Codex terminals get the same running/permission/completed indicators as Claude Code, read from the terminal title Codex sets (braille spinner while working, `Action Required` while awaiting an approval); no hooks or Codex config needed
 - **Running-command badge** — sidebar pill (theme-inverted white/black) shows the count of terminals in each arena currently running a command other than a coding agent (e.g. `cargo build`, `sleep 30`)
 
+## Experimental Codex ACP tabs
+
+Choose **Codex (ACP)** from a pane's **+** menu to open a Codex conversation in that Arena's working directory. Each tab owns its connection and session. Tabs can move between panes in the same Arena, and closing a tab terminates its adapter process group.
+
+Install the current adapter separately:
+
+```sh
+npm install -g @agentclientprotocol/codex-acp
+```
+
+With no configuration, Agentium launches `codex-acp` using the Arena's terminal environment and PATH. If needed, set an explicit command in Agentium's settings, normally `~/.config/agentium/settings.json` on macOS:
+
+```json
+{
+  "agent_servers": {
+    "codex-acp": {
+      "type": "custom",
+      "command": "/absolute/path/to/codex-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+The adapter includes a compatible Codex binary. It offers ChatGPT and API key authentication; `CODEX_API_KEY` or `OPENAI_API_KEY` can be supplied through the environment or the `env` setting. Approval and sandbox options come from the adapter's mode/config controls.
+
+Review file changes in the conversation's edit cards or its review tab, which provides **Keep All** and **Reject All** controls. Editor inline review (`single_file_review`) is not provided in this first version.
+
+This feature is experimental. Automatic ACP Registry installation, conversation restoration after restart, remote Arenas, and ACP support in terminal-specific CLI commands are not available yet. ACP tabs appear as `other` in `agentium tab list`. If a directory's environment cannot be loaded, the tab shows a warning and the adapter uses the inherited environment.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |

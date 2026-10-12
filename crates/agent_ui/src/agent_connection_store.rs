@@ -9,6 +9,7 @@ use futures::{FutureExt, future::Shared};
 use gpui::{App, AppContext, Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 use project::{AgentServerStore, AgentServersUpdated, Project};
+use util::ResultExt as _;
 use watch::Receiver;
 
 use crate::Agent;
@@ -69,16 +70,37 @@ pub struct ActiveAcpConnection {
 pub struct AgentConnectionStore {
     project: Entity<Project>,
     entries: HashMap<Agent, Entity<AgentConnectionEntry>>,
+    connection_tasks: HashMap<Agent, Vec<Task<()>>>,
+    isolated: bool,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AgentConnectionStore {
     pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_lifetime(project, false, cx)
+    }
+
+    pub fn new_isolated(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_lifetime(project, true, cx)
+    }
+
+    fn new_with_lifetime(project: Entity<Project>, isolated: bool, cx: &mut Context<Self>) -> Self {
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let subscription = cx.subscribe(&agent_server_store, Self::handle_agent_servers_updated);
+        if isolated {
+            cx.on_release(|store, cx| {
+                // Review panes can retain a thread after its conversation tab closes.
+                for connection in store.active_acp_connections(cx) {
+                    connection.connection.terminate_process().log_err();
+                }
+            })
+            .detach();
+        }
         Self {
             project,
             entries: HashMap::default(),
+            connection_tasks: HashMap::default(),
+            isolated,
             _subscriptions: vec![subscription],
         }
     }
@@ -137,6 +159,7 @@ impl AgentConnectionStore {
         }
 
         self.entries.remove(&key);
+        self.connection_tasks.remove(&key);
         self.request_connection(key, server, cx)
     }
 
@@ -161,7 +184,7 @@ impl AgentConnectionStore {
         self.entries.insert(key.clone(), entry.clone());
         cx.notify();
 
-        cx.spawn({
+        let connection_task = cx.spawn({
             let key = key.clone();
             let entry = entry.downgrade();
             async move |this, cx| match connect_task.await {
@@ -203,10 +226,9 @@ impl AgentConnectionStore {
                     .ok();
                 }
             }
-        })
-        .detach();
+        });
 
-        cx.spawn({
+        let version_task = cx.spawn({
             let key = key.clone();
             let entry = entry.downgrade();
             async move |this, cx| {
@@ -234,10 +256,10 @@ impl AgentConnectionStore {
                     break;
                 }
             }
-        })
-        .detach();
+        });
 
-        cx.spawn({
+        let status_task = cx.spawn({
+            let key = key.clone();
             let entry = entry.downgrade();
             async move |this, cx| {
                 while let Ok(status) = loading_status_rx.recv().await {
@@ -259,8 +281,16 @@ impl AgentConnectionStore {
                     .ok();
                 }
             }
-        })
-        .detach();
+        });
+
+        if self.isolated {
+            self.connection_tasks
+                .insert(key, vec![connection_task, version_task, status_task]);
+        } else {
+            connection_task.detach();
+            version_task.detach();
+            status_task.detach();
+        }
 
         entry
     }
@@ -271,6 +301,10 @@ impl AgentConnectionStore {
         _: &AgentServersUpdated,
         cx: &mut Context<Self>,
     ) {
+        if self.isolated {
+            cx.notify();
+            return;
+        }
         let store = store.read(cx);
         self.entries.retain(|key, _| match key {
             Agent::NativeAgent => true,

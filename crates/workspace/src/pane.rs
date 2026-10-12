@@ -2255,6 +2255,7 @@ impl Pane {
         if item_index < self.active_item_index {
             self.active_item_index -= 1;
         }
+        self.update_toolbar(window, cx);
 
         let mode = self.nav_history.mode();
         self.nav_history.set_mode(NavigationMode::ClosingItem);
