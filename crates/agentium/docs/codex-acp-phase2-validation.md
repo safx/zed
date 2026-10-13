@@ -1,6 +1,6 @@
 # Codex ACPタブ 第2フェーズの実装・検証記録
 
-2026-10-13。ブランチは `experiment/codex-acp-tabs`、実装前のHEADは `c8d6decbb8`。計画は[Claude承認済みRev 2](codex-acp-phase2-plan.md)。コードレビュー依頼前の記録。
+2026-10-13。ブランチは `experiment/codex-acp-tabs`、実装前のHEADは `c8d6decbb8`。計画は[Claude承認済みRev 2](codex-acp-phase2-plan.md)。実装コミット `4a47a2ebab` はコードレビューでmust-fix 0件、Claude承認済み。
 
 ## 実装
 
@@ -64,3 +64,30 @@ mise shim `/Users/mac/.local/share/mise/shims/codex-acp --version` は `@agentcl
 ## 計画との差分
 
 製品仕様の変更はない。成功時drainは設定応答の初期化後に置き、既存の設定更新順序を維持した。検証は上記自動テストとCLI引数の実操作までで、§5.1のArena作成経路の結合検証と§5.2の実アダプター・ネイティブUI操作は残っている。
+
+## コードレビューと承認
+
+2026-10-13、Claudeが実装コミット `4a47a2ebab` をレビューし、must-fix 0件で承認した。Claudeの環境でも以下のテストを再実行し、計368件すべて成功した。
+
+| コマンド | Claudeの再検証結果 |
+| --- | --- |
+| `cargo test -p agentium --lib` | 127件成功 |
+| `cargo test -p agent_servers --lib` | 58件成功 |
+| `cargo test -p agent_ui --lib conversation_view` | 183件成功 |
+
+Claudeは次の点を確認した。
+
+- 成功時drainの途中でthreadが解放されても、`close_session_and_drain` へ進む。
+- `insert_external_message` から `send` までの同期処理はAgentUiHostフックを呼ばず、CodexAcpViewのleaseと衝突しない。
+- generationはIdleから非Idleへの遷移ごとに増え、active_generationのガードは連続ターンと承認の往復でも正しく働く。
+- Quit observerは `windows.clear()` より前に走り、ローカル書き込みだけを待つ。
+- `AppVersion::global` は未設定でも `0.0.0` を返す。
+
+以下は任意の指摘であり、承認を妨げず、今回の対応は不要とされた。
+
+1. main領域のflex_colとArenaのsize_fullの組み合わせにより、警告バナー表示時にはみ出す可能性がある。実機確認事項とする。
+2. `arena_error` は次のopen成功まで残る。
+3. 新規タブでも、session_id取得後の再接続では「Restoring conversation…」と表示する。
+4. `AcpProcess::live_process_id` は非ガードのZedプロセスでNoneを返すため、名前が誤解を招く可能性がある。
+
+上記の未実施項目一覧は維持する。実機項目はユーザーが新ビルドでAgentiumを再起動して確認する予定であり、この承認記録の更新では実施していない。
