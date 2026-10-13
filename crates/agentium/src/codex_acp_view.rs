@@ -1,5 +1,6 @@
 use std::{path::PathBuf, rc::Rc, sync::Arc};
 
+use crate::codex_acp_persistence::SavedCodexTab;
 use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection, ThreadStatus};
 use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use agent_servers::{AcpConnection, AcpLaunchOptions, AgentServer, AgentServerDelegate, CODEX_ID};
@@ -28,6 +29,12 @@ use workspace::{Item, Workspace, item::ItemEvent};
 pub struct LoginEnvironmentReady(pub Shared<futures::channel::oneshot::Receiver<()>>);
 impl Global for LoginEnvironmentReady {}
 
+pub fn apply_agentium_agent_defaults(content: &mut settings::SettingsContent) {
+    let agent = content.agent.get_or_insert_with(Default::default);
+    agent.expand_edit_card = Some(false);
+    agent.expand_terminal_card = Some(false);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CodexAcpState {
     #[default]
@@ -39,6 +46,16 @@ pub(crate) enum CodexAcpState {
 }
 
 impl CodexAcpState {
+    pub(crate) fn cli_state(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Permission => "permission",
+            Self::Completed => "ready",
+            Self::Error => "error",
+        }
+    }
+
     pub(crate) fn indicator(self) -> Option<Indicator> {
         let color = match self {
             Self::Idle => return None,
@@ -52,6 +69,9 @@ impl CodexAcpState {
 }
 
 pub(crate) struct CodexAcpView {
+    saved_id: uuid::Uuid,
+    cli_title: SharedString,
+    session_id: Option<acp::SessionId>,
     conversation: Entity<ConversationView>,
     focus_handle: FocusHandle,
     _connection_store: Entity<AgentConnectionStore>,
@@ -59,6 +79,7 @@ pub(crate) struct CodexAcpView {
     warning: Arc<Mutex<Option<String>>>,
     state: CodexAcpState,
     generation: u64,
+    active_generation: Option<u64>,
     thread_id: Option<EntityId>,
     thread_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -69,6 +90,8 @@ impl CodexAcpView {
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         working_directory: Option<PathBuf>,
+        title: String,
+        saved: Option<SavedCodexTab>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -83,6 +106,8 @@ impl CodexAcpView {
             workspace,
             working_directory,
             warning,
+            title,
+            saved,
             window,
             cx,
         )
@@ -94,9 +119,14 @@ impl CodexAcpView {
         workspace: WeakEntity<Workspace>,
         working_directory: Option<PathBuf>,
         warning: Arc<Mutex<Option<String>>>,
+        title: String,
+        saved: Option<SavedCodexTab>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let session_id = saved
+            .as_ref()
+            .map(|saved| acp::SessionId::new(saved.session_id.clone()));
         let connection_store = cx.new(|cx| AgentConnectionStore::new_isolated(project.clone(), cx));
         let work_dirs = working_directory
             .as_ref()
@@ -108,7 +138,7 @@ impl CodexAcpView {
                 Agent::Custom {
                     id: CODEX_ID.into(),
                 },
-                None,
+                session_id.clone(),
                 None,
                 work_dirs,
                 None,
@@ -130,12 +160,26 @@ impl CodexAcpView {
                 if conversation.read(cx).load_error().is_some() {
                     this.state = CodexAcpState::Error;
                 }
+                if conversation.read(cx).root_thread(cx).is_none() {
+                    this.thread_id = None;
+                    this.thread_subscription = None;
+                    this.active_generation = None;
+                    if conversation.read(cx).load_error().is_none() {
+                        this.state = CodexAcpState::Idle;
+                    }
+                }
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
             }),
         ];
         let focus_handle = conversation.read(cx).focus_handle(cx);
         Self {
+            saved_id: saved
+                .as_ref()
+                .map(|saved| saved.id)
+                .unwrap_or_else(uuid::Uuid::new_v4),
+            cli_title: title.into(),
+            session_id,
             conversation,
             focus_handle,
             _connection_store: connection_store,
@@ -143,6 +187,7 @@ impl CodexAcpView {
             warning,
             state: CodexAcpState::Idle,
             generation: 0,
+            active_generation: None,
             thread_id: None,
             thread_subscription: None,
             _subscriptions: subscriptions,
@@ -157,6 +202,46 @@ impl CodexAcpView {
         self.state
     }
 
+    pub(crate) fn saved_tab(&self) -> Option<SavedCodexTab> {
+        Some(SavedCodexTab {
+            id: self.saved_id,
+            title: self.cli_title.to_string(),
+            session_id: self.session_id.as_ref()?.to_string(),
+        })
+    }
+
+    pub(crate) fn process_id(&self, cx: &App) -> Option<u32> {
+        let conversation = self.conversation.read(cx);
+        let thread = conversation.root_thread(cx)?;
+        thread
+            .read(cx)
+            .connection()
+            .clone()
+            .downcast::<AcpConnection>()?
+            .live_process_id()
+    }
+
+    pub(crate) fn send_message(
+        &mut self,
+        text: &str,
+        submit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !matches!(
+                self.state,
+                CodexAcpState::Permission | CodexAcpState::Running | CodexAcpState::Error
+            ),
+            "tab {:?} is {}; cannot accept a message",
+            self.cli_title,
+            self.state.cli_state()
+        );
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.insert_external_message(text, submit, window, cx)
+        })
+    }
+
     fn bind_thread(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.conversation.read(cx).root_thread(cx) else {
             return;
@@ -165,8 +250,10 @@ impl CodexAcpView {
             return;
         }
         self.thread_id = Some(thread.entity_id());
+        self.session_id = Some(thread.read(cx).session_id().clone());
         self.state = CodexAcpState::Idle;
         self.generation = thread.read(cx).activity_generation();
+        self.active_generation = None;
         self.thread_subscription = Some(cx.subscribe(&thread, |this, thread, event, cx| {
             this.handle_thread_event(thread, event, cx);
         }));
@@ -180,6 +267,15 @@ impl CodexAcpView {
         event: &AcpThreadEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.thread_id != Some(thread.entity_id())
+            || self
+                .conversation
+                .read(cx)
+                .root_thread(cx)
+                .is_none_or(|current| current != thread)
+        {
+            return;
+        }
         let thread = thread.read(cx);
         let generation = thread.activity_generation();
         match event {
@@ -190,18 +286,21 @@ impl CodexAcpView {
                 activity_generation,
                 stop_reason,
                 ..
-            } if *activity_generation == generation => {
+            } if *activity_generation == generation
+                && self.active_generation == Some(generation) =>
+            {
                 self.state = if thread.had_error()
                     || matches!(stop_reason, Some(acp_v2::StopReason::Refusal))
                 {
                     CodexAcpState::Error
                 } else if matches!(stop_reason, Some(acp_v2::StopReason::Cancelled)) {
                     CodexAcpState::Idle
-                } else if self.generation == generation && self.state != CodexAcpState::Idle {
+                } else if self.state != CodexAcpState::Error {
                     CodexAcpState::Completed
                 } else {
                     self.state
                 };
+                self.active_generation = None;
             }
             AcpThreadEvent::StatusChanged
             | AcpThreadEvent::ToolAuthorizationRequested(_)
@@ -212,7 +311,10 @@ impl CodexAcpView {
                     self.state = CodexAcpState::Permission;
                 } else if thread.status() == ThreadStatus::Generating {
                     self.state = CodexAcpState::Running;
-                    self.generation = generation;
+                    if generation > self.generation {
+                        self.active_generation = Some(generation);
+                        self.generation = generation;
+                    }
                 }
             }
             _ => {}
@@ -238,17 +340,19 @@ impl Item for CodexAcpView {
     fn to_item_events(event: &ItemEvent, emit: &mut dyn FnMut(ItemEvent)) {
         emit(*event);
     }
-    fn tab_content_text(&self, _: usize, cx: &App) -> SharedString {
-        self.conversation
+    fn tab_content_text(&self, _: usize, _cx: &App) -> SharedString {
+        self.cli_title.clone()
+    }
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        let title = self
+            .conversation
             .read(cx)
             .root_thread(cx)
             .and_then(|thread| thread.read(cx).title())
-            .unwrap_or_else(|| "Codex (ACP)".into())
-    }
-    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
+            .unwrap_or_else(|| "Codex (ACP)".into());
         Some(
             format!(
-                "Codex (ACP) — {}",
+                "{title} — {}",
                 self.working_directory
                     .as_ref()
                     .map(|directory| directory.display().to_string())
@@ -273,9 +377,18 @@ impl Render for CodexAcpView {
             });
         }
         let warning = self.warning.lock().clone();
+        let restoration = (self.session_id.is_some() && self.conversation.read(cx).root_thread(cx).is_none())
+            .then(|| if self.conversation.read(cx).load_error().is_some() {
+                "Could not restore the saved conversation. Retry below, or close this tab to forget it. Use + to start a new conversation."
+            } else {
+                "Restoring conversation…"
+            });
         v_flex()
             .size_full()
             .overflow_hidden()
+            .when_some(restoration, |element, text| {
+                element.child(div().p_2().text_sm().child(text))
+            })
             .when_some(warning, |element, warning| {
                 element.child(
                     div()
@@ -315,6 +428,7 @@ fn build_launch(
     directory_environment: Option<HashMap<String, String>>,
     proxy_environment: HashMap<String, String>,
     settings: Option<&CustomAgentServerSettings>,
+    version: &str,
 ) -> Result<CodexAcpLaunch> {
     let (mut command, default_mode, default_config_options) = match settings {
         None => (fallback_command(), None, HashMap::default()),
@@ -339,6 +453,8 @@ fn build_launch(
     let mut environment = directory_environment.unwrap_or_default();
     environment.extend(proxy_environment);
     environment.extend(explicit_environment);
+    environment.insert("TERM_PROGRAM".into(), "agentium".into());
+    environment.insert("TERM_PROGRAM_VERSION".into(), version.into());
     command.env = Some(environment);
     Ok(CodexAcpLaunch {
         command,
@@ -502,6 +618,7 @@ impl AgentServer for CodexAcpServer {
                         directory_environment,
                         proxy_environment,
                         store.get::<AllAgentServersSettings>(None).get(CODEX_ID),
+                        &release_channel::AppVersion::global(cx).to_string(),
                     )
                 })
             })?;
@@ -530,6 +647,7 @@ mod tests {
     use super::*;
     use agent_servers::FakeAcpAgentServer;
     use fs::FakeFs;
+    use gpui::UpdateGlobal as _;
     use gpui::{Action as _, TestAppContext, VisualTestContext};
     use workspace::{MultiWorkspace, Pane};
 
@@ -541,6 +659,7 @@ mod tests {
                 Some(HashMap::default()),
                 HashMap::default(),
                 None,
+                "0.1.0",
             )
             .expect("build Arena launch");
             assert_eq!(launch.options.working_directory, Some(directory));
@@ -559,6 +678,8 @@ mod tests {
                 env: Some(HashMap::from_iter([
                     ("COLLISION".into(), "explicit".into()),
                     ("EXPLICIT_ONLY".into(), "explicit".into()),
+                    ("TERM_PROGRAM".into(), "other-host".into()),
+                    ("TERM_PROGRAM_VERSION".into(), "old-version".into()),
                 ])),
             },
             default_mode: None,
@@ -578,6 +699,7 @@ mod tests {
                 ("PROXY_ONLY".into(), "proxy".into()),
             ]),
             Some(&settings),
+            "0.1.0",
         )
         .expect("build configured launch");
         assert_eq!(
@@ -588,17 +710,25 @@ mod tests {
                 ("DIRECTORY_ONLY".into(), "directory".into()),
                 ("PROXY_ONLY".into(), "proxy".into()),
                 ("EXPLICIT_ONLY".into(), "explicit".into()),
+                ("TERM_PROGRAM".into(), "agentium".into()),
+                ("TERM_PROGRAM_VERSION".into(), "0.1.0".into()),
             ]))
         );
     }
 
     #[test]
     fn codex_acp_launch_warns_when_directory_environment_is_unavailable() {
-        let launch = build_launch("/arena".into(), None, HashMap::default(), None)
+        let launch = build_launch("/arena".into(), None, HashMap::default(), None, "0.1.0")
             .expect("build inherited-environment launch");
         assert_eq!(launch.command.path, PathBuf::from("codex-acp"));
         assert!(launch.command.args.is_empty());
-        assert_eq!(launch.command.env, Some(HashMap::default()));
+        assert_eq!(
+            launch.command.env,
+            Some(HashMap::from_iter([
+                ("TERM_PROGRAM".into(), "agentium".into()),
+                ("TERM_PROGRAM_VERSION".into(), "0.1.0".into()),
+            ]))
+        );
         assert!(
             launch
                 .warning
@@ -610,6 +740,7 @@ mod tests {
             Some(HashMap::default()),
             HashMap::default(),
             None,
+            "0.1.0",
         )
         .expect("build empty directory environment launch");
         assert!(launch.warning.is_none());
@@ -628,6 +759,7 @@ mod tests {
             Some(HashMap::default()),
             HashMap::default(),
             Some(&settings),
+            "0.1.0",
         )
         .err()
         .expect("Registry must not be launched as a custom command");
@@ -666,9 +798,15 @@ mod tests {
             Some(HashMap::default()),
             HashMap::default(),
             Some(&settings),
+            "0.1.0",
         )
         .expect("build custom launch");
-        assert_eq!(launch.command, command);
+        assert_eq!(launch.command.path, command.path);
+        assert_eq!(launch.command.args, command.args);
+        let mut expected_environment = command.env.expect("configured environment");
+        expected_environment.insert("TERM_PROGRAM".into(), "agentium".into());
+        expected_environment.insert("TERM_PROGRAM_VERSION".into(), "0.1.0".into());
+        assert_eq!(launch.command.env, Some(expected_environment));
         assert_eq!(
             launch.default_mode,
             Some(acp::SessionModeId::new("read-only"))
@@ -751,6 +889,8 @@ mod tests {
                 workspace.downgrade(),
                 Some(directory.into()),
                 Arc::new(Mutex::new(None)),
+                "Codex ACP".into(),
+                None,
                 window,
                 cx,
             )
@@ -810,6 +950,8 @@ mod tests {
                 workspace.downgrade(),
                 Some("/arena".into()),
                 Arc::new(Mutex::new(None)),
+                "Codex ACP".into(),
+                None,
                 window,
                 cx,
             )
@@ -845,6 +987,7 @@ mod tests {
                 Some(HashMap::default()),
                 HashMap::default(),
                 None,
+                "0.1.0",
             )
             .expect("build actual launch options");
             thread.read_with(cx, |thread, _| {
@@ -1097,6 +1240,362 @@ mod tests {
         assert_eq!(
             second_log.read_with(cx, |log, cx| log.changed_buffers(cx).count()),
             0
+        );
+    }
+
+    fn tool_history(thread: &Entity<AcpThread>, cx: &mut App) -> Result<Vec<acp::SessionUpdate>> {
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                Default::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.register_terminal_created(
+                "terminal-history".into(),
+                "interrupted command".into(),
+                None,
+                None,
+                terminal,
+                cx,
+            );
+        });
+        Ok(vec![
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("edit-history", "Edit")
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::Completed)
+                    .content(vec![acp::ToolCallContent::Diff(
+                        acp::Diff::new("/arena/file.txt", "after\n").old_text("before\n"),
+                    )]),
+            ),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("command-history", "Command")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .content(vec![acp::ToolCallContent::Terminal(acp::Terminal::new(
+                        "terminal-history",
+                    ))]),
+            ),
+            serde_json::from_value(
+                serde_json::json!({"sessionUpdate": "session_info_update", "title": "Agent renamed the conversation"}),
+            )?,
+        ])
+    }
+
+    fn replay_tools(thread: &Entity<AcpThread>, cx: &mut App) -> Result<()> {
+        for update in tool_history(thread, cx)? {
+            thread.update(cx, |thread, cx| thread.handle_session_update(update, cx))?;
+        }
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn codex_acp_restores_interrupted_tools_collapsed_and_accepts_messages(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, workspace, cx) = setup(cx).await;
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_default_settings(cx, apply_agentium_agent_defaults);
+            })
+        });
+        let server = FakeAcpAgentServer::new().on_load_session(replay_tools);
+        let loads = server.load_session_count();
+        let saved = SavedCodexTab {
+            id: uuid::Uuid::new_v4(),
+            title: "Stable Codex".into(),
+            session_id: "saved-session".into(),
+        };
+        let view = cx.new_window_entity(|window, cx| {
+            CodexAcpView::with_server(
+                Rc::new(server),
+                project,
+                workspace.downgrade(),
+                Some("/arena".into()),
+                Arc::new(Mutex::new(None)),
+                saved.title.clone(),
+                Some(saved.clone()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let thread = thread(&view, cx);
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.session_id().to_string(), "saved-session");
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert_eq!(thread.entries().len(), 2);
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.state(), CodexAcpState::Idle);
+            assert_eq!(view.tab_content_text(0, cx).as_ref(), "Stable Codex");
+            assert_eq!(view.saved_tab(), Some(saved));
+            let thread_view = view
+                .conversation
+                .read(cx)
+                .root_thread_view()
+                .expect("restored thread view");
+            let state = thread_view.read(cx).entry_view_state.read(cx);
+            assert_eq!(state.expanded_tool_call_count(), 0);
+            for (index, entry) in thread.read(cx).entries().iter().enumerate() {
+                let state_entry = state.entry(index).expect("rendered tool entry");
+                for diff in entry.diffs() {
+                    assert!(state_entry.editor_for_diff(diff).is_some());
+                }
+                for terminal in entry.terminals() {
+                    assert!(state_entry.terminal(terminal).is_some());
+                }
+            }
+        });
+        view.update(cx, |view, cx| {
+            view.handle_thread_event(thread.clone(), &AcpThreadEvent::StatusChanged, cx);
+            view.handle_thread_event(
+                thread.clone(),
+                &AcpThreadEvent::Stopped {
+                    activity_generation: thread.read(cx).activity_generation(),
+                    activity_duration: None,
+                    stop_reason: Some(acp_v2::StopReason::EndTurn),
+                },
+                cx,
+            );
+            assert_eq!(view.state(), CodexAcpState::Idle);
+        });
+        view.update_in(cx, |view, window, cx| {
+            let focus = window.focused(cx);
+            let result = view.send_message("[from: Reviewer]\nContinue", true, window, cx);
+            assert_eq!(window.focused(cx), focus);
+            result
+        })
+        .expect("send after replay");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.state()),
+            CodexAcpState::Completed
+        );
+        thread.read_with(cx, |thread, _| assert!(thread.entries().len() > 2));
+    }
+
+    #[gpui::test]
+    async fn codex_acp_cli_drafts_and_busy_states_do_not_replace_input(cx: &mut TestAppContext) {
+        let (project, workspace, cx) = setup(cx).await;
+        let view = fake_tab(FakeAcpAgentServer::new(), "/arena", project, &workspace, cx);
+        cx.run_until_parked();
+        let thread = thread(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.send_message("[from: Reviewer]\nDraft", false, window, cx)
+        })
+        .expect("insert draft");
+        for state in [
+            CodexAcpState::Idle,
+            CodexAcpState::Running,
+            CodexAcpState::Permission,
+            CodexAcpState::Error,
+        ] {
+            view.update_in(cx, |view, window, cx| {
+                view.state = state;
+                assert!(view.send_message("replacement", true, window, cx).is_err());
+                let thread_view = view
+                    .conversation
+                    .read(cx)
+                    .root_thread_view()
+                    .expect("thread view");
+                assert_eq!(
+                    thread_view.read(cx).message_editor.read(cx).text(cx),
+                    "[from: Reviewer]\nDraft"
+                );
+            });
+        }
+        assert!(thread.read_with(cx, |thread, _| thread.entries().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn codex_acp_failed_restore_keeps_the_saved_id(cx: &mut TestAppContext) {
+        let (project, workspace, cx) = setup(cx).await;
+        let server =
+            FakeAcpAgentServer::new().on_load_session(|_, _| anyhow::bail!("Session disappeared"));
+        let saved = SavedCodexTab {
+            id: uuid::Uuid::new_v4(),
+            title: "Missing Codex".into(),
+            session_id: "missing".into(),
+        };
+        let view = cx.new_window_entity(|window, cx| {
+            CodexAcpView::with_server(
+                Rc::new(server),
+                project,
+                workspace.downgrade(),
+                Some("/arena".into()),
+                Arc::new(Mutex::new(None)),
+                saved.title.clone(),
+                Some(saved.clone()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.state(), CodexAcpState::Error);
+            assert_eq!(view.saved_tab(), Some(saved));
+            assert!(view.conversation.read(cx).load_error().is_some());
+            assert!(view.send_message("hello", true, window, cx).is_err());
+        });
+    }
+
+    #[gpui::test]
+    async fn codex_acp_new_tool_cards_respect_defaults_and_user_settings(cx: &mut TestAppContext) {
+        let (project, workspace, cx) = setup(cx).await;
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_default_settings(cx, apply_agentium_agent_defaults);
+                store.set_user_settings("{}", cx).expect("reload settings");
+            })
+        });
+        for (user_settings, expanded) in [
+            ("{}", 0),
+            (
+                r#"{"agent":{"expand_edit_card":true,"expand_terminal_card":true}}"#,
+                2,
+            ),
+        ] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store
+                        .set_user_settings(user_settings, cx)
+                        .expect("user expansion preferences");
+                })
+            });
+            let view = fake_tab(
+                FakeAcpAgentServer::new(),
+                "/arena",
+                project.clone(),
+                &workspace,
+                cx,
+            );
+            cx.run_until_parked();
+            let thread = thread(&view, cx);
+            let updates = cx
+                .update(|_, cx| tool_history(&thread, cx))
+                .expect("tool history");
+            for update in updates {
+                thread
+                    .update(cx, |thread, cx| thread.handle_session_update(update, cx))
+                    .expect("new tool event");
+                cx.run_until_parked();
+            }
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                let thread_view = view
+                    .conversation
+                    .read(cx)
+                    .root_thread_view()
+                    .expect("thread view");
+                assert_eq!(
+                    thread_view
+                        .read(cx)
+                        .entry_view_state
+                        .read(cx)
+                        .expanded_tool_call_count(),
+                    expanded
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn codex_acp_arena_membership_preserves_moves_and_forgets_closed_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, workspace, cx) = setup(cx).await;
+        let directory = tempfile::tempdir().expect("persistence directory");
+        let store = cx.new(|_| {
+            crate::codex_acp_persistence::CodexAcpPersistence::new(
+                directory.path().join("tabs.json"),
+            )
+        });
+        let arena = cx.new_window_entity(|window, cx| {
+            crate::arena::Arena::new(
+                1,
+                "Test".into(),
+                workspace.downgrade(),
+                project.clone(),
+                Some("/arena".into()),
+                crate::SharedSessionState::new(),
+                window,
+                cx,
+            )
+        });
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&arena, {
+                let store = store.clone();
+                move |arena, event: &crate::arena::ArenaEvent, cx| {
+                    if matches!(event, crate::arena::ArenaEvent::CodexTabsChanged) {
+                        let tabs = arena.read(cx).codex_tabs(cx);
+                        store.update(cx, |store, cx| store.replace("/arena".into(), tabs, cx));
+                    }
+                }
+            })
+        });
+        let view = fake_tab(
+            FakeAcpAgentServer::new(),
+            "/arena",
+            project.clone(),
+            &workspace,
+            cx,
+        );
+        let first_pane = arena.read_with(cx, |arena, _| arena.active_pane.clone());
+        first_pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(view.clone()), true, false, None, window, cx)
+        });
+        cx.run_until_parked();
+        let saved = view
+            .read_with(cx, |view, _| view.saved_tab())
+            .expect("session ID");
+        assert_eq!(
+            store.read_with(cx, |store, _| store.tabs(std::path::Path::new("/arena"))),
+            vec![saved.clone()]
+        );
+        let second_pane = arena.update_in(cx, |_, window, cx| {
+            crate::arena::new_agentium_pane(
+                workspace.downgrade(),
+                project,
+                crate::SharedSessionState::new(),
+                window,
+                cx,
+            )
+        });
+        arena.update(cx, |arena, cx| {
+            arena.center.split(
+                &first_pane,
+                &second_pane,
+                workspace::SplitDirection::Right,
+                cx,
+            )
+        });
+        first_pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(view.entity_id(), false, false, window, cx)
+        });
+        second_pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(view.clone()), true, false, None, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            store.read_with(cx, |store, _| store.tabs(std::path::Path::new("/arena"))),
+            vec![saved]
+        );
+        second_pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(view.entity_id(), false, false, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            store
+                .read_with(cx, |store, _| store.tabs(std::path::Path::new("/arena")))
+                .is_empty()
         );
     }
 

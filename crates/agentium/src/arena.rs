@@ -29,6 +29,8 @@ use workspace::{
 };
 
 use crate::{
+    codex_acp_persistence::{SavedCodexTab, validate_title},
+    codex_acp_view::CodexAcpView,
     NewBranchDiff, NewClaudeCode, NewCodexAcp, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
     NewProjectSearch, OpenNewItemMenu, OpenSplitMenu, PaneContentType,
     file_browser_view::FileBrowserView,
@@ -38,6 +40,7 @@ use crate::{
 };
 
 pub(crate) enum ArenaEvent {
+    CodexTabsChanged,
     TerminalKeyInput { shell_pid: u32 },
     /// The agent state read from the terminal title changed.
     TerminalTitleState { shell_pid: u32, state: TitleState },
@@ -79,16 +82,59 @@ pub(crate) struct Arena {
     pub(crate) project: Entity<Project>,
     pub(crate) session_state: crate::SharedSessionState,
     terminal_title_watches: HashMap<EntityId, TitleWatch>,
+    codex_tab_subscriptions: HashMap<EntityId, Subscription>,
+}
+
+fn codex_tab_title(title: Option<String>, titles: &HashSet<String>) -> anyhow::Result<String> {
+    if let Some(title) = title {
+        validate_title(&title)?;
+        anyhow::ensure!(
+            !titles.contains(&title),
+            "A tab titled {title:?} already exists"
+        );
+        return Ok(title);
+    }
+    let mut title = "Codex ACP".to_owned();
+    let mut number = 2;
+    while titles.contains(&title) {
+        title = format!("Codex ACP {number}");
+        number += 1;
+    }
+    Ok(title)
 }
 
 impl Arena {
-    fn add_codex_acp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_codex_acp(
+        &mut self,
+        title: Option<String>,
+        saved: Option<SavedCodexTab>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let titles: HashSet<String> = self
+            .center
+            .panes()
+            .iter()
+            .flat_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .map(|item| item.tab_content_text(0, cx).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let title = if let Some(saved) = &saved {
+            saved.title.clone()
+        } else {
+            codex_tab_title(title, &titles)?
+        };
         self.activate_context(cx);
         let view = cx.new(|cx| {
             crate::codex_acp_view::CodexAcpView::new(
                 self.project.clone(),
                 self.workspace.clone(),
                 self.working_directory.clone(),
+                title,
+                saved,
                 window,
                 cx,
             )
@@ -96,6 +142,43 @@ impl Arena {
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
         });
+        Ok(())
+    }
+
+    pub(crate) fn codex_tabs(&self, cx: &App) -> Vec<SavedCodexTab> {
+        self.center
+            .panes()
+            .iter()
+            .flat_map(|pane| {
+                pane.read(cx)
+                    .items_of_type::<CodexAcpView>()
+                    .filter_map(|view| view.read(cx).saved_tab())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn observe_codex_tabs(&mut self, cx: &mut Context<Self>) {
+        let views: Vec<_> = self
+            .center
+            .panes()
+            .iter()
+            .flat_map(|pane| {
+                pane.read(cx)
+                    .items_of_type::<CodexAcpView>()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        self.codex_tab_subscriptions
+            .retain(|id, _| views.iter().any(|view| view.entity_id() == *id));
+        for view in views {
+            self.codex_tab_subscriptions
+                .entry(view.entity_id())
+                .or_insert_with(|| {
+                    cx.observe(&view, |_, _, cx| cx.emit(ArenaEvent::CodexTabsChanged))
+                });
+        }
+        cx.emit(ArenaEvent::CodexTabsChanged);
     }
 
     pub(crate) fn new(
@@ -153,6 +236,7 @@ impl Arena {
             project,
             session_state,
             terminal_title_watches: HashMap::new(),
+            codex_tab_subscriptions: HashMap::new(),
         }
     }
 
@@ -429,8 +513,15 @@ impl Arena {
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> anyhow::Result<()> {
         match content_type {
+            PaneContentType::CodexAcp => {
+                anyhow::ensure!(
+                    command.is_empty(),
+                    "ACP tabs do not accept a terminal command"
+                );
+                self.add_codex_acp(title, None, window, cx)?;
+            }
             PaneContentType::Terminal => {
                 let terminal_task = if command.is_empty() {
                     self.project.update(cx, |project, cx| {
@@ -493,6 +584,7 @@ impl Arena {
                 self.add_git_graph(window, cx);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn split_active_pane(
@@ -505,6 +597,9 @@ impl Arena {
         cx: &mut Context<Self>,
     ) {
         match content_type {
+            PaneContentType::CodexAcp => {
+                log::error!("Codex ACP tabs do not support pane split");
+            }
             PaneContentType::Terminal => {
                 self.split_with_terminal(direction, keep_focus, command, window, cx);
             }
@@ -861,6 +956,12 @@ impl Arena {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(
+            event,
+            pane::Event::AddItem { .. } | pane::Event::RemovedItem { .. }
+        ) {
+            cx.defer_in(window, |this, _, cx| this.observe_codex_tabs(cx));
+        }
         match event {
             pane::Event::Remove { focus_on_pane } => {
                 let pane_count = self.center.panes().len();
@@ -1241,7 +1342,7 @@ impl Render for Arena {
                         this.add_claude_code(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &NewCodexAcp, window, cx| {
-                        this.add_codex_acp(window, cx);
+                        this.add_codex_acp(None, None, window, cx).log_err();
                     }))
                     .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                         this.add_terminal(window, cx);
@@ -1818,6 +1919,21 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{TitleState, classify_title};
+
+    #[test]
+    fn codex_names_are_unique_and_validated() -> anyhow::Result<()> {
+        let titles =
+            std::collections::HashSet::from_iter(["Codex ACP".to_owned(), "Codex ACP 2".to_owned()]);
+        assert_eq!(super::codex_tab_title(None, &titles)?, "Codex ACP 3");
+        assert_eq!(
+            super::codex_tab_title(Some("Reviewer".into()), &titles)?,
+            "Reviewer"
+        );
+        for title in ["Codex ACP", "", " ", "bad\nname"] {
+            assert!(super::codex_tab_title(Some(title.into()), &titles).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn classify_title_reads_claude_and_codex_titles() {
