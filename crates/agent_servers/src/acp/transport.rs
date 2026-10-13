@@ -43,6 +43,13 @@ pub(super) struct AcpProcess {
 }
 
 impl AcpProcess {
+    pub fn live_process_id(&self) -> Option<u32> {
+        self.exited
+            .as_ref()
+            .filter(|exited| !exited.get())
+            .map(|_| self.child.id())
+    }
+
     fn new(child: Child, guarded: bool, cx: &mut AsyncApp) -> Self {
         let exited = guarded.then(|| Rc::new(Cell::new(false)));
         let mut process = Self {
@@ -306,6 +313,7 @@ mod tests {
     #[gpui::test]
     async fn guarded_quit_terminates_even_with_a_live_owner(cx: &mut TestAppContext) {
         let (mut process, _directory) = guarded_process(cx).await;
+        assert_eq!(process.child.live_process_id(), Some(process.child.id()));
         assert_eq!(
             process
                 .incoming
@@ -326,6 +334,7 @@ mod tests {
         cx.update(|cx| cx.shutdown());
         assert!(!status.await.expect("wait for quit termination").success());
         assert!(process.child.exit_flag().expect("guarded flag").get());
+        assert_eq!(process.child.live_process_id(), None);
         assert!(process.incoming.next().await.is_none());
     }
 

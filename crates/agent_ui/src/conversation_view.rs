@@ -803,6 +803,52 @@ pub struct ConversationView {
 }
 
 impl ConversationView {
+    pub fn insert_external_message(
+        &mut self,
+        text: &str,
+        submit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let connected = self
+            .as_connected()
+            .context("The conversation is connecting or restoring")?;
+        anyhow::ensure!(
+            connected.auth_state.is_ok(),
+            "The conversation requires authentication"
+        );
+        anyhow::ensure!(
+            !connected
+                .conversation
+                .read(cx)
+                .threads
+                .values()
+                .any(|thread| thread.read(cx).is_waiting_for_confirmation()),
+            "The conversation is waiting for a permission answer; ask the user instead"
+        );
+        anyhow::ensure!(
+            !connected
+                .connection
+                .request_elicitations()
+                .is_some_and(|store| store.read(cx).elicitations().iter().any(
+                    |elicitation| matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                )),
+            "The conversation is waiting for an answer; ask the user instead"
+        );
+        let thread_view = self
+            .root_thread_view()
+            .context("The conversation has no root thread")?;
+        thread_view.read(cx).check_external_message(cx)?;
+        thread_view.update(cx, |view, cx| {
+            view.message_editor
+                .update(cx, |editor, cx| editor.insert_text(text, window, cx));
+            if submit {
+                view.send(window, cx);
+            }
+        });
+        Ok(())
+    }
+
     pub fn load_error(&self) -> Option<&LoadError> {
         match &self.server_state {
             ServerState::LoadError { error } => Some(error),
@@ -4045,6 +4091,95 @@ pub(crate) mod tests {
 
     use super::*;
 
+    #[gpui::test]
+    async fn test_external_message_rejects_loading_queue_and_child_permission(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (view, cx) = setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let root_view = active_thread(&view, cx);
+        let root = root_view.read_with(cx, |view, _| view.thread.clone());
+        let editor = root_view.read_with(cx, |view, _| view.message_editor.clone());
+
+        root_view.update(cx, |view, _| view.is_loading_contents = true);
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.insert_external_message("blocked", true, window, cx)
+                    .is_err()
+            );
+        });
+        assert!(
+            editor
+                .read_with(cx, |editor, cx| editor.text(cx))
+                .is_empty()
+        );
+        root_view.update(cx, |view, _| view.is_loading_contents = false);
+
+        let child = view.update(cx, |view, cx| {
+            let child = create_test_acp_thread(
+                Some(root.read(cx).session_id().clone()),
+                "external-message-child",
+                Rc::new(StubAgentConnection::new()),
+                view.project.clone(),
+                cx,
+            );
+            view.as_connected()
+                .expect("connected")
+                .conversation
+                .update(cx, |conversation, cx| {
+                    conversation.register_thread(child.clone(), cx);
+                });
+            child
+        });
+        let request = generic_permission_prompt(&child, None, cx);
+        let (request_id, _response) = request_test_generic_permission(&child, request, cx);
+        view.update_in(cx, |view, window, cx| {
+            let error = view
+                .insert_external_message("blocked", true, window, cx)
+                .expect_err("child permission");
+            assert!(error.to_string().contains("permission"));
+            assert!(child.read(cx).permission_request(request_id).is_some());
+        });
+        assert!(
+            editor
+                .read_with(cx, |editor, cx| editor.text(cx))
+                .is_empty()
+        );
+        view.read_with(cx, |view, _| {
+            view.as_connected().expect("connected").conversation.clone()
+        })
+        .update(cx, |conversation, cx| {
+            conversation.threads.remove(child.read(cx).session_id());
+        });
+
+        root_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                    "queued",
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        view.update_in(cx, |view, window, cx| {
+            let error = view
+                .insert_external_message("blocked", true, window, cx)
+                .expect_err("queued message");
+            assert!(error.to_string().contains("pending message"));
+        });
+        assert!(
+            editor
+                .read_with(cx, |editor, cx| editor.text(cx))
+                .is_empty()
+        );
+        assert!(root.read_with(cx, |thread, _| thread.entries().is_empty()));
+        assert_eq!(
+            root_view.read_with(cx, |view, _| view.message_queue.len()),
+            1
+        );
+    }
+
     #[test]
     fn test_data_retention_error_maps_from_provider_error() {
         // The agent wraps the provider error in a fresh `anyhow::Error`, so
@@ -4167,6 +4302,15 @@ pub(crate) mod tests {
             );
         });
 
+        conversation_view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.insert_external_message("cannot answer an elicitation", true, window, cx)
+                    .is_err()
+            );
+            if let Some(thread) = view.root_thread_view() {
+                assert!(thread.read(cx).message_editor.read(cx).text(cx).is_empty());
+            }
+        });
         assert_eq!(*response.lock(), None);
         let weak_view = conversation_view.downgrade();
         drop(conversation_view);

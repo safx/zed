@@ -117,7 +117,7 @@ enum TabAction {
     New {
         #[arg(long, default_value = "terminal")]
         r#type: PaneContentType,
-        /// Override the tab title (only applied for --type terminal with a command)
+        /// Set the ACP tab name or override a terminal command title
         #[arg(long)]
         title: Option<String>,
         /// Arena worktree to add the tab to; defaults to the arena this command runs in
@@ -127,7 +127,7 @@ enum TabAction {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Paste text into the terminal tab whose title matches; fails unless exactly one tab matches
+    /// Insert text into a terminal or ACP tab; fails unless exactly one title matches
     #[command(alias = "sendMessage")]
     SendMessage {
         /// Tab title to match exactly (errors on zero or multiple matches)
@@ -137,7 +137,7 @@ enum TabAction {
         /// (by process ancestry, then by current directory)
         #[arg(long)]
         arena: Option<PathBuf>,
-        /// Press Enter after pasting
+        /// Submit after inserting the message
         #[arg(long)]
         submit: bool,
         /// Sender title for the `[from: ...]` line when the tab this command runs
@@ -160,7 +160,7 @@ enum TabAction {
         #[arg(long, short = 'n', default_value_t = 200)]
         lines: usize,
     },
-    /// Print the title of the terminal tab this command runs in
+    /// Print the title of the terminal or ACP tab this command runs in
     #[command(name = "self")]
     SelfTab {
         #[arg(long)]
@@ -178,6 +178,7 @@ enum TabAction {
 
 #[derive(clap::ValueEnum, Clone)]
 enum PaneContentType {
+    CodexAcp,
     Terminal,
     Diff,
     BranchDiff,
@@ -653,6 +654,7 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
             command,
         } => {
             let content_type_str = match r#type {
+                PaneContentType::CodexAcp => "codex-acp",
                 PaneContentType::Terminal => "terminal",
                 PaneContentType::Diff => "diff",
                 PaneContentType::BranchDiff => "branch-diff",
@@ -1308,6 +1310,45 @@ mod peer_pid_tests {
 }
 
 #[cfg(test)]
+mod codex_acp_cli_tests {
+    use super::{Args, Command, PaneContentType, TabAction, parse_content_type};
+    use clap::Parser as _;
+
+    #[test]
+    fn codex_acp_type_survives_clap_and_ipc_parsing() {
+        let args = Args::try_parse_from([
+            "agentium",
+            "tab",
+            "new",
+            "--type",
+            "codex-acp",
+            "--title",
+            "Reviewer",
+        ])
+        .expect("ACP CLI arguments");
+        let Some(Command::Tab {
+            action:
+                TabAction::New {
+                    r#type,
+                    title,
+                    command,
+                    ..
+                },
+        }) = args.command
+        else {
+            panic!("expected tab new");
+        };
+        assert!(matches!(r#type, PaneContentType::CodexAcp));
+        assert_eq!(title.as_deref(), Some("Reviewer"));
+        assert!(command.is_empty());
+        assert!(matches!(
+            parse_content_type(Some("codex-acp")),
+            Some(agentium::PaneContentType::CodexAcp)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod task_action_tests {
     use agentium::board::BoardTask;
     use std::path::PathBuf;
@@ -1598,6 +1639,7 @@ fn cli_connection_reply(
 
 fn parse_content_type(value: Option<&str>) -> Option<agentium::PaneContentType> {
     Some(match value? {
+        "codex-acp" => agentium::PaneContentType::CodexAcp,
         "terminal" => agentium::PaneContentType::Terminal,
         "diff" => agentium::PaneContentType::Diff,
         "branch-diff" => agentium::PaneContentType::BranchDiff,
@@ -1674,7 +1716,7 @@ fn handle_cli_request(
                 _ => None,
             };
             let from = agentium::sender_label(verified.as_deref(), claimed);
-            app.handle_tab_send_message(title, &selector, submit, &from, text, cx)
+            app.handle_tab_send_message(title, &selector, submit, &from, text, window, cx)
                 .map(|()| serde_json::json!({ "ok": true, "warning": warning }))
         }
         Some("tab_log") => {
@@ -2081,7 +2123,12 @@ fn main() {
                     (direction, r#type, keep_focus, command)
                 }
             };
+            if matches!(content_type, PaneContentType::CodexAcp) {
+                eprintln!("error: Codex ACP tabs do not support pane split");
+                std::process::exit(1);
+            }
             let content_type_str = match content_type {
+                PaneContentType::CodexAcp => "codex-acp",
                 PaneContentType::Terminal => "terminal",
                 PaneContentType::Diff => "diff",
                 PaneContentType::BranchDiff => "branch-diff",
@@ -2340,6 +2387,7 @@ fn main() {
                     let theme_name_for_defaults = theme_name.clone();
                     SettingsStore::update_global(cx, |store, cx| {
                         store.update_default_settings(cx, |content| {
+                            agentium::codex_acp_view::apply_agentium_agent_defaults(content);
                             let modifiers = content
                                 .workspace
                                 .active_pane_modifiers
@@ -2480,13 +2528,6 @@ fn main() {
                                     project::LocalProjectFlags::default(),
                                     cx,
                                 );
-                                if let Some(ref path) = worktree_path {
-                                    project
-                                        .update(cx, |project, cx| {
-                                            project.find_or_create_worktree(path, true, cx)
-                                        })
-                                        .detach_and_log_err(cx);
-                                }
                                 let workspace_entity = cx.new(|cx| {
                                     workspace::Workspace::new(
                                         None,
@@ -2517,6 +2558,13 @@ fn main() {
                     cx.activate(true);
 
                     if let Some(window_handle) = window_handle {
+                        if let Some(path) = worktree_path {
+                            window_handle
+                                .update(cx, |app, window, cx| {
+                                    app.add_arena_with_path(path, window, cx);
+                                })
+                                .log_err();
+                        }
                         let (msg_sender, mut msg_receiver) =
                             futures::channel::mpsc::unbounded::<IpcMessage>();
 

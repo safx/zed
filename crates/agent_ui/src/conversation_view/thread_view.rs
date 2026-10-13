@@ -1734,6 +1734,26 @@ impl ThreadView {
         }
     }
 
+    pub(super) fn check_external_message(&self, cx: &App) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.thread.read(cx).status() == ThreadStatus::Idle,
+            "The conversation is running"
+        );
+        anyhow::ensure!(
+            !self.is_loading_contents && !self.has_queued_messages(),
+            "The conversation has a pending message"
+        );
+        anyhow::ensure!(
+            self.editing_message.is_none() && !self.message_editor.read(cx).has_draft(cx),
+            "The conversation has an unsent draft"
+        );
+        anyhow::ensure!(
+            self.thread_error.is_none(),
+            "The conversation has an error; resolve it before sending"
+        );
+        Ok(())
+    }
+
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = &self.thread;
 

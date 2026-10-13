@@ -620,6 +620,7 @@ dependencies = [
  "smol",
  "sysinfo 0.39.6",
  "task",
+ "tempfile",
  "terminal",
  "terminal_view",
  "theme",

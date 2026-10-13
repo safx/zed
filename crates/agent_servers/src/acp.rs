@@ -725,6 +725,10 @@ impl Default for AcpLaunchOptions {
 }
 
 impl AcpConnection {
+    pub fn live_process_id(&self) -> Option<u32> {
+        self.child.borrow().as_ref()?.live_process_id()
+    }
+
     pub fn terminate_process(&self) -> Result<()> {
         if let Some(child) = self.child.borrow_mut().as_mut() {
             child.terminate()?;
@@ -1274,28 +1278,27 @@ impl AcpConnection {
                         return Ok(());
                     }
 
-                    let response =
-                        rpc_call(connection.clone(), session_id.clone(), directories).await;
-                    if response.is_err() {
-                        // Do not let replay from a failed load reach its replacement.
-                        drain_foreground_queue(&dispatch_tx).await.log_err();
-                    }
-                    let Some(connection_state) = this.upgrade() else {
-                        return Ok(());
-                    };
-                    let (modes, config_options) = match response
-                        .and_then(|response| config_state(response.modes, response.config_options))
-                    {
+                    let response = rpc_call(connection.clone(), session_id.clone(), directories)
+                        .await
+                        .and_then(|response| config_state(response.modes, response.config_options));
+                    let (modes, config_options) = match response {
                         Ok(state) => state,
                         Err(error) => {
-                            connection_state.remove_session(&session_id, thread.entity_id());
-                            connection_state
-                                .remove_pending_session(&session_id, thread.entity_id());
+                            // Failed replay must finish before a replacement uses the same ID.
+                            drain_foreground_queue(&dispatch_tx).await.log_err();
+                            if let Some(connection_state) = this.upgrade() {
+                                connection_state.remove_session(&session_id, thread.entity_id());
+                                connection_state
+                                    .remove_pending_session(&session_id, thread.entity_id());
+                            }
                             return Err(Arc::new(error));
                         }
                     };
+                    let Some(connection_state) = this.upgrade() else {
+                        return Ok(());
+                    };
 
-                    if let Some(_thread) = thread.upgrade() {
+                    if thread.is_upgradable() {
                         {
                             let mut sessions = connection_state.sessions.borrow_mut();
                             let Some(session) = sessions
@@ -1318,11 +1321,28 @@ impl AcpConnection {
                                 cx,
                             );
                         }
-                        connection_state.remove_pending_session(&session_id, thread.entity_id());
+                    }
+                    drop(connection_state);
+
+                    // Initialize response config before queued updates can override it, and
+                    // finish replay before callers create views and subscribe to live events.
+                    let drained = drain_foreground_queue(&dispatch_tx).await;
+                    if let Some(connection_state) = this.upgrade() {
+                        if let Err(error) = drained {
+                            connection_state.remove_session(&session_id, thread.entity_id());
+                            connection_state
+                                .remove_pending_session(&session_id, thread.entity_id());
+                            return Err(Arc::new(error));
+                        }
+                        if thread.is_upgradable() {
+                            connection_state
+                                .remove_pending_session(&session_id, thread.entity_id());
+                            return Ok(());
+                        }
+                    } else {
                         return Ok(());
                     }
 
-                    drop(connection_state);
                     let result = close_session_and_drain(
                         &connection,
                         session_id.clone(),
@@ -2081,8 +2101,12 @@ pub mod test_support {
 
     use super::*;
 
+    type FakeLoadSessionHandler =
+        Arc<dyn Fn(&Entity<AcpThread>, &mut App) -> Result<()> + Send + Sync>;
+
     #[derive(Clone, Default)]
     pub struct FakeAcpAgentServer {
+        load_session_handler: Option<FakeLoadSessionHandler>,
         load_session_count: Arc<AtomicUsize>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
@@ -2095,6 +2119,14 @@ pub mod test_support {
     }
 
     impl FakeAcpAgentServer {
+        pub fn on_load_session(
+            mut self,
+            handler: impl Fn(&Entity<AcpThread>, &mut App) -> Result<()> + Send + Sync + 'static,
+        ) -> Self {
+            self.load_session_handler = Some(Arc::new(handler));
+            self
+        }
+
         pub fn new() -> Self {
             Self::default()
         }
@@ -2163,6 +2195,7 @@ pub mod test_support {
             let auth_elicitation_response = self.auth_elicitation_response.clone();
             let auth_elicitation_completion = self.auth_elicitation_completion.clone();
             let exit_status_sender = self.exit_status_sender.clone();
+            let load_session_handler = self.load_session_handler.clone();
             cx.spawn(async move |cx| {
                 let harness = build_fake_acp_connection(
                     project,
@@ -2194,6 +2227,7 @@ pub mod test_support {
                     Ok(())
                 });
                 Ok(Rc::new(FakeAcpAgentConnection {
+                    load_session_handler,
                     inner: harness.connection,
                     _keep_agent_alive: harness.keep_agent_alive,
                     _simulate_exit_task: simulate_exit_task,
@@ -2216,6 +2250,7 @@ pub mod test_support {
     }
 
     struct FakeAcpAgentConnection {
+        load_session_handler: Option<FakeLoadSessionHandler>,
         inner: Rc<AcpConnection>,
         _keep_agent_alive: Task<anyhow::Result<()>>,
         _simulate_exit_task: Task<anyhow::Result<()>>,
@@ -2255,9 +2290,17 @@ pub mod test_support {
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
-            self.inner
+            let load = self
+                .inner
                 .clone()
-                .load_session(session_id, project, work_dirs, title, cx)
+                .load_session(session_id, project, work_dirs, title, cx);
+            cx.spawn(async move |cx| {
+                let thread = load.await?;
+                if let Some(handler) = &self.load_session_handler {
+                    cx.update(|cx| handler(&thread, cx))?;
+                }
+                Ok(thread)
+            })
         }
 
         fn supports_resume_session(&self) -> bool {
@@ -5239,7 +5282,6 @@ exit 7
             })
             .await
             .expect("load_session failed");
-        cx.run_until_parked();
 
         let entries = thread.read_with(cx, |thread, _| {
             thread

@@ -78,6 +78,11 @@ impl EntryViewState {
         self.expanded_tool_calls.contains(tool_call_id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn expanded_tool_call_count(&self) -> usize {
+        self.expanded_tool_calls.len()
+    }
+
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
         self.is_tool_call_expanded(&tool_call.id) || tool_call.authorization_id().is_some()
     }

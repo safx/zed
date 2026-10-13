@@ -735,6 +735,10 @@ impl MessageEditor {
         self.editor.read(cx).text(cx).trim().is_empty()
     }
 
+    pub(crate) fn has_draft(&self, cx: &App) -> bool {
+        !self.editor.read(cx).text(cx).is_empty() || !self.mention_set.read(cx).is_empty()
+    }
+
     pub fn is_completions_menu_visible(&self, cx: &App) -> bool {
         self.editor
             .read(cx)

@@ -1,4 +1,5 @@
 mod arena;
+mod codex_acp_persistence;
 pub mod codex_acp_view;
 pub mod board;
 pub mod file_browser_view;
@@ -85,6 +86,7 @@ pub struct TaskInfoReply {
 }
 
 pub enum PaneContentType {
+    CodexAcp,
     Terminal,
     Diff,
     BranchDiff,
@@ -452,6 +454,10 @@ struct BoardCache {
 }
 
 pub struct AgentiumApp {
+    codex_tabs: Entity<codex_acp_persistence::CodexAcpPersistence>,
+    _codex_tabs_subscription: Subscription,
+    _codex_quit_subscription: Subscription,
+    arena_error: Option<String>,
     arenas: Vec<Entity<Arena>>,
     active_arena_index: Option<usize>,
     workspace_entity: Entity<Workspace>,
@@ -535,6 +541,23 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let codex_tabs = cx.new(|_| {
+            codex_acp_persistence::CodexAcpPersistence::new(
+                paths::data_dir().join("codex_acp_tabs.json"),
+            )
+        });
+        let codex_tabs_subscription = cx.observe(&codex_tabs, |_, _, cx| cx.notify());
+        let codex_quit_subscription = cx.on_app_quit(|this, cx| {
+            for arena in this.arenas.clone() {
+                this.sync_codex_tabs(&arena, cx);
+            }
+            let pending = this.codex_tabs.update(cx, |store, _| store.finish());
+            async move {
+                if let Some(pending) = pending {
+                    pending.await;
+                }
+            }
+        });
         let git_store = project.read(cx).git_store().clone();
         let git_subscription = cx.subscribe(&git_store, |this, _, event: &GitStoreEvent, cx| {
             if let GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, _) = event {
@@ -785,6 +808,10 @@ impl AgentiumApp {
         });
 
         let mut this = Self {
+            codex_tabs,
+            _codex_tabs_subscription: codex_tabs_subscription,
+            _codex_quit_subscription: codex_quit_subscription,
+            arena_error: None,
             arenas: Vec::new(),
             active_arena_index: None,
             workspace_entity,
@@ -853,6 +880,23 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let path = match std::fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.arena_error = Some(format!("Could not open {}: {error}", path.display()));
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(index) = self
+            .arenas
+            .iter()
+            .position(|arena| arena.read(cx).working_directory.as_ref() == Some(&path))
+        {
+            self.switch_arena(index, window, cx);
+            return;
+        }
+        self.arena_error = None;
         self.project
             .update(cx, |project, cx| {
                 project.create_worktree(&path, true, cx)
@@ -886,30 +930,41 @@ impl AgentiumApp {
         let workspace_weak = self.workspace_entity.downgrade();
         let project = self.project.clone();
         let session_state = self.session_state.clone();
+        let saved_tabs = working_directory
+            .as_ref()
+            .map(|path| self.codex_tabs.read(cx).tabs(path))
+            .unwrap_or_default();
 
         let arena_entity = cx.new(|cx| {
             Arena::new(arena_id, name, workspace_weak, project, working_directory, session_state, window, cx)
         });
 
-        let subscription = cx.subscribe(
-            &arena_entity,
-            |this, _ws, event: &ArenaEvent, cx| match event {
-                // Claude session clearing routes through AgentiumApp because
-                // claude_sessions state lives here. Non-Claude task acknowledgment
-                // is handled locally in Arena::handle_key_input via the shared
-                // acknowledged_task_pids set.
-                ArenaEvent::TerminalKeyInput { shell_pid } => {
-                    this.clear_session_for_shell_pid(*shell_pid, cx);
-                }
-                ArenaEvent::TerminalTitleState { shell_pid, state } => {
-                    this.handle_terminal_title_state(*shell_pid, *state, cx);
-                }
-            },
-        );
+        let subscription =
+            cx.subscribe(
+                &arena_entity,
+                |this, arena, event: &ArenaEvent, cx| match event {
+                    ArenaEvent::CodexTabsChanged => this.sync_codex_tabs(&arena, cx),
+                    // Claude session clearing routes through AgentiumApp because
+                    // claude_sessions state lives here. Non-Claude task acknowledgment
+                    // is handled locally in Arena::handle_key_input via the shared
+                    // acknowledged_task_pids set.
+                    ArenaEvent::TerminalKeyInput { shell_pid } => {
+                        this.clear_session_for_shell_pid(*shell_pid, cx);
+                    }
+                    ArenaEvent::TerminalTitleState { shell_pid, state } => {
+                        this.handle_terminal_title_state(*shell_pid, *state, cx);
+                    }
+                },
+            );
         self._arena_subscriptions
             .insert(arena_entity.entity_id(), subscription);
 
         self.arenas.push(arena_entity.clone());
+        arena_entity.update(cx, |arena, cx| {
+            for saved in saved_tabs {
+                arena.add_codex_acp(None, Some(saved), window, cx).log_err();
+            }
+        });
         self.active_arena_index = Some(self.arenas.len() - 1);
         arena_entity.update(cx, |arena, cx| {
             arena.activate_context(cx);
@@ -921,6 +976,18 @@ impl AgentiumApp {
         let focus = arena_entity.focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn sync_codex_tabs(&mut self, arena: &Entity<Arena>, cx: &mut Context<Self>) {
+        if !self.arenas.contains(arena) {
+            return;
+        }
+        let arena = arena.read(cx);
+        if let Some(directory) = arena.working_directory.clone() {
+            let tabs = arena.codex_tabs(cx);
+            self.codex_tabs
+                .update(cx, |store, cx| store.replace(directory, tabs, cx));
+        }
     }
 
     fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1638,6 +1705,10 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.arenas.iter().position(|ws| ws == workspace) else { return };
+        if let Some(directory) = workspace.read(cx).working_directory.clone() {
+            self.codex_tabs
+                .update(cx, |store, cx| store.replace(directory, Vec::new(), cx));
+        }
         let entity_id = workspace.entity_id();
         self._arena_subscriptions.remove(&entity_id);
         self.pr_info.remove(&entity_id);
@@ -1961,9 +2032,8 @@ impl AgentiumApp {
             anyhow::bail!("only terminal tabs can be added to an arena other than the active one");
         }
         arena.update(cx, |arena, cx| {
-            arena.add_tab(content_type, title, command, in_active_arena, window, cx);
-        });
-        Ok(())
+            arena.add_tab(content_type, title, command, in_active_arena, window, cx)
+        })
     }
 
     fn resolve_arena(
@@ -1994,12 +2064,28 @@ impl AgentiumApp {
         Some(getter.fallback_pid().as_u32())
     }
 
+    fn tab_process_id(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<u32> {
+        if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
+            view.read(cx).process_id(cx)
+        } else {
+            self.terminal_shell_pid(item, cx)
+        }
+    }
+
     fn tab_info(
         &self,
         item: &dyn workspace::ItemHandle,
         arena: &Entity<Arena>,
         cx: &App,
     ) -> TabInfo {
+        if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
+            return TabInfo {
+                title: item.tab_content_text(0, cx).to_string(),
+                kind: "codex-acp",
+                state: Some(view.read(cx).state().cli_state()),
+                arena: arena.read(cx).working_directory.clone(),
+            };
+        }
         let state = self.terminal_shell_pid(item, cx).map(|pid| {
             if self.session_state.permission_shell_pids.borrow().contains(&pid) {
                 "permission"
@@ -2020,19 +2106,26 @@ impl AgentiumApp {
         }
     }
 
-    /// The terminal tab whose shell is among the caller's ancestor processes.
     pub fn tab_self(&self, ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TabInfo> {
-        for arena in &self.arenas {
-            for pane in arena.read(cx).center.panes() {
-                for item in pane.read(cx).items() {
-                    let pid = self.terminal_shell_pid(item.as_ref(), cx);
-                    if pid.is_some_and(|pid| ancestor_pids.contains(&pid)) {
-                        return Ok(self.tab_info(item.as_ref(), arena, cx));
+        for ancestor in ancestor_pids {
+            let mut matches = Vec::new();
+            for arena in &self.arenas {
+                for pane in arena.read(cx).center.panes() {
+                    for item in pane.read(cx).items() {
+                        if self.tab_process_id(item.as_ref(), cx) == Some(*ancestor) {
+                            matches.push(self.tab_info(item.as_ref(), arena, cx));
+                        }
                     }
                 }
             }
+            if matches.len() > 1 {
+                anyhow::bail!("caller matches multiple Agentium tabs");
+            }
+            if let Some(tab) = matches.pop() {
+                return Ok(tab);
+            }
         }
-        anyhow::bail!("caller is not running inside an Agentium terminal")
+        anyhow::bail!("caller is not running inside an Agentium terminal or ACP tab")
     }
 
     pub fn tab_list(&self, selector: &ArenaSelector, cx: &App) -> anyhow::Result<Vec<TabInfo>> {
@@ -2052,6 +2145,19 @@ impl AgentiumApp {
         selector: &ArenaSelector,
         cx: &App,
     ) -> anyhow::Result<Entity<TerminalView>> {
+        self.unique_item_by_title(title, selector, cx)?
+            .act_as::<TerminalView>(cx)
+            .ok_or_else(|| {
+                anyhow::anyhow!("tab {title:?} is not a terminal; tab log is not supported")
+            })
+    }
+
+    fn unique_item_by_title(
+        &self,
+        title: &str,
+        selector: &ArenaSelector,
+        cx: &App,
+    ) -> anyhow::Result<Box<dyn workspace::ItemHandle>> {
         let arena = self.resolve_arena(selector, cx)?;
         let mut matches = Vec::new();
         for pane in arena.read(cx).center.panes() {
@@ -2066,8 +2172,7 @@ impl AgentiumApp {
             [] => anyhow::bail!("no tab titled {title:?}"),
             _ => anyhow::bail!("{} tabs titled {title:?}", matches.len()),
         };
-        item.act_as::<TerminalView>(cx)
-            .ok_or_else(|| anyhow::anyhow!("tab {title:?} is not a terminal"))
+        Ok(item.boxed_clone())
     }
 
     /// The last `lines` lines (all when 0) of the terminal tab titled `title`.
@@ -2090,9 +2195,18 @@ impl AgentiumApp {
         submit: bool,
         from: &str,
         text: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        let terminal_view = self.unique_terminal_view_by_title(title, selector, cx)?;
+        let item = self.unique_item_by_title(title, selector, cx)?;
+        if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
+            return view.update(cx, |view, cx| {
+                view.send_message(&with_from_line(from, text), submit, window, cx)
+            });
+        }
+        let terminal_view = item
+            .act_as::<TerminalView>(cx)
+            .ok_or_else(|| anyhow::anyhow!("tab {title:?} cannot receive messages"))?;
         let terminal = terminal_view.read(cx).terminal().clone();
         self.ensure_safe_message_target(title, terminal.read(cx))?;
         let text = with_from_line(from, text);
@@ -2386,17 +2500,22 @@ impl AgentiumApp {
     }
 
     fn find_arena_entity_id_for_pids(&self, pids: &[u32], cx: &App) -> Option<EntityId> {
-        for arena_entity in &self.arenas {
-            let arena = arena_entity.read(cx);
-            for pane in arena.center.panes() {
-                for terminal_view in pane.read(cx).items_of_type::<TerminalView>() {
-                    if let Some(getter) = terminal_view.read(cx).terminal().read(cx).pid_getter() {
-                        let pid = getter.fallback_pid().as_u32();
-                        if pids.contains(&pid) {
-                            return Some(arena_entity.entity_id());
+        for pid in pids {
+            let mut matches = Vec::new();
+            for arena in &self.arenas {
+                for pane in arena.read(cx).center.panes() {
+                    for item in pane.read(cx).items() {
+                        if self.tab_process_id(item.as_ref(), cx) == Some(*pid) {
+                            matches.push(arena.entity_id());
                         }
                     }
                 }
+            }
+            if matches.len() > 1 {
+                return None;
+            }
+            if let Some(id) = matches.pop() {
+                return Some(id);
             }
         }
         None
@@ -6219,8 +6338,24 @@ impl Render for AgentiumApp {
             .child(
                 div()
                     .flex_1()
+                    .flex()
+                    .flex_col()
                     .h_full()
                     .bg(colors.background)
+                    .when_some(
+                        self.arena_error
+                            .clone()
+                            .or_else(|| self.codex_tabs.read(cx).error()),
+                        |element, error| {
+                            element.child(
+                                div()
+                                    .p_2()
+                                    .text_sm()
+                                    .text_color(cx.theme().status().warning)
+                                    .child(error),
+                            )
+                        },
+                    )
                     .map(|d| match self.active_arena() {
                         Some(arena) => d.child(arena.clone()),
                         None => d.child(

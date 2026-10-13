@@ -56,7 +56,11 @@ Review file changes in the conversation's edit cards or its review tab, which pr
 
 Approval notifications can appear while another pane has focus, even when the Codex conversation remains visible.
 
-This feature is experimental. Automatic ACP Registry installation, conversation restoration after restart, remote Arenas, and ACP support in terminal-specific CLI commands are not available yet. ACP tabs appear as `other` in `agentium tab list`. If a directory's environment cannot be loaded, the tab shows a warning and the adapter uses the inherited environment.
+ACP tabs left open at Quit are restored when you next open that worktree's Arena. Closing a tab with Cmd+W or closing its Arena removes it from automatic restoration; it does not delete the adapter's conversation history. Agentium stores session IDs and fixed tab names in `codex_acp_tabs.json` in its data directory. Pane layouts and other tabs are not restored; every Arena still opens an initial terminal. A failed restore keeps the tab and offers retry. A conversation interrupted by Quit may restore partial history or report a load error.
+
+Edit and terminal cards start collapsed, including restored cards. Approval content remains visible. Set `agent.expand_edit_card` or `agent.expand_terminal_card` to `true` in Agentium settings to enable automatic expansion.
+
+This feature is experimental. Automatic ACP Registry installation and remote Arenas are not available. If a directory's environment cannot be loaded, the tab shows a warning and the adapter uses the inherited environment. ACP processes receive `TERM_PROGRAM=agentium` and Agentium's `TERM_PROGRAM_VERSION`.
 
 ## Keyboard Shortcuts
 
@@ -134,27 +138,31 @@ Add a new tab to the active pane of an arena.
 agentium tab new [--type <TYPE>] [--title <TITLE>] [--arena <PATH>] [-- <COMMAND>...]
 ```
 
-- `--type` — content type: `terminal` (default), `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
-- `--title` — tab title override (terminal with a command only)
+- `--type` — content type: `terminal` (default), `codex-acp`, `diff`, `branch-diff`, `git-status`, `project-search`, `git-graph`
+- `--title` — fixed ACP tab name, or terminal title override when a command is given
 - `--arena` — arena worktree to add the tab to; defaults to the arena the command runs in (process ancestry, then current directory). A caller outside every arena, such as a shell in another terminal app, gets the active arena. Only `terminal` tabs can be added to an arena other than the active one; they are added without taking focus
+
+For example, `agentium tab new --type codex-acp --title Codex-Review` creates an independent conversation. Its tab name stays fixed when the agent changes the conversation title. Without `--title`, names are allocated as `Codex ACP`, `Codex ACP 2`, and so on. ACP tabs reject a trailing terminal command and do not support `pane split`.
 
 ### `agentium tab send-message`
 
-Paste text into the terminal tab whose title matches and optionally press Enter. Fails unless exactly one tab in the target arena matches. Also refuses, sending nothing, when the target's foreground process is not a coding agent (`claude` or `codex`): text pasted into a shell, or into any other program that later exits back to the shell (including this CLI, when sending to its own tab), runs as a command outside any agent sandbox. It also refuses when the target is waiting for a permission answer (the text would answer the dialog without the user).
+Insert text into the terminal or ACP tab whose title matches and optionally submit it. Fails unless exactly one tab in the target arena matches. For terminal tabs, it also refuses, sending nothing, when the target's foreground process is not a coding agent (`claude` or `codex`): text pasted into a shell, or into any other program that later exits back to the shell (including this CLI, when sending to its own tab), runs as a command outside any agent sandbox. It also refuses when the target is waiting for a permission answer (the text would answer the dialog without the user).
 
 ```
 agentium tab send-message --title <TITLE> [--arena <PATH>] [--submit] [--from <SENDER>] <MESSAGE>
 ```
 
 - `--arena` — arena worktree to search; defaults to the arena the command runs in (process ancestry, then current directory)
-- `--submit` — send Enter after pasting
+- `--submit` — send Enter for a terminal, or send the ACP message; without this flag the message remains a draft
 - `--from` — sender title to show when the sending tab cannot be verified. Needed when the command runs outside the tab's process tree, such as Codex 0.159+, which runs commands (including `!`) under its shared app-server daemon
 
 Every non-empty message starts with a sender line on its own line, even if the message itself begins with `[from:`. The app identifies the sender from the CLI process's PID as reported by the kernel (`LOCAL_PEERPID`) and its ancestry, not from anything the CLI sends: a verified tab shows as `[from: <tab title>]`, otherwise the line is `[from: <--from value> (unverified)]`, or `[from: unknown (unverified)]` with a warning on stderr. `--from` is ignored, with a warning, when it disagrees with a verified tab. `]` and control characters are removed from names so the line cannot be closed early or split. A verified title is still the sender tab's current title, which a program in that tab may be able to change.
 
+ACP messages go to the root conversation. ACP tabs reject messages while running, awaiting approval or another answer, connecting, restoring, or showing an error. They also reject messages when a draft, attachment, edited message, or queued message already exists. Sending to a hidden Arena does not change focus. CLI success means the input was accepted; a later connection or model error appears in the conversation.
+
 ### `agentium tab log`
 
-Print the last lines of the terminal tab whose title matches, as plain text. Fails unless exactly one tab in the target arena matches.
+Print the last lines of the terminal tab whose title matches, as plain text. ACP tabs do not support this command. Fails unless exactly one tab in the target arena matches.
 
 ```
 agentium tab log --title <TITLE> [--arena <PATH>] [-n|--lines <N>]
@@ -170,7 +178,7 @@ agentium tab self [--json]
 agentium tab list [--arena <PATH>] [--json]
 ```
 
-`self` prints the title of the terminal tab the command runs in. `list` prints title, kind, and Claude hook state (`permission`, `running`, `ready`, `idle`) for each tab of the arena. All `agentium tab` subcommands use the CLI socket `~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`.
+`self` resolves a terminal by its shell PID or an ACP tab by its live adapter PID in the caller ancestry. Detached processes may not resolve. `list` prints title, kind (`terminal`, `codex-acp`, or `other`), and state. ACP states are `idle`, `running`, `permission`, `ready`, and `error`; connecting and restoring tabs also appear as `idle` but reject messages until ready. Other items have a null state. All `agentium tab` subcommands use the CLI socket `~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`.
 
 ### `agentium task`
 

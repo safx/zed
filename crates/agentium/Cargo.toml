@@ -83,6 +83,7 @@ zed_actions.workspace = true
 zlog.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 acp_thread = { workspace = true, features = ["test-support"] }
 agent_servers = { workspace = true, features = ["test-support"] }
 agent_ui = { workspace = true, features = ["test-support"] }
