@@ -92,13 +92,15 @@ Add the following to your Claude Code `settings.json`:
     "Stop": [{ "hooks": [{ "type": "command", "command": "agentium claude hook stop" }] }],
     "Notification": [{ "matcher": "", "hooks": [{ "type": "command", "command": "agentium claude hook notification" }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "agentium claude hook user-prompt-submit" }] }],
-    "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook permission-request" }] }],
+    "PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook permission-request", "timeout": 86400 }] }],
     "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook post-tool-use" }] }],
     "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "agentium claude hook post-tool-use-failure" }] }]
   },
   "statusLine": "agentium claude statusline"
 }
 ```
+
+The `permission-request` hook stays running until the permission is answered, so it can be answered from the Inbox (Allow / Always allow / Deny) while Claude Code shows its own dialog in the terminal; whichever answer comes first wins. Its `timeout` must be long: when Claude Code cancels the hook (600 seconds by default), the Inbox can no longer answer and only the terminal dialog remains.
 
 Terminal tabs show dot indicators based on execution state:
 

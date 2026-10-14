@@ -776,6 +776,45 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
     }
 }
 
+/// Holds the PermissionRequest hook open until the user answers in the Inbox,
+/// then prints the decision for Claude Code. Claude keeps its own dialog up
+/// meanwhile and takes whichever answer comes first, so printing nothing (no
+/// Agentium, the request was dropped, or the user answered in the terminal)
+/// leaves the dialog in charge.
+fn print_inbox_permission_decision(hook_input: &serde_json::Value) {
+    // Questions are answered through the Inbox's decision lane, and allowing
+    // one without `answers` would submit it empty.
+    if hook_input["tool_name"].as_str() == Some("AskUserQuestion") {
+        return;
+    }
+    let response = cli_request_if_running(serde_json::json!({
+        "type": "permission_request",
+        "session_id": hook_input["session_id"],
+        "tool_name": hook_input["tool_name"],
+        "tool_input": hook_input["tool_input"],
+        "permission_suggestions": hook_input["permission_suggestions"],
+    }));
+    let decision = match response {
+        Ok(Some(response)) => response["decision"].clone(),
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("agentium: permission request not answered from the Inbox: {error:#}");
+            return;
+        }
+    };
+    if decision.is_object() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": decision,
+                }
+            })
+        );
+    }
+}
+
 fn inbox_option_json(option: &str) -> serde_json::Value {
     match option.split_once("::") {
         Some((label, description)) => serde_json::json!({
@@ -1745,6 +1784,9 @@ fn handle_cli_connection(
 // foreground never replies (which only happens if the whole app is stuck), so
 // 120s is fine even for the fast requests.
 const CLI_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// A permission request waits for the user, who may be away for hours; the
+// app drops the request (ending the wait) once the session moves on.
+const PERMISSION_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 fn cli_connection_reply(
     stream: &mut UnixStream,
@@ -1757,6 +1799,11 @@ fn cli_connection_reply(
     let mut request = String::new();
     stream.read_to_string(&mut request)?;
     let request: serde_json::Value = serde_json::from_str(&request)?;
+    let reply_timeout = if request["type"].as_str() == Some("permission_request") {
+        PERMISSION_REPLY_TIMEOUT
+    } else {
+        CLI_REPLY_TIMEOUT
+    };
     let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
     msg_sender
         .unbounded_send(IpcMessage::CliRequest {
@@ -1765,7 +1812,7 @@ fn cli_connection_reply(
             reply: reply_sender,
         })
         .map_err(|_| anyhow::anyhow!("Agentium is shutting down"))?;
-    Ok(reply_receiver.recv_timeout(CLI_REPLY_TIMEOUT)?)
+    Ok(reply_receiver.recv_timeout(reply_timeout)?)
 }
 
 fn parse_content_type(value: Option<&str>) -> Option<agentium::PaneContentType> {
@@ -1809,6 +1856,17 @@ fn handle_cli_request(
     // (which resolve synchronously): `--update` awaits `gh`/`bee` fetches, so
     // this needs its own conversion to `Task<Value>` rather than the
     // `Task::ready` the other branches share.
+    if request["type"].as_str() == Some("permission_request") {
+        return app.inbox_permission_request(
+            request["session_id"].as_str().unwrap_or_default(),
+            peer_ancestor_pids,
+            request["tool_name"].as_str().unwrap_or_default(),
+            &request["tool_input"],
+            request["permission_suggestions"].clone(),
+            cx,
+        );
+    }
+
     if request["type"].as_str() == Some("task_info") {
         let task_selector = request["task"].as_str();
         let cwd = request["cwd"].as_str().map(PathBuf::from);
@@ -2118,6 +2176,7 @@ fn main() {
                 .unwrap_or_default();
             let session_id = json["session_id"].as_str().unwrap_or("");
             let ancestor_pids = get_ancestor_pids();
+            let is_permission_request = matches!(event, ClaudeHookEvent::PermissionRequest);
 
             let msg_type = match event {
                 ClaudeHookEvent::SessionStart => "claude_session_start",
@@ -2149,6 +2208,9 @@ fn main() {
                 if socket.connect(&socket_path).is_ok() {
                     socket.send(msg.to_string().as_bytes()).ok();
                 }
+            }
+            if is_permission_request {
+                print_inbox_permission_decision(&json);
             }
             return;
         }
