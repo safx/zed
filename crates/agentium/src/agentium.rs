@@ -420,6 +420,31 @@ struct InboxEntry {
     arena_name: String,
     info: BadgeEntryInfo,
     is_active: bool,
+    permission: Option<InboxPermissionRow>,
+}
+
+/// A Claude PermissionRequest hook held open until the user answers here.
+struct InboxPermission {
+    id: u64,
+    session_id: String,
+    tool_name: String,
+    summary: String,
+    suggestions: serde_json::Value,
+    reply: futures::channel::oneshot::Sender<serde_json::Value>,
+}
+
+struct InboxPermissionRow {
+    id: u64,
+    tool_name: String,
+    summary: String,
+    can_always_allow: bool,
+}
+
+#[derive(Clone, Copy)]
+enum InboxPermissionAnswer {
+    Allow,
+    AlwaysAllow,
+    Deny,
 }
 
 struct InboxCompletionRow {
@@ -662,6 +687,7 @@ pub struct AgentiumApp {
     next_inbox_question_id: u64,
     inbox_completions: Vec<InboxCompletion>,
     inbox_note_editors: HashMap<u64, Entity<Editor>>,
+    inbox_permissions: Vec<InboxPermission>,
     /// Tabs seen in the Completed state on the previous sync, so a tab that
     /// stays Completed is recorded once, and not again after a dismiss.
     inbox_completed_items: HashSet<EntityId>,
@@ -1019,6 +1045,7 @@ impl AgentiumApp {
             inbox_questions,
             inbox_completions,
             inbox_note_editors: HashMap::new(),
+            inbox_permissions: Vec::new(),
             inbox_completed_items: HashSet::new(),
             renaming_task: None,
             task_rename_editor,
@@ -2025,6 +2052,7 @@ impl AgentiumApp {
         title: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.drop_inbox_permissions(session_id);
         let status_message = title.unwrap_or_else(|| "Ready".to_string());
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             session.state = ClaudeSessionState::Completed;
@@ -2096,6 +2124,7 @@ impl AgentiumApp {
         prompt: String,
         cx: &mut Context<Self>,
     ) {
+        self.drop_inbox_permissions(session_id);
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             session.user_prompt = prompt;
             session.ancestor_pids = ancestor_pids;
@@ -2128,6 +2157,109 @@ impl AgentiumApp {
                 self.save_pr_session_mapping(entity_id, cx);
             }
         }
+    }
+
+    /// Registers a PermissionRequest hook waiting on the CLI socket. The
+    /// returned task resolves to the hook's reply: a `decision` once the user
+    /// answers in the Inbox, or none if the request is dropped.
+    pub fn inbox_permission_request(
+        &mut self,
+        session_id: &str,
+        peer_ancestor_pids: &[u32],
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        suggestions: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> Task<serde_json::Value> {
+        // The session's Claude process must be an ancestor of the hook, so a
+        // process elsewhere cannot attach a fake prompt to a real session.
+        if let Some(session) = self.claude_sessions.get(session_id)
+            && !session
+                .ancestor_pids
+                .first()
+                .is_some_and(|claude_pid| peer_ancestor_pids.contains(claude_pid))
+        {
+            return Task::ready(serde_json::json!({
+                "ok": false,
+                "error": "the requester is not the session's Claude process",
+            }));
+        }
+        // The hook's datagram and this request race on separate sockets; set
+        // the state here too so the request is never pruned as stale.
+        self.handle_claude_permission_request(session_id, peer_ancestor_pids.to_vec(), cx);
+        let (reply, receiver) = futures::channel::oneshot::channel();
+        let id = self.next_inbox_question_id;
+        self.next_inbox_question_id += 1;
+        self.inbox_permissions.push(InboxPermission {
+            id,
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            summary: permission_summary(tool_input),
+            suggestions,
+            reply,
+        });
+        cx.notify();
+        cx.background_spawn(async move {
+            receiver
+                .await
+                .unwrap_or_else(|_| serde_json::json!({ "ok": true }))
+        })
+    }
+
+    /// Ends the hook's wait without a decision. Called once the session has
+    /// moved on, which means the user answered in the terminal.
+    fn drop_inbox_permissions(&mut self, session_id: &str) {
+        self.inbox_permissions
+            .retain(|permission| permission.session_id != session_id);
+    }
+
+    /// Drops requests whose session left WaitingPermission through a path
+    /// with no hook (e.g. the caffeinate monitor after Ctrl-C).
+    fn drop_stale_inbox_permissions(&mut self) {
+        let sessions = &self.claude_sessions;
+        self.inbox_permissions.retain(|permission| {
+            sessions
+                .get(&permission.session_id)
+                .is_some_and(|session| session.state == ClaudeSessionState::WaitingPermission)
+        });
+    }
+
+    fn answer_inbox_permission(
+        &mut self,
+        permission_id: u64,
+        answer: InboxPermissionAnswer,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(position) = self
+            .inbox_permissions
+            .iter()
+            .position(|permission| permission.id == permission_id)
+        else {
+            return;
+        };
+        let permission = self.inbox_permissions.remove(position);
+        let decision = match answer {
+            InboxPermissionAnswer::Allow => serde_json::json!({ "behavior": "allow" }),
+            InboxPermissionAnswer::AlwaysAllow => serde_json::json!({
+                "behavior": "allow",
+                "updatedPermissions": permission.suggestions,
+            }),
+            InboxPermissionAnswer::Deny => serde_json::json!({
+                "behavior": "deny",
+                "message": "Denied from the Agentium Inbox",
+            }),
+        };
+        if permission
+            .reply
+            .send(serde_json::json!({ "ok": true, "decision": decision }))
+            .is_err()
+        {
+            log::warn!(
+                "permission request {permission_id} for {} was already gone",
+                permission.tool_name
+            );
+        }
+        cx.notify();
     }
 
     pub fn handle_claude_permission_request(
@@ -2166,6 +2298,7 @@ impl AgentiumApp {
         ancestor_pids: Vec<u32>,
         cx: &mut Context<Self>,
     ) {
+        self.drop_inbox_permissions(session_id);
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             if session.state == ClaudeSessionState::WaitingPermission {
                 session.ancestor_pids = ancestor_pids;
@@ -2178,6 +2311,7 @@ impl AgentiumApp {
     }
 
     pub fn handle_claude_session_end(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        self.drop_inbox_permissions(session_id);
         if self.claude_sessions.remove(session_id).is_some() {
             self.caffeinate_absent_since.remove(session_id);
             self.sync_session_derived_state();
@@ -4828,6 +4962,67 @@ fn inbox_decision_color() -> Hsla {
     rgb(0xb48ef2).into()
 }
 
+/// The one field of a tool call that says what it will touch, falling back to
+/// the whole input for tools without one.
+fn permission_summary(tool_input: &serde_json::Value) -> String {
+    ["command", "file_path", "notebook_path", "url", "path", "pattern"]
+        .iter()
+        .find_map(|key| tool_input[key].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| tool_input.to_string())
+}
+
+fn render_inbox_permission(
+    permission: InboxPermissionRow,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<AgentiumApp>,
+) -> impl IntoElement {
+    let permission_id = permission.id;
+    let button = |label: &'static str, answer: InboxPermissionAnswer, cx: &mut Context<AgentiumApp>| {
+        Button::new(
+            SharedString::from(format!("inbox-permission-{permission_id}-{label}")),
+            label,
+        )
+        .style(ButtonStyle::Subtle)
+        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            this.answer_inbox_permission(permission_id, answer, cx);
+        }))
+    };
+    v_flex()
+        .gap_1()
+        .pt_1()
+        .child(
+            h_flex()
+                .gap_1()
+                .text_xs()
+                .child(
+                    div()
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border)
+                        .child(permission.tool_name),
+                )
+                .child(
+                    div()
+                        .font_buffer(cx)
+                        .truncate()
+                        .child(truncate_for_menu(&permission.summary)),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_1()
+                .justify_end()
+                .child(button("Allow", InboxPermissionAnswer::Allow, cx))
+                .when(permission.can_always_allow, |d| {
+                    d.child(button("Always allow", InboxPermissionAnswer::AlwaysAllow, cx))
+                })
+                .child(button("Deny", InboxPermissionAnswer::Deny, cx)),
+        )
+}
+
 const INBOX_QUESTIONS_FILE: &str = "inbox.json";
 const INBOX_COMPLETIONS_FILE: &str = "inbox_completions.json";
 const INBOX_CONFIRMED_COMPLETION_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(1);
@@ -6476,6 +6671,28 @@ impl AgentiumApp {
                 .is_some_and(|item| item.item_id() == item_id)
     }
 
+    fn pending_permission_row(
+        &self,
+        item: &dyn workspace::ItemHandle,
+        cx: &App,
+    ) -> Option<InboxPermissionRow> {
+        let shell_pid = self.terminal_shell_pid(item, cx)?;
+        let session_ids = self.session_state.pid_to_session_id.borrow();
+        let session_id = session_ids.get(&shell_pid)?;
+        self.inbox_permissions
+            .iter()
+            .find(|permission| &permission.session_id == session_id)
+            .map(|permission| InboxPermissionRow {
+                id: permission.id,
+                tool_name: permission.tool_name.clone(),
+                summary: permission.summary.clone(),
+                can_always_allow: permission
+                    .suggestions
+                    .as_array()
+                    .is_some_and(|suggestions| !suggestions.is_empty()),
+            })
+    }
+
     fn collect_inbox_entries(&self, cx: &App) -> InboxEntries {
         let mut entries = InboxEntries::default();
         for question in &self.inbox_questions {
@@ -6528,6 +6745,7 @@ impl AgentiumApp {
                 arena_index,
                 arena_name: arena_name.clone(),
                 is_active: self.is_active_tab(arena_entity, &info.pane, info.item.item_id(), cx),
+                permission: self.pending_permission_row(info.item.as_ref(), cx),
                 info,
             };
             entries.permission.extend(
@@ -6577,6 +6795,7 @@ impl AgentiumApp {
                         arena_name,
                         info,
                         is_active,
+                        permission,
                     } = entry;
                     let primary = if info.primary.is_empty() {
                         "(no prompt)".to_string()
@@ -6615,6 +6834,9 @@ impl AgentiumApp {
                                 .truncate()
                                 .child(secondary),
                         )
+                        .when_some(permission, |d, permission| {
+                            d.child(render_inbox_permission(permission, &colors, cx))
+                        })
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.navigate_to_item(
                                 arena_index,
@@ -7275,6 +7497,7 @@ impl Render for AgentiumApp {
         // renderer) can run while colors are still in scope.
         let colors = cx.theme().colors().clone();
         self.bind_inbox_tabs(cx);
+        self.drop_stale_inbox_permissions();
         self.sync_inbox_note_editors(window, cx);
         self.sync_inbox_completions(cx);
         let inbox_entries = self.collect_inbox_entries(cx);
@@ -7939,7 +8162,7 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
-        ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, backlog_issue_keys_in_branch, next_title_driven_state,
+        ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line,
     };
@@ -7948,6 +8171,22 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn permission_summary_shows_what_the_tool_touches() {
+        assert_eq!(
+            permission_summary(&serde_json::json!({ "command": "rm -rf build", "description": "x" })),
+            "rm -rf build"
+        );
+        assert_eq!(
+            permission_summary(&serde_json::json!({ "file_path": "/a.rs", "content": "..." })),
+            "/a.rs"
+        );
+        assert_eq!(
+            permission_summary(&serde_json::json!({ "server": "github" })),
+            r#"{"server":"github"}"#
+        );
+    }
 
     #[test]
     fn inbox_question_persists_its_asker_but_not_its_tab() {
