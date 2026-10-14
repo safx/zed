@@ -1810,17 +1810,9 @@ mod tests {
             &workspace,
             cx,
         );
+        // Not `Arena::new`, for the PTY reason in the membership test above.
         let arena = cx.new_window_entity(|window, cx| {
-            crate::arena::Arena::new(
-                1,
-                "Test".into(),
-                workspace.downgrade(),
-                project,
-                Some("/arena".into()),
-                crate::SharedSessionState::new(),
-                window,
-                cx,
-            )
+            crate::arena::Arena::test_empty("Test".into(), project, "/arena".into(), window, cx)
         });
         cx.run_until_parked();
         let pane = arena.read_with(cx, |arena, _| arena.active_pane.clone());
@@ -1962,14 +1954,14 @@ mod tests {
                 directory.path().join("tabs.json"),
             )
         });
+        // Not `Arena::new`: it opens a terminal whose PTY reader thread wakes
+        // the foreground executor outside the test scheduler, failing the run
+        // nondeterministically.
         let arena = cx.new_window_entity(|window, cx| {
-            crate::arena::Arena::new(
-                1,
+            crate::arena::Arena::test_empty(
                 "Test".into(),
-                workspace.downgrade(),
                 project.clone(),
-                Some("/arena".into()),
-                crate::SharedSessionState::new(),
+                "/arena".into(),
                 window,
                 cx,
             )
