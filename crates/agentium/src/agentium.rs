@@ -1,5 +1,6 @@
 mod arena;
 mod codex_acp_persistence;
+mod codex_acp_resume;
 pub mod codex_acp_view;
 pub mod board;
 pub mod file_browser_view;
@@ -96,7 +97,7 @@ pub enum PaneContentType {
     GitGraph,
 }
 
-actions!(agentium, [NewClaudeCode, NewCodexAcp, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
+actions!(agentium, [NewClaudeCode, NewCodexAcp, ResumeCodexConversation, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
 
 pub fn init_acp_host(cx: &mut App) {
     cx.set_global(agent_ui::AgentUiHost {
@@ -988,6 +989,47 @@ impl AgentiumApp {
             self.codex_tabs
                 .update(cx, |store, cx| store.replace(directory, tabs, cx));
         }
+    }
+
+    fn resume_codex_conversation(
+        &mut self,
+        origin: &Entity<Arena>,
+        directory: &Path,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let origin_index = self
+            .arenas
+            .iter()
+            .position(|arena| arena == origin)
+            .ok_or_else(|| anyhow::anyhow!("The originating Arena is no longer open"))?;
+        let existing = codex_acp_resume::resume_target(
+            &self.arenas,
+            origin,
+            directory,
+            session_id,
+            self.codex_tabs.read(cx),
+            cx,
+        )?;
+        self.switch_arena(origin_index, window, cx);
+        if let Some(codex_acp_resume::OpenConversation { pane, view }) = existing {
+            let index = pane
+                .read(cx)
+                .index_for_item(&view)
+                .ok_or_else(|| anyhow::anyhow!("The conversation tab is no longer open"))?;
+            pane.update(cx, |pane, cx| {
+                pane.activate_item(index, true, true, window, cx);
+                pane.zoom_out(&ZoomOut, window, cx);
+            });
+            window.focus(&view.focus_handle(cx), cx);
+        } else {
+            origin.update(cx, |arena, cx| {
+                arena.resume_codex_tab(session_id.to_owned(), window, cx)
+            })?;
+            self.sync_codex_tabs(origin, cx);
+        }
+        Ok(())
     }
 
     fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {

@@ -32,7 +32,7 @@ use crate::{
     codex_acp_persistence::{SavedCodexTab, validate_title},
     codex_acp_view::CodexAcpView,
     NewBranchDiff, NewClaudeCode, NewCodexAcp, NewDiffView, NewFileBrowser, NewGitGraph, NewGitStatus,
-    NewProjectSearch, OpenNewItemMenu, OpenSplitMenu, PaneContentType,
+    NewProjectSearch, OpenNewItemMenu, OpenSplitMenu, PaneContentType, ResumeCodexConversation,
     file_browser_view::FileBrowserView,
     git_status_view::GitStatusView,
     questionnaire_view::{OpenAsText, QuestionnaireView},
@@ -104,6 +104,83 @@ fn codex_tab_title(title: Option<String>, titles: &HashSet<String>) -> anyhow::R
 }
 
 impl Arena {
+    pub(crate) fn validate_tab_title(
+        &self,
+        item_id: EntityId,
+        title: &str,
+        cx: &App,
+    ) -> anyhow::Result<()> {
+        validate_title(title)?;
+        for pane in self.center.panes() {
+            for item in pane.read(cx).items() {
+                if item.item_id() != item_id {
+                    anyhow::ensure!(
+                        item.tab_content_text(0, cx).as_ref() != title,
+                        "A tab titled {title:?} already exists"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_empty(
+        name: String,
+        project: Entity<Project>,
+        working_directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let workspace = WeakEntity::new_invalid();
+        let session_state = crate::SharedSessionState::new();
+        let pane = new_agentium_pane(
+            workspace.clone(),
+            project.clone(),
+            session_state.clone(),
+            window,
+            cx,
+        );
+        Self {
+            id: 0,
+            name,
+            working_directory: Some(working_directory),
+            active_pane: pane.clone(),
+            center: PaneGroup::new(pane),
+            zoomed_pane: None,
+            workspace,
+            project,
+            session_state,
+            terminal_title_watches: HashMap::new(),
+            codex_tab_subscriptions: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn resume_codex_tab(
+        &mut self,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let titles = self
+            .center
+            .panes()
+            .iter()
+            .flat_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .map(|item| item.tab_content_text(0, cx).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let saved = SavedCodexTab {
+            id: uuid::Uuid::new_v4(),
+            title: codex_tab_title(None, &titles)?,
+            session_id,
+        };
+        self.add_codex_acp(None, Some(saved), window, cx)
+    }
+
     pub(crate) fn add_codex_acp(
         &mut self,
         title: Option<String>,
@@ -128,8 +205,9 @@ impl Arena {
             codex_tab_title(title, &titles)?
         };
         self.activate_context(cx);
+        let arena = cx.weak_entity();
         let view = cx.new(|cx| {
-            crate::codex_acp_view::CodexAcpView::new(
+            let mut view = crate::codex_acp_view::CodexAcpView::new(
                 self.project.clone(),
                 self.workspace.clone(),
                 self.working_directory.clone(),
@@ -137,7 +215,9 @@ impl Arena {
                 saved,
                 window,
                 cx,
-            )
+            );
+            view.set_arena(arena);
+            view
         });
         self.active_pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(view), true, true, None, window, cx);
@@ -1344,6 +1424,21 @@ impl Render for Arena {
                     .on_action(cx.listener(|this, _: &NewCodexAcp, window, cx| {
                         this.add_codex_acp(None, None, window, cx).log_err();
                     }))
+                    .on_action(cx.listener(|this, _: &ResumeCodexConversation, window, cx| {
+                        let Some(directory) = this.working_directory.clone() else {
+                            return;
+                        };
+                        let arena = cx.entity().downgrade();
+                        let project = this.project.clone();
+                        let workspace = this.workspace.clone();
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.toggle_modal(window, cx, |window, cx| {
+                                crate::codex_acp_resume::CodexResume::new(
+                                    arena, directory, project, window, cx,
+                                )
+                            });
+                        }).log_err();
+                    }))
                     .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                         this.add_terminal(window, cx);
                     }))
@@ -1796,6 +1891,7 @@ pub(crate) fn new_agentium_pane(
                                             .context(focus_handle.clone())
                                             .action("Claude Code", NewClaudeCode.boxed_clone())
                                             .action("Codex (ACP)", NewCodexAcp.boxed_clone())
+                                            .action("Resume Codex Conversation…", ResumeCodexConversation.boxed_clone())
                                             .action("Terminal", NewTerminal::default().boxed_clone())
                                             .action("Git Status", NewGitStatus.boxed_clone())
                                             .action("Git Graph", NewGitGraph.boxed_clone())
