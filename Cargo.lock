@@ -569,6 +569,7 @@ dependencies = [
  "acp_thread",
  "agent-client-protocol",
  "agent_servers",
+ "agent_settings",
  "agent_ui",
  "anyhow",
  "assets",

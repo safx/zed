@@ -691,6 +691,8 @@ pub struct AgentiumApp {
     inbox_completions: Vec<InboxCompletion>,
     inbox_note_editors: HashMap<u64, Entity<Editor>>,
     inbox_permissions: Vec<InboxPermission>,
+    completion_notifications: Vec<WindowHandle<agent_ui::AgentNotification>>,
+    _completion_notification_subscriptions: Vec<Subscription>,
     /// Tabs seen in the Completed state on the previous sync, so a tab that
     /// stays Completed is recorded once, and not again after a dismiss.
     inbox_completed_items: HashSet<EntityId>,
@@ -1049,6 +1051,8 @@ impl AgentiumApp {
             inbox_completions,
             inbox_note_editors: HashMap::new(),
             inbox_permissions: Vec::new(),
+            completion_notifications: Vec::new(),
+            _completion_notification_subscriptions: Vec::new(),
             inbox_completed_items: HashSet::new(),
             renaming_task: None,
             task_rename_editor,
@@ -2085,6 +2089,7 @@ impl AgentiumApp {
             }
         }
 
+        self.sync_inbox_completions(cx);
         cx.notify();
     }
 
@@ -2117,6 +2122,7 @@ impl AgentiumApp {
         }
         self.sync_session_derived_state();
         self.notify_all_panes(cx);
+        self.sync_inbox_completions(cx);
         cx.notify();
     }
 
@@ -2789,6 +2795,16 @@ impl AgentiumApp {
         let mut changed = !fresh.is_empty();
         for (arena, arena_name, info) in fresh {
             let item_id = info.item.item_id();
+            // ACP tabs pop up their own notification from the conversation view.
+            let should_notify = info.item.act_as::<codex_acp_view::CodexAcpView>(cx).is_none()
+                && !self.is_tab_in_view(&arena, &info.pane, item_id, cx);
+            let notification = should_notify.then(|| {
+                (
+                    info.primary.clone(),
+                    info.secondary.clone(),
+                    arena_name.clone(),
+                )
+            });
             let asker = self.inbox_asker(info.item.as_ref(), cx);
             self.inbox_completions.retain(|completion| {
                 let same_tab = completion
@@ -2817,6 +2833,16 @@ impl AgentiumApp {
                     }),
                 },
             );
+            if let Some((title, caption, arena_name)) = notification {
+                // Deferred: this sync also runs inside `render`, where opening
+                // a window is not safe.
+                cx.spawn(async move |this, cx| {
+                    this.update(cx, |this, cx| {
+                        this.show_completion_notification(id, title, caption, arena_name, cx);
+                    })
+                })
+                .detach_and_log_err(cx);
+            }
         }
 
         let now = Utc::now();
@@ -2858,6 +2884,115 @@ impl AgentiumApp {
         if changed {
             self.persist_inbox_completions(cx);
         }
+    }
+
+    /// Whether the user is looking at the tab: Agentium is the active window
+    /// and the tab is the active one in it.
+    fn is_tab_in_view(
+        &self,
+        arena: &WeakEntity<Arena>,
+        pane: &Entity<Pane>,
+        item_id: EntityId,
+        cx: &App,
+    ) -> bool {
+        cx.active_window()
+            .is_some_and(|window| window.downcast::<AgentiumApp>().is_some())
+            && arena
+                .upgrade()
+                .is_some_and(|arena| self.is_active_tab(&arena, pane, item_id, cx))
+    }
+
+    /// The same pop-up Codex ACP tabs show, for terminal agents. Honors the
+    /// agent panel's `notify_when_agent_waiting` setting so one switch
+    /// controls both.
+    fn show_completion_notification(
+        &mut self,
+        completion_id: u64,
+        title: String,
+        caption: String,
+        arena_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        use agent_settings::AgentSettings;
+        use settings::{NotifyWhenAgentWaiting, Settings as _};
+
+        let screens = match AgentSettings::get_global(cx).notify_when_agent_waiting {
+            NotifyWhenAgentWaiting::PrimaryScreen => cx.primary_display().into_iter().collect(),
+            NotifyWhenAgentWaiting::AllScreens => cx.displays(),
+            NotifyWhenAgentWaiting::Never => return,
+        };
+        // A newer completion replaces the previous pop-up instead of stacking.
+        self.dismiss_completion_notifications(cx);
+        let title = if title.trim().is_empty() {
+            arena_name.clone()
+        } else {
+            truncate_for_menu(&title)
+        };
+        let caption = if caption.trim().is_empty() {
+            "Finished".to_string()
+        } else {
+            truncate_for_menu(&caption)
+        };
+        for screen in screens {
+            let options = agent_ui::AgentNotification::window_options(screen, cx);
+            let Some(window) = cx
+                .open_window(options, |_window, cx| {
+                    cx.new(|_cx| {
+                        agent_ui::AgentNotification::new(
+                            title.clone(),
+                            Some(caption.clone().into()),
+                            IconName::ZedAssistant,
+                            Some(arena_name.clone()),
+                        )
+                    })
+                })
+                .log_err()
+            else {
+                continue;
+            };
+            let Some(pop_up) = window.entity(cx).log_err() else {
+                continue;
+            };
+            self._completion_notification_subscriptions.push(cx.subscribe(
+                &pop_up,
+                move |this, _, event: &agent_ui::AgentNotificationEvent, cx| match event {
+                    agent_ui::AgentNotificationEvent::Accepted => {
+                        this.dismiss_completion_notifications(cx);
+                        let Some(app_window) = cx
+                            .windows()
+                            .into_iter()
+                            .find_map(|window| window.downcast::<AgentiumApp>())
+                        else {
+                            return;
+                        };
+                        cx.activate(true);
+                        // Deferred: this entity is being updated, and the
+                        // window update below leases it again.
+                        cx.defer(move |cx| {
+                            app_window
+                                .update(cx, |this, window, cx| {
+                                    window.activate_window();
+                                    this.open_inbox_completion(completion_id, window, cx);
+                                })
+                                .log_err();
+                        });
+                    }
+                    agent_ui::AgentNotificationEvent::Dismissed => {
+                        this.dismiss_completion_notifications(cx);
+                    }
+                },
+            ));
+            self.completion_notifications.push(window);
+        }
+    }
+
+    fn dismiss_completion_notifications(&mut self, cx: &mut Context<Self>) {
+        for window in self.completion_notifications.drain(..) {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .log_err();
+        }
+        self._completion_notification_subscriptions.clear();
     }
 
     fn dismiss_inbox_completion(&mut self, completion_id: u64, cx: &mut Context<Self>) {
@@ -4113,6 +4248,9 @@ impl AgentiumApp {
         if changed {
             self.sync_session_derived_state();
             self.notify_all_panes(cx);
+            // Here rather than only in `render`: a window in the background
+            // may not render, and that is when the notification matters.
+            self.sync_inbox_completions(cx);
             cx.notify();
         }
     }
