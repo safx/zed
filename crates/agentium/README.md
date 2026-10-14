@@ -58,6 +58,8 @@ Approval notifications can appear while another pane has focus, even when the Co
 
 ACP tabs left open at Quit are restored when you next open that worktree's Arena. Closing a tab with Cmd+W or closing its Arena removes it from automatic restoration; it does not delete the adapter's conversation history. Agentium stores session IDs and fixed tab names in `codex_acp_tabs.json` in its data directory. Pane layouts and other tabs are not restored; every Arena still opens an initial terminal. A failed restore keeps the tab and offers retry. A conversation interrupted by Quit may restore partial history or report a load error.
 
+Dropping files from Finder onto the tab attaches them to the message: raster images (PNG, JPEG, GIF, WebP, BMP) become image attachments, other files and directories become `@` mentions. Pasting works the same way.
+
 Edit and terminal cards start collapsed, including restored cards. Approval content remains visible. Set `agent.expand_edit_card` or `agent.expand_terminal_card` to `true` in Agentium settings to enable automatic expansion.
 
 This feature is experimental. Automatic ACP Registry installation and remote Arenas are not available. If a directory's environment cannot be loaded, the tab shows a warning and the adapter uses the inherited environment. ACP processes receive `TERM_PROGRAM=agentium` and Agentium's `TERM_PROGRAM_VERSION`.

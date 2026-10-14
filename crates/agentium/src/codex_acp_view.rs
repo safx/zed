@@ -1,4 +1,4 @@
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{any::Any, path::PathBuf, rc::Rc, sync::Arc};
 
 use crate::codex_acp_persistence::SavedCodexTab;
 use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection, ThreadStatus};
@@ -10,10 +10,11 @@ use agent_ui::{
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet};
 use fs::Fs;
-use futures::future::Shared;
+use futures::future::{Shared, join_all};
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global,
-    IntoElement, Render, SharedString, Subscription, Task, WeakEntity, Window, prelude::*,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, Global, IntoElement, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    prelude::*,
 };
 use parking_lot::Mutex;
 use project::{
@@ -23,7 +24,7 @@ use project::{
 use settings::{AgentConfigOptionValue, SettingsStore, update_settings_file};
 use task::Shell;
 use ui::{Indicator, prelude::*};
-use workspace::{Item, Workspace, item::ItemEvent};
+use workspace::{Item, Pane, Workspace, item::ItemEvent};
 
 #[derive(Clone)]
 pub struct LoginEnvironmentReady(pub Shared<futures::channel::oneshot::Receiver<()>>);
@@ -73,6 +74,7 @@ pub(crate) struct CodexAcpView {
     cli_title: SharedString,
     session_id: Option<acp::SessionId>,
     conversation: Entity<ConversationView>,
+    project: Entity<Project>,
     focus_handle: FocusHandle,
     _connection_store: Entity<AgentConnectionStore>,
     working_directory: Option<PathBuf>,
@@ -144,7 +146,7 @@ impl CodexAcpView {
                 None,
                 None,
                 workspace,
-                project,
+                project.clone(),
                 None,
                 AgentThreadSource::AgentPanel,
                 window,
@@ -181,6 +183,7 @@ impl CodexAcpView {
             cli_title: title.into(),
             session_id,
             conversation,
+            project,
             focus_handle,
             _connection_store: connection_store,
             working_directory,
@@ -360,6 +363,49 @@ impl Item for CodexAcpView {
             )
             .into(),
         )
+    }
+    fn handle_drop(
+        &self,
+        _active_pane: &Pane,
+        dropped: &dyn Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(paths) = dropped.downcast_ref::<ExternalPaths>() else {
+            return false;
+        };
+        // Consumed even without a thread: the pane's fallback would open the
+        // files as editor tabs next to a connecting or failed conversation.
+        let Some(thread_view) = self.conversation.read(cx).root_thread_view() else {
+            return true;
+        };
+        let resolutions: Vec<_> = paths
+            .paths()
+            .iter()
+            .map(|path| Workspace::project_path_for_path(self.project.clone(), path, false, cx))
+            .collect();
+        window
+            .spawn(cx, async move |cx| {
+                let mut project_paths = Vec::new();
+                let mut added_worktrees = Vec::new();
+                for resolution in join_all(resolutions).await {
+                    match resolution {
+                        Ok((worktree, project_path)) => {
+                            added_worktrees.push(worktree);
+                            project_paths.push(project_path);
+                        }
+                        Err(error) => log::error!("cannot attach dropped path: {error:#}"),
+                    }
+                }
+                thread_view.update_in(cx, |thread_view, window, cx| {
+                    thread_view.message_editor.update(cx, |editor, cx| {
+                        editor.insert_dragged_files(project_paths, added_worktrees, window, cx);
+                        editor.focus_handle(cx).focus(window, cx);
+                    })
+                })
+            })
+            .detach_and_log_err(cx);
+        true
     }
 }
 impl EventEmitter<ItemEvent> for CodexAcpView {}
@@ -1416,6 +1462,63 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn codex_acp_drop_attaches_files_to_the_input(cx: &mut TestAppContext) {
+        init(cx);
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/arena", serde_json::json!({"notes.md": "dropped"}))
+            .await;
+        let project = Project::test(filesystem, [std::path::Path::new("/arena")], cx).await;
+        let (root, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = root.read_with(cx, |root, _| root.workspace().clone());
+        let view = fake_tab(
+            FakeAcpAgentServer::new(),
+            "/arena",
+            project.clone(),
+            &workspace,
+            cx,
+        );
+        let arena = cx.new_window_entity(|window, cx| {
+            crate::arena::Arena::new(
+                1,
+                "Test".into(),
+                workspace.downgrade(),
+                project,
+                Some("/arena".into()),
+                crate::SharedSessionState::new(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let pane = arena.read_with(cx, |arena, _| arena.active_pane.clone());
+        let dropped = ExternalPaths(vec![PathBuf::from("/arena/notes.md")].into());
+        let handled = pane.update_in(cx, |pane, window, cx| {
+            (
+                workspace::ItemHandle::handle_drop(&view, pane, &dropped, window, cx),
+                workspace::ItemHandle::handle_drop(&view, pane, &"not paths", window, cx),
+            )
+        });
+        assert_eq!(handled, (true, false));
+        cx.run_until_parked();
+        let text = view.read_with(cx, |view, cx| {
+            view.conversation
+                .read(cx)
+                .root_thread_view()
+                .expect("thread view")
+                .read(cx)
+                .message_editor
+                .read(cx)
+                .text(cx)
+        });
+        assert!(
+            text.contains("notes.md"),
+            "dropped file was not attached: {text:?}"
+        );
+    }
+
+    #[gpui::test]
     async fn codex_acp_failed_restore_keeps_the_saved_id(cx: &mut TestAppContext) {
         let (project, workspace, cx) = setup(cx).await;
         let server =
@@ -1445,6 +1548,16 @@ mod tests {
             assert!(view.conversation.read(cx).load_error().is_some());
             assert!(view.send_message("hello", true, window, cx).is_err());
         });
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let dropped = ExternalPaths(vec![PathBuf::from("/arena/notes.md")].into());
+        let consumed = pane.update_in(cx, |pane, window, cx| {
+            workspace::ItemHandle::handle_drop(&view, pane, &dropped, window, cx)
+        });
+        assert!(consumed, "a failed tab must still swallow drops");
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, cx| {
+            view.conversation.read(cx).root_thread_view().is_none()
+        }));
     }
 
     #[gpui::test]
