@@ -656,6 +656,7 @@ pub struct AgentiumApp {
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
     inbox_completions: Vec<InboxCompletion>,
+    inbox_note_editors: HashMap<u64, Entity<Editor>>,
     /// Tabs seen in the Completed state on the previous sync, so a tab that
     /// stays Completed is recorded once, and not again after a dismiss.
     inbox_completed_items: HashSet<EntityId>,
@@ -1012,6 +1013,7 @@ impl AgentiumApp {
                 .unwrap_or(1),
             inbox_questions,
             inbox_completions,
+            inbox_note_editors: HashMap::new(),
             inbox_completed_items: HashSet::new(),
             renaming_task: None,
             task_rename_editor,
@@ -2781,10 +2783,13 @@ impl AgentiumApp {
         }));
     }
 
+    /// Sends the chosen option, with the note typed under the question as its
+    /// condition. A question without options is answered by the note alone,
+    /// so `option_index` is `None` only for those.
     fn answer_inbox_question(
         &mut self,
         question_id: u64,
-        option_index: usize,
+        option_index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2795,15 +2800,31 @@ impl AgentiumApp {
         else {
             return;
         };
+        let note = self
+            .inbox_note_editors
+            .get(&question_id)
+            .map(|editor| editor.read(cx).text(cx).trim().to_string())
+            .unwrap_or_default();
         let question = &self.inbox_questions[position];
-        let Some(option) = question.options.get(option_index) else {
-            return;
+        let answer = match option_index {
+            Some(index) => {
+                let Some(option) = question.options.get(index) else {
+                    return;
+                };
+                if note.is_empty() {
+                    option.label.clone()
+                } else {
+                    format!("{}\nNote: {note}", option.label)
+                }
+            }
+            None if question.options.is_empty() && !note.is_empty() => note,
+            None => return,
         };
         let text = with_from_line(
             "Agentium Inbox",
             &format!(
-                "Answer to your `agentium inbox ask` question.\nQuestion: {}\nAnswer: {}",
-                question.question, option.label
+                "Answer to your `agentium inbox ask` question.\nQuestion: {}\nAnswer: {answer}",
+                question.question
             ),
         );
         let result = match question.live_tab() {
@@ -2813,6 +2834,7 @@ impl AgentiumApp {
         match result {
             Ok(()) => {
                 self.inbox_questions.remove(position);
+                self.inbox_note_editors.remove(&question_id);
                 self.persist_inbox(cx);
             }
             Err(error) => {
@@ -2822,6 +2844,43 @@ impl AgentiumApp {
             }
         }
         cx.notify();
+    }
+
+    fn sync_inbox_note_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let question_ids: HashSet<u64> = self
+            .inbox_questions
+            .iter()
+            .map(|question| question.id)
+            .collect();
+        self.inbox_note_editors
+            .retain(|question_id, _| question_ids.contains(question_id));
+        for question in &self.inbox_questions {
+            let has_options = !question.options.is_empty();
+            self.inbox_note_editors
+                .entry(question.id)
+                .or_insert_with(|| {
+                    cx.new(|cx| {
+                        let mut editor = Editor::auto_height(1, 6, window, cx);
+                        editor.set_placeholder_text(
+                            if has_options {
+                                "Condition or note for the chosen option (optional)"
+                            } else {
+                                "Answer (Enter to send, Shift-Enter for a new line)"
+                            },
+                            window,
+                            cx,
+                        );
+                        editor
+                    })
+                });
+        }
+    }
+
+    fn focused_inbox_note(&self, window: &Window, cx: &App) -> Option<u64> {
+        self.inbox_note_editors
+            .iter()
+            .find(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+            .map(|(question_id, _)| *question_id)
     }
 
     fn open_inbox_question(&mut self, question_id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -6692,7 +6751,7 @@ impl AgentiumApp {
                         )
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.answer_inbox_question(question_id, option_index, window, cx);
+                        this.answer_inbox_question(question_id, Some(option_index), window, cx);
                     }))
                     .into_any_element()
             })
@@ -6731,12 +6790,30 @@ impl AgentiumApp {
                 d.child(div().text_xs().child(context))
             })
             .children(option_buttons)
-            .when(!has_options, |d| {
+            .when_some(self.inbox_note_editors.get(&question_id).cloned(), |d, editor| {
                 d.child(
                     div()
-                        .text_xs()
-                        .text_color(colors.text_muted)
-                        .child("Open the tab to answer"),
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .text_sm()
+                        .child(editor),
+                )
+            })
+            .when(!has_options, |d| {
+                d.child(
+                    h_flex().justify_end().child(
+                        Button::new(
+                            SharedString::from(format!("inbox-question-{question_id}-send")),
+                            "Send",
+                        )
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.answer_inbox_question(question_id, None, window, cx);
+                        })),
+                    ),
                 )
             })
             .when_some(row.resume_hint, |d, hint| {
@@ -7152,11 +7229,12 @@ impl AgentiumApp {
 }
 
 impl Render for AgentiumApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Owned so that closures needing `&mut cx` (e.g. the per-arena row
         // renderer) can run while colors are still in scope.
         let colors = cx.theme().colors().clone();
         self.bind_inbox_tabs(cx);
+        self.sync_inbox_note_editors(window, cx);
         self.sync_inbox_completions(cx);
         let inbox_entries = self.collect_inbox_entries(cx);
 
@@ -7185,8 +7263,12 @@ impl Render for AgentiumApp {
                     // also rendered under the Tasks tab, so their editor can be
                     // focused outside #arena-list; actions stop at the first
                     // matching handler, so exactly one handler must exist here.
-                    .on_action(cx.listener(|this, _: &menu::Confirm, _window, cx| {
-                        if this.adding_issue_to_task.is_some() {
+                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                        if let Some(question_id) = this.focused_inbox_note(window, cx) {
+                            // Enter sends only an option-less question's
+                            // answer; with options, a click picks which one.
+                            this.answer_inbox_question(question_id, None, window, cx);
+                        } else if this.adding_issue_to_task.is_some() {
                             this.finish_add_issue(true, cx);
                         } else if this.renaming_task.is_some() {
                             this.finish_rename_task(true, cx);
@@ -7194,8 +7276,10 @@ impl Render for AgentiumApp {
                             this.finish_rename_arena(true, cx);
                         }
                     }))
-                    .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| {
-                        if this.adding_issue_to_task.is_some() {
+                    .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                        if this.focused_inbox_note(window, cx).is_some() {
+                            // Keep the draft; Escape only leaves the note.
+                        } else if this.adding_issue_to_task.is_some() {
                             this.finish_add_issue(false, cx);
                         } else if this.renaming_task.is_some() {
                             this.finish_rename_task(false, cx);
