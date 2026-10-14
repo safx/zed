@@ -21,11 +21,14 @@ agentium inbox ask "Close the monthly aggregate at JST or UTC midnight?" \
 - `--context` says why you stopped: what the code or spec leaves open, with file and symbol names.
 - Each `--option` is `LABEL :: DESCRIPTION`. The description states the impact and trade-off. Give 2–4 options.
 - `--recommended` is the 1-based option you would pick, if any.
+- Add `--assume` (requires `--recommended`) only when the recommended option is cheap to undo: you keep working on it instead of stopping. Do not assume when the choice is destructive or hard to reverse (schema changes, deletions, public API).
 
 ## After asking
 
-End your turn immediately. Do not keep working on an assumed answer. The user answers from the Inbox and the answer arrives in this tab as a new message starting with `[from: Agentium Inbox]`; continue from there.
+Without `--assume`, end your turn immediately. Do not keep working on an assumed answer. The user answers from the Inbox and the answer arrives in this tab as a new message starting with `[from: Agentium Inbox]`; continue from there.
 
 The `Answer:` line carries the chosen option label, or the user's own text when you gave no options. A following `Note:` line is a condition or correction the user attached to that option; it takes precedence over the option's description.
+
+With `--assume`, continue on the recommended option and mention the assumption in your final report. A message arrives only if the user picks another option (revise the work built on the assumption) or attaches a note to the assumed one (apply it). No message means the assumption stands.
 
 If the command fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), ask the same question in the conversation instead.
