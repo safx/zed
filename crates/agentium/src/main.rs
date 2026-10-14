@@ -65,6 +65,11 @@ enum Command {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Agentium Inbox operations
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -173,6 +178,27 @@ enum TabAction {
         arena: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum InboxAction {
+    /// Ask the user to decide an implementation question from the Agentium Inbox.
+    /// Returns immediately; end your turn afterwards. The answer arrives in this
+    /// tab as a new user message.
+    Ask {
+        /// The decision to make, as one sentence
+        #[arg(allow_hyphen_values = true)]
+        question: String,
+        /// Why you stopped: what the code or spec leaves open
+        #[arg(long, allow_hyphen_values = true)]
+        context: Option<String>,
+        /// A choice, as `LABEL` or `LABEL::DESCRIPTION` (impact and trade-offs); repeatable
+        #[arg(long = "option", allow_hyphen_values = true)]
+        options: Vec<String>,
+        /// 1-based number of the option you recommend
+        #[arg(long)]
+        recommended: Option<usize>,
     },
 }
 
@@ -746,6 +772,45 @@ fn run_tab_action(action: TabAction) -> anyhow::Result<()> {
     }
 }
 
+fn inbox_option_json(option: &str) -> serde_json::Value {
+    match option.split_once("::") {
+        Some((label, description)) => serde_json::json!({
+            "label": label.trim(),
+            "description": description.trim(),
+        }),
+        None => serde_json::json!({ "label": option.trim() }),
+    }
+}
+
+fn run_inbox_action(action: InboxAction) -> anyhow::Result<()> {
+    match action {
+        InboxAction::Ask {
+            question,
+            context,
+            options,
+            recommended,
+        } => {
+            let options: Vec<serde_json::Value> =
+                options.iter().map(|option| inbox_option_json(option)).collect();
+            if recommended == Some(0) {
+                anyhow::bail!("--recommended is 1-based");
+            }
+            let response = cli_request(serde_json::json!({
+                "type": "inbox_ask",
+                "question": question,
+                "context": context,
+                "options": options,
+                "recommended": recommended.map(|number| number - 1),
+            }))?;
+            println!(
+                "Asked in the Agentium Inbox (question {}). End your turn now; the answer will arrive as a new message.",
+                response["id"]
+            );
+            Ok(())
+        }
+    }
+}
+
 enum IpcMessage {
     WorkspacePath(PathBuf),
     ClaudeSessionStart { session_id: String, ancestor_pids: Vec<u32> },
@@ -1310,6 +1375,44 @@ mod peer_pid_tests {
 }
 
 #[cfg(test)]
+mod inbox_cli_tests {
+    use super::{Args, Command, InboxAction, inbox_option_json};
+    use clap::Parser as _;
+
+    #[test]
+    fn inbox_ask_options_split_label_from_description() {
+        let args = Args::try_parse_from([
+            "agentium",
+            "inbox",
+            "ask",
+            "Close the month in JST or UTC?",
+            "--option",
+            "JST 0:00 :: matches the daily job",
+            "--option",
+            "UTC 0:00",
+            "--option",
+            "--assume :: keep going on the recommended answer",
+            "--recommended",
+            "1",
+        ])
+        .expect("inbox ask arguments");
+        let Some(Command::Inbox {
+            action: InboxAction::Ask { options, recommended, .. },
+        }) = args.command
+        else {
+            panic!("expected inbox ask");
+        };
+        assert_eq!(recommended, Some(1));
+        assert_eq!(
+            inbox_option_json(&options[0]),
+            serde_json::json!({ "label": "JST 0:00", "description": "matches the daily job" })
+        );
+        assert_eq!(inbox_option_json(&options[1]), serde_json::json!({ "label": "UTC 0:00" }));
+        assert_eq!(inbox_option_json(&options[2])["label"], "--assume");
+    }
+}
+
+#[cfg(test)]
 mod codex_acp_cli_tests {
     use super::{Args, Command, PaneContentType, TabAction, parse_content_type};
     use clap::Parser as _;
@@ -1741,6 +1844,31 @@ fn handle_cli_request(
             })
             .map(|()| serde_json::json!({ "ok": true })),
         Some("task_list") => Ok(serde_json::json!({ "ok": true, "tasks": app.task_list() })),
+        Some("inbox_ask") => {
+            let options = request["options"]
+                .as_array()
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            Some(agentium::InboxOption {
+                                label: option["label"].as_str()?.to_string(),
+                                description: option["description"].as_str().map(String::from),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            app.inbox_ask(
+                peer_ancestor_pids,
+                request["question"].as_str().unwrap_or_default().to_string(),
+                request["context"].as_str().map(String::from),
+                options,
+                request["recommended"].as_u64().map(|index| index as usize),
+                cx,
+            )
+            .map(|id| serde_json::json!({ "ok": true, "id": id }))
+        }
         other => Err(anyhow::anyhow!("unknown request type {other:?}")),
     };
     Task::ready(
@@ -2148,6 +2276,13 @@ fn main() {
                 if socket.connect(&socket_path).is_ok() {
                     socket.send(msg.to_string().as_bytes()).ok();
                 }
+            }
+            return;
+        }
+        Some(Command::Inbox { action }) => {
+            if let Err(error) = run_inbox_action(action) {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
             }
             return;
         }
