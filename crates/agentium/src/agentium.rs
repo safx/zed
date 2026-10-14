@@ -337,6 +337,80 @@ struct BadgeEntryInfo {
     secondary: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct InboxOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// What survives an Agentium restart to find the asking tab again: tab
+/// entities and shell PIDs do not, but `claude --resume` keeps the session id
+/// and restored ACP tabs keep their saved id.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InboxAsker {
+    ClaudeSession { session_id: String },
+    CodexAcp { saved_id: Uuid },
+}
+
+struct InboxTab {
+    arena: WeakEntity<Arena>,
+    pane: WeakEntity<Pane>,
+    item: Box<dyn workspace::WeakItemHandle>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InboxQuestion {
+    id: u64,
+    question: String,
+    context: Option<String>,
+    options: Vec<InboxOption>,
+    recommended: Option<usize>,
+    arena_name: String,
+    asker: Option<InboxAsker>,
+    #[serde(skip)]
+    tab: Option<InboxTab>,
+    #[serde(skip)]
+    error: Option<String>,
+}
+
+impl InboxQuestion {
+    fn live_tab(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
+        let tab = self.tab.as_ref()?;
+        Some((tab.arena.upgrade()?, tab.pane.upgrade()?, tab.item.upgrade()?))
+    }
+}
+
+struct InboxEntry {
+    arena_index: usize,
+    arena_name: String,
+    info: BadgeEntryInfo,
+}
+
+struct InboxQuestionRow {
+    id: u64,
+    arena_name: String,
+    resume_hint: Option<String>,
+    question: String,
+    context: Option<String>,
+    options: Vec<(String, Option<String>)>,
+    recommended: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct InboxEntries {
+    questions: Vec<InboxQuestionRow>,
+    permission: Vec<InboxEntry>,
+    completed: Vec<InboxEntry>,
+}
+
+impl InboxEntries {
+    fn len(&self) -> usize {
+        self.questions.len() + self.permission.len() + self.completed.len()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalPidInfo {
     pub pid: u32,
@@ -434,6 +508,7 @@ pub struct CiInfo {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarTab {
+    Inbox,
     Repositories,
     Tasks,
 }
@@ -504,6 +579,7 @@ pub struct AgentiumApp {
     last_branch_names: HashMap<EntityId, Option<String>>,
     pr_session_db: HashMap<String, HashMap<String, PrSessionData>>,
     _pr_session_db_write_task: Option<Task<()>>,
+    _inbox_write_task: Option<Task<()>>,
     // Snapshot of the most recent arena-derived PR fetch per canonical worktree
     // path, persisted so `agentium task info` can show PRs without an app
     // instance running. Loaded once at startup; see `apply_pr_fetch_result`.
@@ -521,6 +597,8 @@ pub struct AgentiumApp {
     failed_backlog_issue_keys: HashSet<String>,
     _issue_fetch_task: Option<Task<()>>,
     sidebar_tab: SidebarTab,
+    inbox_questions: Vec<InboxQuestion>,
+    next_inbox_question_id: u64,
     renaming_task: Option<Uuid>,
     task_rename_editor: Entity<Editor>,
     adding_issue_to_task: Option<Uuid>,
@@ -808,6 +886,7 @@ impl AgentiumApp {
             }
         });
 
+        let inbox_questions = load_inbox();
         let mut this = Self {
             codex_tabs,
             _codex_tabs_subscription: codex_tabs_subscription,
@@ -851,6 +930,7 @@ impl AgentiumApp {
             last_branch_names: HashMap::new(),
             pr_session_db: load_pr_session_db(),
             _pr_session_db_write_task: None,
+            _inbox_write_task: None,
             pr_cache: load_pr_cache(),
             _pr_cache_write_task: None,
             board: board::load_board(),
@@ -860,6 +940,12 @@ impl AgentiumApp {
             failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
             sidebar_tab: SidebarTab::Repositories,
+            next_inbox_question_id: inbox_questions
+                .iter()
+                .map(|question| question.id + 1)
+                .max()
+                .unwrap_or(1),
+            inbox_questions,
             renaming_task: None,
             task_rename_editor,
             adding_issue_to_task: None,
@@ -2149,13 +2235,22 @@ impl AgentiumApp {
     }
 
     pub fn tab_self(&self, ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TabInfo> {
+        let (arena, _pane, item) = self.tab_for_ancestors(ancestor_pids, cx)?;
+        Ok(self.tab_info(item.as_ref(), &arena, cx))
+    }
+
+    fn tab_for_ancestors(
+        &self,
+        ancestor_pids: &[u32],
+        cx: &App,
+    ) -> anyhow::Result<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
         for ancestor in ancestor_pids {
             let mut matches = Vec::new();
             for arena in &self.arenas {
                 for pane in arena.read(cx).center.panes() {
                     for item in pane.read(cx).items() {
                         if self.tab_process_id(item.as_ref(), cx) == Some(*ancestor) {
-                            matches.push(self.tab_info(item.as_ref(), arena, cx));
+                            matches.push((arena.clone(), pane.clone(), item.boxed_clone()));
                         }
                     }
                 }
@@ -2163,8 +2258,8 @@ impl AgentiumApp {
             if matches.len() > 1 {
                 anyhow::bail!("caller matches multiple Agentium tabs");
             }
-            if let Some(tab) = matches.pop() {
-                return Ok(tab);
+            if let Some(found) = matches.pop() {
+                return Ok(found);
             }
         }
         anyhow::bail!("caller is not running inside an Agentium terminal or ACP tab")
@@ -2241,17 +2336,26 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let item = self.unique_item_by_title(title, selector, cx)?;
+        self.send_message_to_item(item.as_ref(), submit, &with_from_line(from, text), window, cx)
+    }
+
+    fn send_message_to_item(
+        &mut self,
+        item: &dyn workspace::ItemHandle,
+        submit: bool,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let title = item.tab_content_text(0, cx).to_string();
         if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
-            return view.update(cx, |view, cx| {
-                view.send_message(&with_from_line(from, text), submit, window, cx)
-            });
+            return view.update(cx, |view, cx| view.send_message(text, submit, window, cx));
         }
         let terminal_view = item
             .act_as::<TerminalView>(cx)
             .ok_or_else(|| anyhow::anyhow!("tab {title:?} cannot receive messages"))?;
         let terminal = terminal_view.read(cx).terminal().clone();
-        self.ensure_safe_message_target(title, terminal.read(cx))?;
-        let text = with_from_line(from, text);
+        self.ensure_safe_message_target(&title, terminal.read(cx))?;
         terminal.update(cx, |terminal, _cx| {
             if !text.is_empty() {
                 terminal.paste(&text);
@@ -2307,6 +2411,198 @@ impl AgentiumApp {
             );
         }
         Ok(())
+    }
+
+    /// Registers a question from the tab whose process tree contains
+    /// `peer_ancestor_pids`. Only the kernel-verified peer ancestry is used:
+    /// the answer is later pasted into that tab, so a self-reported pid list
+    /// would let any process redirect it.
+    pub fn inbox_ask(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        question: String,
+        context: Option<String>,
+        options: Vec<InboxOption>,
+        recommended: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<u64> {
+        if question.trim().is_empty() {
+            anyhow::bail!("the question is empty");
+        }
+        if let Some(index) = recommended
+            && index >= options.len()
+        {
+            anyhow::bail!("--recommended {} is out of range", index + 1);
+        }
+        let (arena, pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
+        let id = self.next_inbox_question_id;
+        self.next_inbox_question_id += 1;
+        self.inbox_questions.push(InboxQuestion {
+            id,
+            question,
+            context,
+            options,
+            recommended,
+            arena_name: arena.read(cx).name.clone(),
+            asker: self.inbox_asker(item.as_ref(), cx),
+            tab: Some(InboxTab {
+                arena: arena.downgrade(),
+                pane: pane.downgrade(),
+                item: item.downgrade_item(),
+            }),
+            error: None,
+        });
+        self.persist_inbox(cx);
+        cx.notify();
+        Ok(id)
+    }
+
+    fn inbox_asker(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<InboxAsker> {
+        if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
+            return view
+                .read(cx)
+                .saved_tab()
+                .map(|saved| InboxAsker::CodexAcp { saved_id: saved.id });
+        }
+        let shell_pid = self.terminal_shell_pid(item, cx)?;
+        self.session_state
+            .pid_to_session_id
+            .borrow()
+            .get(&shell_pid)
+            .map(|session_id| InboxAsker::ClaudeSession {
+                session_id: session_id.clone(),
+            })
+    }
+
+    /// Re-attaches questions whose tab is gone (closed, or not yet reopened
+    /// after a restart) to the tab now hosting the same asker, and drops
+    /// questions that have lost their tab and have no asker to wait for.
+    fn bind_inbox_questions(&mut self, cx: &App) {
+        let mut found = Vec::new();
+        for (index, question) in self.inbox_questions.iter().enumerate() {
+            if question.live_tab().is_some() {
+                continue;
+            }
+            let Some(asker) = &question.asker else {
+                continue;
+            };
+            'search: for arena in &self.arenas {
+                for pane in arena.read(cx).center.panes() {
+                    for item in pane.read(cx).items() {
+                        if self.inbox_asker(item.as_ref(), cx).as_ref() == Some(asker) {
+                            found.push((
+                                index,
+                                InboxTab {
+                                    arena: arena.downgrade(),
+                                    pane: pane.downgrade(),
+                                    item: item.downgrade_item(),
+                                },
+                            ));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        for (index, tab) in found {
+            if let Some(question) = self.inbox_questions.get_mut(index) {
+                question.tab = Some(tab);
+                question.error = None;
+            }
+        }
+        self.inbox_questions
+            .retain(|question| question.asker.is_some() || question.live_tab().is_some());
+    }
+
+    fn dismiss_inbox_question(&mut self, question_id: u64, cx: &mut Context<Self>) {
+        self.inbox_questions
+            .retain(|question| question.id != question_id);
+        self.persist_inbox(cx);
+        cx.notify();
+    }
+
+    fn persist_inbox(&mut self, cx: &mut Context<Self>) {
+        let previous = self._inbox_write_task.take();
+        let snapshot = serde_json::to_vec_pretty(
+            &self
+                .inbox_questions
+                .iter()
+                .filter(|question| question.asker.is_some())
+                .collect::<Vec<_>>(),
+        );
+        self._inbox_write_task = Some(cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            snapshot
+                .map_err(anyhow::Error::from)
+                .and_then(|content| write_inbox(&content))
+                .log_err();
+        }));
+    }
+
+    fn answer_inbox_question(
+        &mut self,
+        question_id: u64,
+        option_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(position) = self
+            .inbox_questions
+            .iter()
+            .position(|question| question.id == question_id)
+        else {
+            return;
+        };
+        let question = &self.inbox_questions[position];
+        let Some(option) = question.options.get(option_index) else {
+            return;
+        };
+        let text = with_from_line(
+            "Agentium Inbox",
+            &format!(
+                "Answer to your `agentium inbox ask` question.\nQuestion: {}\nAnswer: {}",
+                question.question, option.label
+            ),
+        );
+        let result = match question.live_tab() {
+            Some((_, _, item)) => self.send_message_to_item(item.as_ref(), true, &text, window, cx),
+            None => Err(anyhow::anyhow!("the asking tab is not open")),
+        };
+        match result {
+            Ok(()) => {
+                self.inbox_questions.remove(position);
+                self.persist_inbox(cx);
+            }
+            Err(error) => {
+                if let Some(question) = self.inbox_questions.get_mut(position) {
+                    question.error = Some(format!("{error:#}"));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_inbox_question(&mut self, question_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(question) = self
+            .inbox_questions
+            .iter()
+            .find(|question| question.id == question_id)
+        else {
+            return;
+        };
+        let Some((arena, pane, item)) = question.live_tab() else {
+            return;
+        };
+        let Some(arena_index) = self
+            .arenas
+            .iter()
+            .position(|candidate| candidate.entity_id() == arena.entity_id())
+        else {
+            return;
+        };
+        self.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
     }
 
     /// All tasks, active and archived (the CLI's `--json` and non-json list
@@ -4191,6 +4487,28 @@ fn is_shell_process_name(name: &str) -> bool {
     )
 }
 
+fn load_inbox() -> Vec<InboxQuestion> {
+    let path = paths::data_dir().join("inbox.json");
+    match std::fs::read(&path) {
+        Ok(content) => serde_json::from_slice(&content)
+            .map_err(|error| anyhow::anyhow!("Failed to parse {}: {error}", path.display()))
+            .log_err()
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn write_inbox(content: &[u8]) -> anyhow::Result<()> {
+    let path = paths::data_dir().join("inbox.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary_path = path.with_extension("json.tmp");
+    std::fs::write(&temporary_path, content)?;
+    std::fs::rename(&temporary_path, &path)?;
+    Ok(())
+}
+
 fn load_pr_session_db() -> HashMap<String, HashMap<String, PrSessionData>> {
     let db_path = paths::data_dir().join("pr.json");
     match std::fs::read_to_string(&db_path) {
@@ -5796,13 +6114,313 @@ impl AgentiumApp {
         (pr_el, review_el)
     }
 
+    fn collect_inbox_entries(&self, cx: &App) -> InboxEntries {
+        let mut entries = InboxEntries::default();
+        for question in &self.inbox_questions {
+            let resume_hint = match (question.live_tab(), &question.asker) {
+                (Some(_), _) | (None, None) => None,
+                (None, Some(InboxAsker::ClaudeSession { session_id })) => Some(format!(
+                    "Tab not open. Resume it with `claude --resume {session_id}`."
+                )),
+                (None, Some(InboxAsker::CodexAcp { .. })) => {
+                    Some("Tab not open. Open its arena to restore it.".to_string())
+                }
+            };
+            entries.questions.push(InboxQuestionRow {
+                id: question.id,
+                arena_name: question.arena_name.clone(),
+                resume_hint,
+                question: question.question.clone(),
+                context: question.context.clone(),
+                options: question
+                    .options
+                    .iter()
+                    .map(|option| (option.label.clone(), option.description.clone()))
+                    .collect(),
+                recommended: question.recommended,
+                error: question.error.clone(),
+            });
+        }
+        // The asking agent ends its turn right after `inbox ask`, which also
+        // marks its tab Completed; listing it twice would hide the question.
+        let asking_items: HashSet<EntityId> = self
+            .inbox_questions
+            .iter()
+            .filter_map(|question| question.tab.as_ref().map(|tab| tab.item.id()))
+            .collect();
+        for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
+            let arena_name = arena_entity.read(cx).name.clone();
+            let to_entry = |info| InboxEntry {
+                arena_index,
+                arena_name: arena_name.clone(),
+                info,
+            };
+            entries.permission.extend(
+                self.collect_permission_terminal_infos(arena_entity, cx)
+                    .into_iter()
+                    .map(to_entry),
+            );
+            entries.completed.extend(
+                self.collect_ready_terminal_infos(arena_entity, cx)
+                    .into_iter()
+                    .filter(|info| !asking_items.contains(&info.item.item_id()))
+                    .map(to_entry),
+            );
+        }
+        entries
+    }
+
+    fn render_inbox(&self, entries: InboxEntries, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
+
+        let lane_header = |label: &'static str, count: usize, swatch: Hsla| {
+            h_flex()
+                .gap_1p5()
+                .px_1()
+                .pt_2()
+                .pb_0p5()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(div().size_2().rounded_sm().bg(swatch))
+                .child(label)
+                .child(
+                    div()
+                        .text_color(colors.text_muted)
+                        .child(count.to_string()),
+                )
+        };
+        let empty_row = || {
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(colors.text_muted)
+                .child("None")
+        };
+        let render_rows = |lane: &'static str, lane_entries: Vec<InboxEntry>, cx: &mut Context<Self>| {
+            lane_entries
+                .into_iter()
+                .enumerate()
+                .map(|(row_index, entry)| {
+                    let InboxEntry {
+                        arena_index,
+                        arena_name,
+                        info,
+                    } = entry;
+                    let primary = if info.primary.is_empty() {
+                        "(no prompt)".to_string()
+                    } else {
+                        truncate_for_menu(&info.primary)
+                    };
+                    let secondary = if info.secondary.is_empty() {
+                        arena_name
+                    } else {
+                        format!("{arena_name} · {}", truncate_for_menu(&info.secondary))
+                    };
+                    v_flex()
+                        .id(SharedString::from(format!("inbox-{lane}-{row_index}")))
+                        .mx_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(colors.element_background)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(colors.element_hover))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(primary),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(colors.text_muted)
+                                .truncate()
+                                .child(secondary),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.navigate_to_item(
+                                arena_index,
+                                &info.pane,
+                                info.item.as_ref(),
+                                window,
+                                cx,
+                            );
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let question_count = entries.questions.len();
+        let question_rows = entries
+            .questions
+            .into_iter()
+            .map(|row| self.render_inbox_question(row, cx))
+            .collect::<Vec<_>>();
+        let permission_count = entries.permission.len();
+        let completed_count = entries.completed.len();
+        let permission_rows = render_rows("permission", entries.permission, cx);
+        let completed_rows = render_rows("completed", entries.completed, cx);
+
+        v_flex()
+            .id("inbox")
+            .flex_1()
+            .overflow_y_scroll()
+            .gap_1()
+            .px_1()
+            .child(lane_header("Needs decision", question_count, colors.terminal_ansi_magenta))
+            .when(question_rows.is_empty(), |d| d.child(empty_row()))
+            .children(question_rows)
+            .child(lane_header("Needs permission", permission_count, status_colors.warning))
+            .when(permission_rows.is_empty(), |d| d.child(empty_row()))
+            .children(permission_rows)
+            .child(lane_header("Completed", completed_count, colors.text_accent))
+            .when(completed_rows.is_empty(), |d| d.child(empty_row()))
+            .children(completed_rows)
+            .into_any_element()
+    }
+
+    fn render_inbox_question(&self, row: InboxQuestionRow, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
+        let question_id = row.id;
+        let has_options = !row.options.is_empty();
+        let option_buttons = row
+            .options
+            .into_iter()
+            .enumerate()
+            .map(|(option_index, (label, description))| {
+                let is_recommended = row.recommended == Some(option_index);
+                v_flex()
+                    .id(SharedString::from(format!(
+                        "inbox-question-{question_id}-option-{option_index}"
+                    )))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_recommended {
+                        colors.terminal_ansi_magenta
+                    } else {
+                        colors.border
+                    })
+                    .cursor_pointer()
+                    .hover(|d| d.bg(colors.element_hover))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .text_color(colors.text_muted)
+                                    .child(format!("{}.", option_index + 1)),
+                            )
+                            .child(label)
+                            .when(is_recommended, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(colors.terminal_ansi_magenta)
+                                        .child("recommended"),
+                                )
+                            }),
+                    )
+                    .when_some(description, |d, description| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors.text_muted)
+                                .child(description),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.answer_inbox_question(question_id, option_index, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .mx_1()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .rounded_md()
+            .bg(colors.element_background)
+            .child(
+                div()
+                    .id(SharedString::from(format!("inbox-question-{question_id}")))
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(colors.text_accent))
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(row.question)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_inbox_question(question_id, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .child(row.arena_name),
+            )
+            .when_some(row.context, |d, context| {
+                d.child(div().text_xs().child(context))
+            })
+            .children(option_buttons)
+            .when(!has_options, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child("Open the tab to answer"),
+                )
+            })
+            .when_some(row.resume_hint, |d, hint| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(status_colors.warning)
+                        .child(hint),
+                )
+            })
+            .when_some(row.error, |d, error| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(status_colors.error)
+                        .child(error),
+                )
+            })
+            .child(
+                h_flex().justify_end().child(
+                    Button::new(
+                        SharedString::from(format!("inbox-question-{question_id}-dismiss")),
+                        "Dismiss",
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.dismiss_inbox_question(question_id, cx);
+                    })),
+                ),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar_tab_button(
         &self,
         label: &'static str,
         tab: SidebarTab,
+        count: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors();
+        let status_colors = cx.theme().status();
         let is_active = self.sidebar_tab == tab;
         h_flex()
             .id(label)
@@ -5821,7 +6439,16 @@ impl AgentiumApp {
                 d.text_color(colors.text_muted)
                     .hover(|d| d.bg(colors.element_hover))
             })
+            .gap_1()
             .child(label)
+            .when(count > 0, |d| {
+                d.child(render_arena_pill(
+                    SharedString::from(format!("{label}-count")),
+                    count,
+                    status_colors.warning,
+                    colors.surface_background,
+                ))
+            })
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.sidebar_tab = tab;
                 cx.notify();
@@ -6172,6 +6799,8 @@ impl Render for AgentiumApp {
         // Owned so that closures needing `&mut cx` (e.g. the per-arena row
         // renderer) can run while colors are still in scope.
         let colors = cx.theme().colors().clone();
+        self.bind_inbox_questions(cx);
+        let inbox_entries = self.collect_inbox_entries(cx);
 
         div()
             .key_context("Agentium")
@@ -6189,7 +6818,7 @@ impl Render for AgentiumApp {
                 div()
                     .flex()
                     .flex_col()
-                    .w(px(240.0))
+                    .w(px(320.0))
                     .h_full()
                     .bg(colors.panel_background)
                     .border_r_1()
@@ -6255,25 +6884,32 @@ impl Render for AgentiumApp {
                             .pb_1()
                             .gap_1()
                             .child(self.render_sidebar_tab_button(
-                                "Repositories",
-                                SidebarTab::Repositories,
+                                "Inbox",
+                                SidebarTab::Inbox,
+                                inbox_entries.len(),
                                 cx,
                             ))
-                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, cx)),
+                            .child(self.render_sidebar_tab_button(
+                                "Repositories",
+                                SidebarTab::Repositories,
+                                0,
+                                cx,
+                            ))
+                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, 0, cx)),
                     )
-                    .child(if self.sidebar_tab == SidebarTab::Repositories {
-                        div()
+                    .child(match self.sidebar_tab {
+                        SidebarTab::Inbox => self.render_inbox(inbox_entries, cx),
+                        SidebarTab::Repositories => div()
                             .id("arena-list")
                             .flex_1()
                             .overflow_y_scroll()
                             .children(
                                 (0..self.arenas.len()).map(|i| self.render_arena_row(i, cx)),
                             )
-                            .into_any_element()
-                    } else {
-                        self.render_task_list(cx)
+                            .into_any_element(),
+                        SidebarTab::Tasks => self.render_task_list(cx),
                     })
-                    .child(if self.sidebar_tab == SidebarTab::Repositories {
+                    .when(self.sidebar_tab == SidebarTab::Repositories, |d| d.child(
                         div()
                             .p_2()
                             .child({
@@ -6297,8 +6933,8 @@ impl Render for AgentiumApp {
                                     )
                                     .anchor(Anchor::BottomLeft)
                             })
-                            .into_any_element()
-                    } else {
+                    ))
+                    .when(self.sidebar_tab == SidebarTab::Tasks, |d| d.child(
                         div()
                             .p_2()
                             .child(
@@ -6308,9 +6944,8 @@ impl Render for AgentiumApp {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.create_task(None, window, cx);
                                     })),
-                            )
-                            .into_any_element()
-                    })
+                            ),
+                    ))
                     .when_some(self.rate_limits.as_ref(), |sidebar, rate_limits| {
                         let is_stale =
                             rate_limits.received_at.elapsed() > Duration::from_secs(3600);
@@ -6821,7 +7456,7 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
-        ClaudeSessionState, WorktreeRow, backlog_issue_keys_in_branch, next_title_driven_state,
+        ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line,
     };
@@ -6830,6 +7465,42 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn inbox_question_persists_its_asker_but_not_its_tab() {
+        let question = InboxQuestion {
+            id: 3,
+            question: "JST or UTC?".to_string(),
+            context: None,
+            options: vec![InboxOption {
+                label: "JST".to_string(),
+                description: Some("matches invoices".to_string()),
+            }],
+            recommended: Some(0),
+            arena_name: "backlog-scala".to_string(),
+            asker: Some(InboxAsker::ClaudeSession {
+                session_id: "c8832ec2".to_string(),
+            }),
+            tab: None,
+            error: Some("the asking tab is not open".to_string()),
+        };
+        let json = serde_json::to_value(&question).expect("serialize");
+        assert_eq!(
+            json["asker"],
+            serde_json::json!({ "kind": "claude_session", "session_id": "c8832ec2" })
+        );
+        assert!(json.get("error").is_none());
+
+        let restored: InboxQuestion = serde_json::from_value(json).expect("deserialize");
+        assert!(restored.tab.is_none() && restored.error.is_none());
+        assert!(
+            restored.asker
+                == Some(InboxAsker::ClaudeSession {
+                    session_id: "c8832ec2".to_string()
+                })
+        );
+        assert_eq!(restored.options[0].label, "JST");
+    }
 
     fn task_with(title: &str, issues: Vec<IssueLink>, prs: Vec<PrRef>) -> BoardTask {
         BoardTask {
