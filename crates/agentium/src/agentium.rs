@@ -395,6 +395,11 @@ struct InboxCompletion {
     detail: String,
     arena_name: String,
     completed_at: DateTime<Utc>,
+    /// Set when the user first looks at the tab. A confirmed record no longer
+    /// counts toward the Inbox badge and expires after
+    /// `INBOX_CONFIRMED_COMPLETION_TTL` or on restart.
+    #[serde(default)]
+    confirmed_at: Option<DateTime<Utc>>,
     asker: Option<InboxAsker>,
     #[serde(skip)]
     tab: Option<InboxTab>,
@@ -410,19 +415,23 @@ struct InboxEntry {
     arena_index: usize,
     arena_name: String,
     info: BadgeEntryInfo,
+    is_active: bool,
 }
 
 struct InboxCompletionRow {
     id: u64,
+    is_active: bool,
     title: String,
     detail: String,
     arena_name: String,
     completed_at: DateTime<Utc>,
     note: Option<&'static str>,
+    confirmed: bool,
 }
 
 struct InboxQuestionRow {
     id: u64,
+    is_active: bool,
     arena_name: String,
     resume_hint: Option<String>,
     question: String,
@@ -440,8 +449,21 @@ struct InboxEntries {
 }
 
 impl InboxEntries {
-    fn len(&self) -> usize {
-        self.questions.len() + self.permission.len() + self.completed.len()
+    /// The count of entries still awaiting the user (confirmed completions
+    /// excluded), colored by the most urgent lane that has any.
+    fn badge(&self, cx: &App) -> Option<(usize, Hsla)> {
+        let unconfirmed = self.completed.iter().filter(|row| !row.confirmed).count();
+        let color = if !self.questions.is_empty() {
+            inbox_decision_color()
+        } else if !self.permission.is_empty() {
+            cx.theme().status().warning
+        } else if unconfirmed > 0 {
+            cx.theme().colors().text_accent
+        } else {
+            return None;
+        };
+        let count = self.questions.len() + self.permission.len() + unconfirmed;
+        Some((count, color))
     }
 }
 
@@ -926,7 +948,8 @@ impl AgentiumApp {
         });
 
         let inbox_questions: Vec<InboxQuestion> = load_inbox_file(INBOX_QUESTIONS_FILE);
-        let inbox_completions: Vec<InboxCompletion> = load_inbox_file(INBOX_COMPLETIONS_FILE);
+        let mut inbox_completions: Vec<InboxCompletion> = load_inbox_file(INBOX_COMPLETIONS_FILE);
+        inbox_completions.retain(|completion| completion.confirmed_at.is_none());
         let mut this = Self {
             codex_tabs,
             _codex_tabs_subscription: codex_tabs_subscription,
@@ -1075,6 +1098,7 @@ impl AgentiumApp {
                 &arena_entity,
                 |this, arena, event: &ArenaEvent, cx| match event {
                     ArenaEvent::CodexTabsChanged => this.sync_codex_tabs(&arena, cx),
+                    ArenaEvent::ActiveItemChanged => cx.notify(),
                     // Claude session clearing routes through AgentiumApp because
                     // claude_sessions state lives here. Non-Claude task acknowledgment
                     // is handled locally in Arena::handle_key_input via the shared
@@ -2586,6 +2610,10 @@ impl AgentiumApp {
     /// A tab keeps one record, replaced by its latest completion. Tabs with a
     /// pending question are skipped: the asking agent ends its turn right
     /// after `inbox ask`, and that is not a finished task.
+    ///
+    /// Then ages the records: one whose tab is working again is dropped, one
+    /// whose tab the user is looking at becomes confirmed, and a confirmed one
+    /// is dropped after `INBOX_CONFIRMED_COMPLETION_TTL`.
     fn sync_inbox_completions(&mut self, cx: &mut Context<Self>) {
         let asking_items: HashSet<EntityId> = self
             .inbox_questions
@@ -2607,9 +2635,7 @@ impl AgentiumApp {
             }
         }
         self.inbox_completed_items = completed_items;
-        if fresh.is_empty() {
-            return;
-        }
+        let mut changed = !fresh.is_empty();
         for (arena, arena_name, info) in fresh {
             let item_id = info.item.item_id();
             let asker = self.inbox_asker(info.item.as_ref(), cx);
@@ -2631,6 +2657,7 @@ impl AgentiumApp {
                     detail: info.secondary,
                     arena_name,
                     completed_at: Utc::now(),
+                    confirmed_at: None,
                     asker,
                     tab: Some(InboxTab {
                         arena,
@@ -2640,7 +2667,46 @@ impl AgentiumApp {
                 },
             );
         }
-        self.persist_inbox_completions(cx);
+
+        let now = Utc::now();
+        let mut expired = HashSet::new();
+        let mut confirmed = HashSet::new();
+        for completion in &self.inbox_completions {
+            if completion
+                .confirmed_at
+                .is_some_and(|confirmed_at| now - confirmed_at > INBOX_CONFIRMED_COMPLETION_TTL)
+            {
+                expired.insert(completion.id);
+                continue;
+            }
+            let Some((arena, pane, item)) = completion.live_tab() else {
+                continue;
+            };
+            if matches!(
+                self.tab_info(item.as_ref(), &arena, cx).state,
+                Some("running" | "permission")
+            ) {
+                expired.insert(completion.id);
+            } else if completion.confirmed_at.is_none()
+                && self.is_active_tab(&arena, &pane, item.item_id(), cx)
+            {
+                confirmed.insert(completion.id);
+            }
+        }
+        if !expired.is_empty() {
+            self.inbox_completions
+                .retain(|completion| !expired.contains(&completion.id));
+            changed = true;
+        }
+        for completion in &mut self.inbox_completions {
+            if confirmed.contains(&completion.id) {
+                completion.confirmed_at = Some(now);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_inbox_completions(cx);
+        }
     }
 
     fn dismiss_inbox_completion(&mut self, completion_id: u64, cx: &mut Context<Self>) {
@@ -4669,6 +4735,7 @@ fn inbox_decision_color() -> Hsla {
 
 const INBOX_QUESTIONS_FILE: &str = "inbox.json";
 const INBOX_COMPLETIONS_FILE: &str = "inbox_completions.json";
+const INBOX_CONFIRMED_COMPLETION_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 fn load_inbox_file<T: serde::de::DeserializeOwned>(file_name: &str) -> Vec<T> {
     let path = paths::data_dir().join(file_name);
@@ -6297,6 +6364,23 @@ impl AgentiumApp {
         (pr_el, review_el)
     }
 
+    /// Whether `item_id` is the tab the user is looking at: the active item of
+    /// the active pane of the active arena.
+    fn is_active_tab(
+        &self,
+        arena: &Entity<Arena>,
+        pane: &Entity<Pane>,
+        item_id: EntityId,
+        cx: &App,
+    ) -> bool {
+        self.active_arena_index.and_then(|index| self.arenas.get(index)) == Some(arena)
+            && arena.read(cx).active_pane == *pane
+            && pane
+                .read(cx)
+                .active_item()
+                .is_some_and(|item| item.item_id() == item_id)
+    }
+
     fn collect_inbox_entries(&self, cx: &App) -> InboxEntries {
         let mut entries = InboxEntries::default();
         for question in &self.inbox_questions {
@@ -6311,6 +6395,9 @@ impl AgentiumApp {
             };
             entries.questions.push(InboxQuestionRow {
                 id: question.id,
+                is_active: question.live_tab().is_some_and(|(arena, pane, item)| {
+                    self.is_active_tab(&arena, &pane, item.item_id(), cx)
+                }),
                 arena_name: question.arena_name.clone(),
                 resume_hint,
                 question: question.question.clone(),
@@ -6325,27 +6412,26 @@ impl AgentiumApp {
             });
         }
         for completion in &self.inbox_completions {
-            let note = match completion.live_tab() {
-                None => Some("tab not open"),
-                Some((arena, _, item)) => match self.tab_info(item.as_ref(), &arena, cx).state {
-                    Some("running" | "permission") => Some("running again"),
-                    _ => None,
-                },
-            };
+            let note = completion.live_tab().is_none().then_some("tab not open");
             entries.completed.push(InboxCompletionRow {
                 id: completion.id,
+                is_active: completion.live_tab().is_some_and(|(arena, pane, item)| {
+                    self.is_active_tab(&arena, &pane, item.item_id(), cx)
+                }),
                 title: completion.title.clone(),
                 detail: completion.detail.clone(),
                 arena_name: completion.arena_name.clone(),
                 completed_at: completion.completed_at,
+                confirmed: completion.confirmed_at.is_some(),
                 note,
             });
         }
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
             let arena_name = arena_entity.read(cx).name.clone();
-            let to_entry = |info| InboxEntry {
+            let to_entry = |info: BadgeEntryInfo| InboxEntry {
                 arena_index,
                 arena_name: arena_name.clone(),
+                is_active: self.is_active_tab(arena_entity, &info.pane, info.item.item_id(), cx),
                 info,
             };
             entries.permission.extend(
@@ -6394,6 +6480,7 @@ impl AgentiumApp {
                         arena_index,
                         arena_name,
                         info,
+                        is_active,
                     } = entry;
                     let primary = if info.primary.is_empty() {
                         "(no prompt)".to_string()
@@ -6411,7 +6498,11 @@ impl AgentiumApp {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(colors.element_background)
+                        .bg(if is_active {
+                            colors.element_selected
+                        } else {
+                            colors.element_background
+                        })
                         .cursor_pointer()
                         .hover(|d| d.bg(colors.element_hover))
                         .child(
@@ -6494,12 +6585,17 @@ impl AgentiumApp {
         }
         h_flex()
             .id(SharedString::from(format!("inbox-completion-{completion_id}")))
+            .when(row.confirmed, |d| d.opacity(0.6))
             .mx_1()
             .px_2()
             .py_1()
             .gap_1()
             .rounded_md()
-            .bg(colors.element_background)
+            .bg(if row.is_active {
+                colors.element_selected
+            } else {
+                colors.element_background
+            })
             .cursor_pointer()
             .hover(|d| d.bg(colors.element_hover))
             .child(
@@ -6608,7 +6704,11 @@ impl AgentiumApp {
             .py_1()
             .gap_1()
             .rounded_md()
-            .bg(colors.element_background)
+            .bg(if row.is_active {
+                colors.element_selected
+            } else {
+                colors.element_background
+            })
             .child(
                 div()
                     .id(SharedString::from(format!("inbox-question-{question_id}")))
@@ -6674,11 +6774,10 @@ impl AgentiumApp {
         &self,
         label: &'static str,
         tab: SidebarTab,
-        count: usize,
+        badge: Option<(usize, Hsla)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let status_colors = cx.theme().status();
         let is_active = self.sidebar_tab == tab;
         h_flex()
             .id(label)
@@ -6699,11 +6798,11 @@ impl AgentiumApp {
             })
             .gap_1()
             .child(label)
-            .when(count > 0, |d| {
+            .when_some(badge, |d, (count, color)| {
                 d.child(render_arena_pill(
                     SharedString::from(format!("{label}-count")),
                     count,
-                    status_colors.warning,
+                    color,
                     colors.surface_background,
                 ))
             })
@@ -7145,16 +7244,16 @@ impl Render for AgentiumApp {
                             .child(self.render_sidebar_tab_button(
                                 "Inbox",
                                 SidebarTab::Inbox,
-                                inbox_entries.len(),
+                                inbox_entries.badge(cx),
                                 cx,
                             ))
                             .child(self.render_sidebar_tab_button(
                                 "Repositories",
                                 SidebarTab::Repositories,
-                                0,
+                                None,
                                 cx,
                             ))
-                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, 0, cx)),
+                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, None, cx)),
                     )
                     .child(match self.sidebar_tab {
                         SidebarTab::Inbox => self.render_inbox(inbox_entries, cx),
