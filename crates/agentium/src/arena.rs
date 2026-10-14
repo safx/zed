@@ -41,6 +41,8 @@ use crate::{
 
 pub(crate) enum ArenaEvent {
     CodexTabsChanged,
+    /// The active pane or a pane's active item changed.
+    ActiveItemChanged,
     TerminalKeyInput { shell_pid: u32 },
     /// The agent state read from the terminal title changed.
     TerminalTitleState { shell_pid: u32, state: TitleState },
@@ -1142,7 +1144,7 @@ impl Arena {
                     window.focus(&new_pane.focus_handle(cx), cx);
                 }
             },
-            pane::Event::ActivateItem { .. } => {}
+            pane::Event::ActivateItem { .. } => cx.emit(ArenaEvent::ActiveItemChanged),
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
                 if let Some(workspace) = self.workspace.upgrade() {
@@ -1150,6 +1152,7 @@ impl Arena {
                         workspace.set_last_active_center_pane(pane);
                     });
                 }
+                cx.emit(ArenaEvent::ActiveItemChanged);
                 cx.notify();
             }
             _ => {}
