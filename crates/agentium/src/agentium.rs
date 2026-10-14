@@ -374,10 +374,35 @@ struct InboxQuestion {
     error: Option<String>,
 }
 
+impl InboxTab {
+    fn live(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
+        Some((self.arena.upgrade()?, self.pane.upgrade()?, self.item.upgrade()?))
+    }
+}
+
 impl InboxQuestion {
     fn live_tab(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
-        let tab = self.tab.as_ref()?;
-        Some((tab.arena.upgrade()?, tab.pane.upgrade()?, tab.item.upgrade()?))
+        self.tab.as_ref()?.live()
+    }
+}
+
+/// A turn that finished, kept until the user dismisses it: the live Completed
+/// state it is recorded from clears as soon as the tab is touched.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InboxCompletion {
+    id: u64,
+    title: String,
+    detail: String,
+    arena_name: String,
+    completed_at: DateTime<Utc>,
+    asker: Option<InboxAsker>,
+    #[serde(skip)]
+    tab: Option<InboxTab>,
+}
+
+impl InboxCompletion {
+    fn live_tab(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
+        self.tab.as_ref()?.live()
     }
 }
 
@@ -385,6 +410,15 @@ struct InboxEntry {
     arena_index: usize,
     arena_name: String,
     info: BadgeEntryInfo,
+}
+
+struct InboxCompletionRow {
+    id: u64,
+    title: String,
+    detail: String,
+    arena_name: String,
+    completed_at: DateTime<Utc>,
+    note: Option<&'static str>,
 }
 
 struct InboxQuestionRow {
@@ -402,7 +436,7 @@ struct InboxQuestionRow {
 struct InboxEntries {
     questions: Vec<InboxQuestionRow>,
     permission: Vec<InboxEntry>,
-    completed: Vec<InboxEntry>,
+    completed: Vec<InboxCompletionRow>,
 }
 
 impl InboxEntries {
@@ -599,6 +633,11 @@ pub struct AgentiumApp {
     sidebar_tab: SidebarTab,
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
+    inbox_completions: Vec<InboxCompletion>,
+    /// Tabs seen in the Completed state on the previous sync, so a tab that
+    /// stays Completed is recorded once, and not again after a dismiss.
+    inbox_completed_items: HashSet<EntityId>,
+    _inbox_completions_write_task: Option<Task<()>>,
     renaming_task: Option<Uuid>,
     task_rename_editor: Entity<Editor>,
     adding_issue_to_task: Option<Uuid>,
@@ -886,7 +925,8 @@ impl AgentiumApp {
             }
         });
 
-        let inbox_questions = load_inbox();
+        let inbox_questions: Vec<InboxQuestion> = load_inbox_file(INBOX_QUESTIONS_FILE);
+        let inbox_completions: Vec<InboxCompletion> = load_inbox_file(INBOX_COMPLETIONS_FILE);
         let mut this = Self {
             codex_tabs,
             _codex_tabs_subscription: codex_tabs_subscription,
@@ -931,6 +971,7 @@ impl AgentiumApp {
             pr_session_db: load_pr_session_db(),
             _pr_session_db_write_task: None,
             _inbox_write_task: None,
+            _inbox_completions_write_task: None,
             pr_cache: load_pr_cache(),
             _pr_cache_write_task: None,
             board: board::load_board(),
@@ -943,9 +984,12 @@ impl AgentiumApp {
             next_inbox_question_id: inbox_questions
                 .iter()
                 .map(|question| question.id + 1)
+                .chain(inbox_completions.iter().map(|completion| completion.id + 1))
                 .max()
                 .unwrap_or(1),
             inbox_questions,
+            inbox_completions,
+            inbox_completed_items: HashSet::new(),
             renaming_task: None,
             task_rename_editor,
             adding_issue_to_task: None,
@@ -2474,34 +2518,22 @@ impl AgentiumApp {
             })
     }
 
-    /// Re-attaches questions whose tab is gone (closed, or not yet reopened
-    /// after a restart) to the tab now hosting the same asker, and drops
-    /// questions that have lost their tab and have no asker to wait for.
-    fn bind_inbox_questions(&mut self, cx: &App) {
+    /// Re-attaches questions and completions whose tab is gone (closed, or
+    /// not yet reopened after a restart) to the tab now hosting the same
+    /// asker, and drops questions that have lost their tab and have no asker
+    /// to wait for. Completions stay until dismissed.
+    fn bind_inbox_tabs(&mut self, cx: &App) {
         let mut found = Vec::new();
         for (index, question) in self.inbox_questions.iter().enumerate() {
             if question.live_tab().is_some() {
                 continue;
             }
-            let Some(asker) = &question.asker else {
-                continue;
-            };
-            'search: for arena in &self.arenas {
-                for pane in arena.read(cx).center.panes() {
-                    for item in pane.read(cx).items() {
-                        if self.inbox_asker(item.as_ref(), cx).as_ref() == Some(asker) {
-                            found.push((
-                                index,
-                                InboxTab {
-                                    arena: arena.downgrade(),
-                                    pane: pane.downgrade(),
-                                    item: item.downgrade_item(),
-                                },
-                            ));
-                            break 'search;
-                        }
-                    }
-                }
+            if let Some(tab) = question
+                .asker
+                .as_ref()
+                .and_then(|asker| self.tab_for_asker(asker, cx))
+            {
+                found.push((index, tab));
             }
         }
         for (index, tab) in found {
@@ -2512,6 +2544,148 @@ impl AgentiumApp {
         }
         self.inbox_questions
             .retain(|question| question.asker.is_some() || question.live_tab().is_some());
+
+        let mut found = Vec::new();
+        for (index, completion) in self.inbox_completions.iter().enumerate() {
+            if completion.live_tab().is_some() {
+                continue;
+            }
+            if let Some(tab) = completion
+                .asker
+                .as_ref()
+                .and_then(|asker| self.tab_for_asker(asker, cx))
+            {
+                found.push((index, tab));
+            }
+        }
+        for (index, tab) in found {
+            if let Some(completion) = self.inbox_completions.get_mut(index) {
+                completion.tab = Some(tab);
+            }
+        }
+    }
+
+    fn tab_for_asker(&self, asker: &InboxAsker, cx: &App) -> Option<InboxTab> {
+        for arena in &self.arenas {
+            for pane in arena.read(cx).center.panes() {
+                for item in pane.read(cx).items() {
+                    if self.inbox_asker(item.as_ref(), cx).as_ref() == Some(asker) {
+                        return Some(InboxTab {
+                            arena: arena.downgrade(),
+                            pane: pane.downgrade(),
+                            item: item.downgrade_item(),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Records each tab that entered the Completed state since the last sync.
+    /// A tab keeps one record, replaced by its latest completion. Tabs with a
+    /// pending question are skipped: the asking agent ends its turn right
+    /// after `inbox ask`, and that is not a finished task.
+    fn sync_inbox_completions(&mut self, cx: &mut Context<Self>) {
+        let asking_items: HashSet<EntityId> = self
+            .inbox_questions
+            .iter()
+            .filter_map(|question| question.tab.as_ref().map(|tab| tab.item.id()))
+            .collect();
+        let mut completed_items = HashSet::new();
+        let mut fresh = Vec::new();
+        for arena in &self.arenas {
+            let arena_name = arena.read(cx).name.clone();
+            for info in self.collect_ready_terminal_infos(arena, cx) {
+                let item_id = info.item.item_id();
+                completed_items.insert(item_id);
+                if !self.inbox_completed_items.contains(&item_id)
+                    && !asking_items.contains(&item_id)
+                {
+                    fresh.push((arena.downgrade(), arena_name.clone(), info));
+                }
+            }
+        }
+        self.inbox_completed_items = completed_items;
+        if fresh.is_empty() {
+            return;
+        }
+        for (arena, arena_name, info) in fresh {
+            let item_id = info.item.item_id();
+            let asker = self.inbox_asker(info.item.as_ref(), cx);
+            self.inbox_completions.retain(|completion| {
+                let same_tab = completion
+                    .tab
+                    .as_ref()
+                    .is_some_and(|tab| tab.item.id() == item_id);
+                let same_asker = asker.is_some() && completion.asker == asker;
+                !same_tab && !same_asker
+            });
+            let id = self.next_inbox_question_id;
+            self.next_inbox_question_id += 1;
+            self.inbox_completions.insert(
+                0,
+                InboxCompletion {
+                    id,
+                    title: info.primary,
+                    detail: info.secondary,
+                    arena_name,
+                    completed_at: Utc::now(),
+                    asker,
+                    tab: Some(InboxTab {
+                        arena,
+                        pane: info.pane.downgrade(),
+                        item: info.item.downgrade_item(),
+                    }),
+                },
+            );
+        }
+        self.persist_inbox_completions(cx);
+    }
+
+    fn dismiss_inbox_completion(&mut self, completion_id: u64, cx: &mut Context<Self>) {
+        self.inbox_completions
+            .retain(|completion| completion.id != completion_id);
+        self.persist_inbox_completions(cx);
+        cx.notify();
+    }
+
+    fn open_inbox_completion(
+        &mut self,
+        completion_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((arena, pane, item)) = self
+            .inbox_completions
+            .iter()
+            .find(|completion| completion.id == completion_id)
+            .and_then(|completion| completion.live_tab())
+        else {
+            return;
+        };
+        let Some(arena_index) = self
+            .arenas
+            .iter()
+            .position(|candidate| candidate.entity_id() == arena.entity_id())
+        else {
+            return;
+        };
+        self.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
+    }
+
+    fn persist_inbox_completions(&mut self, cx: &mut Context<Self>) {
+        let previous = self._inbox_completions_write_task.take();
+        let snapshot = serde_json::to_vec_pretty(&self.inbox_completions);
+        self._inbox_completions_write_task = Some(cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            snapshot
+                .map_err(anyhow::Error::from)
+                .and_then(|content| write_inbox_file(INBOX_COMPLETIONS_FILE, &content))
+                .log_err();
+        }));
     }
 
     fn dismiss_inbox_question(&mut self, question_id: u64, cx: &mut Context<Self>) {
@@ -2536,7 +2710,7 @@ impl AgentiumApp {
             }
             snapshot
                 .map_err(anyhow::Error::from)
-                .and_then(|content| write_inbox(&content))
+                .and_then(|content| write_inbox_file(INBOX_QUESTIONS_FILE, &content))
                 .log_err();
         }));
     }
@@ -4487,8 +4661,17 @@ fn is_shell_process_name(name: &str) -> bool {
     )
 }
 
-fn load_inbox() -> Vec<InboxQuestion> {
-    let path = paths::data_dir().join("inbox.json");
+// Not the theme's `terminal_ansi_magenta`: several themes map it to a blue
+// indistinguishable from the Completed lane's accent.
+fn inbox_decision_color() -> Hsla {
+    rgb(0xb48ef2).into()
+}
+
+const INBOX_QUESTIONS_FILE: &str = "inbox.json";
+const INBOX_COMPLETIONS_FILE: &str = "inbox_completions.json";
+
+fn load_inbox_file<T: serde::de::DeserializeOwned>(file_name: &str) -> Vec<T> {
+    let path = paths::data_dir().join(file_name);
     match std::fs::read(&path) {
         Ok(content) => serde_json::from_slice(&content)
             .map_err(|error| anyhow::anyhow!("Failed to parse {}: {error}", path.display()))
@@ -4498,8 +4681,8 @@ fn load_inbox() -> Vec<InboxQuestion> {
     }
 }
 
-fn write_inbox(content: &[u8]) -> anyhow::Result<()> {
-    let path = paths::data_dir().join("inbox.json");
+fn write_inbox_file(file_name: &str, content: &[u8]) -> anyhow::Result<()> {
+    let path = paths::data_dir().join(file_name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -6141,13 +6324,23 @@ impl AgentiumApp {
                 error: question.error.clone(),
             });
         }
-        // The asking agent ends its turn right after `inbox ask`, which also
-        // marks its tab Completed; listing it twice would hide the question.
-        let asking_items: HashSet<EntityId> = self
-            .inbox_questions
-            .iter()
-            .filter_map(|question| question.tab.as_ref().map(|tab| tab.item.id()))
-            .collect();
+        for completion in &self.inbox_completions {
+            let note = match completion.live_tab() {
+                None => Some("tab not open"),
+                Some((arena, _, item)) => match self.tab_info(item.as_ref(), &arena, cx).state {
+                    Some("running" | "permission") => Some("running again"),
+                    _ => None,
+                },
+            };
+            entries.completed.push(InboxCompletionRow {
+                id: completion.id,
+                title: completion.title.clone(),
+                detail: completion.detail.clone(),
+                arena_name: completion.arena_name.clone(),
+                completed_at: completion.completed_at,
+                note,
+            });
+        }
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
             let arena_name = arena_entity.read(cx).name.clone();
             let to_entry = |info| InboxEntry {
@@ -6158,12 +6351,6 @@ impl AgentiumApp {
             entries.permission.extend(
                 self.collect_permission_terminal_infos(arena_entity, cx)
                     .into_iter()
-                    .map(to_entry),
-            );
-            entries.completed.extend(
-                self.collect_ready_terminal_infos(arena_entity, cx)
-                    .into_iter()
-                    .filter(|info| !asking_items.contains(&info.item.item_id()))
                     .map(to_entry),
             );
         }
@@ -6264,7 +6451,11 @@ impl AgentiumApp {
         let permission_count = entries.permission.len();
         let completed_count = entries.completed.len();
         let permission_rows = render_rows("permission", entries.permission, cx);
-        let completed_rows = render_rows("completed", entries.completed, cx);
+        let completed_rows = entries
+            .completed
+            .into_iter()
+            .map(|row| self.render_inbox_completion(row, cx))
+            .collect::<Vec<_>>();
 
         v_flex()
             .id("inbox")
@@ -6272,7 +6463,7 @@ impl AgentiumApp {
             .overflow_y_scroll()
             .gap_1()
             .px_1()
-            .child(lane_header("Needs decision", question_count, colors.terminal_ansi_magenta))
+            .child(lane_header("Needs decision", question_count, inbox_decision_color()))
             .when(question_rows.is_empty(), |d| d.child(empty_row()))
             .children(question_rows)
             .child(lane_header("Needs permission", permission_count, status_colors.warning))
@@ -6281,6 +6472,73 @@ impl AgentiumApp {
             .child(lane_header("Completed", completed_count, colors.text_accent))
             .when(completed_rows.is_empty(), |d| d.child(empty_row()))
             .children(completed_rows)
+            .into_any_element()
+    }
+
+    fn render_inbox_completion(&self, row: InboxCompletionRow, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let completion_id = row.id;
+        let title = if row.title.is_empty() {
+            "(no prompt)".to_string()
+        } else {
+            truncate_for_menu(&row.title)
+        };
+        let mut detail = format!(
+            "{} · {}",
+            row.completed_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+            row.arena_name
+        );
+        if !row.detail.is_empty() {
+            detail.push_str(" · ");
+            detail.push_str(&truncate_for_menu(&row.detail));
+        }
+        h_flex()
+            .id(SharedString::from(format!("inbox-completion-{completion_id}")))
+            .mx_1()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .rounded_md()
+            .bg(colors.element_background)
+            .cursor_pointer()
+            .hover(|d| d.bg(colors.element_hover))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .truncate()
+                            .child(detail),
+                    )
+                    .when_some(row.note, |d, note| {
+                        d.child(div().text_xs().text_color(colors.text_accent).child(note))
+                    }),
+            )
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("inbox-completion-{completion_id}-dismiss")),
+                    IconName::Close,
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text("Dismiss"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.dismiss_inbox_completion(completion_id, cx);
+                })),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_inbox_completion(completion_id, window, cx);
+            }))
             .into_any_element()
     }
 
@@ -6304,7 +6562,7 @@ impl AgentiumApp {
                     .rounded_md()
                     .border_1()
                     .border_color(if is_recommended {
-                        colors.terminal_ansi_magenta
+                        inbox_decision_color()
                     } else {
                         colors.border
                     })
@@ -6324,7 +6582,7 @@ impl AgentiumApp {
                                 d.child(
                                     div()
                                         .text_xs()
-                                        .text_color(colors.terminal_ansi_magenta)
+                                        .text_color(inbox_decision_color())
                                         .child("recommended"),
                                 )
                             }),
@@ -6799,7 +7057,8 @@ impl Render for AgentiumApp {
         // Owned so that closures needing `&mut cx` (e.g. the per-arena row
         // renderer) can run while colors are still in scope.
         let colors = cx.theme().colors().clone();
-        self.bind_inbox_questions(cx);
+        self.bind_inbox_tabs(cx);
+        self.sync_inbox_completions(cx);
         let inbox_entries = self.collect_inbox_entries(cx);
 
         div()
