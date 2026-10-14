@@ -199,6 +199,10 @@ enum InboxAction {
         /// 1-based number of the option you recommend
         #[arg(long)]
         recommended: Option<usize>,
+        /// Keep working on the recommended option instead of ending your turn;
+        /// a message arrives only if the user picks differently or adds a note
+        #[arg(long, requires = "recommended")]
+        assume: bool,
     },
 }
 
@@ -789,6 +793,7 @@ fn run_inbox_action(action: InboxAction) -> anyhow::Result<()> {
             context,
             options,
             recommended,
+            assume,
         } => {
             let options: Vec<serde_json::Value> =
                 options.iter().map(|option| inbox_option_json(option)).collect();
@@ -801,11 +806,19 @@ fn run_inbox_action(action: InboxAction) -> anyhow::Result<()> {
                 "context": context,
                 "options": options,
                 "recommended": recommended.map(|number| number - 1),
+                "assume": assume,
             }))?;
-            println!(
-                "Asked in the Agentium Inbox (question {}). End your turn now; the answer will arrive as a new message.",
-                response["id"]
-            );
+            if assume {
+                println!(
+                    "Asked in the Agentium Inbox (question {}). Continue with the option you assumed; if the user picks another or adds a note, the answer will arrive as a new message.",
+                    response["id"]
+                );
+            } else {
+                println!(
+                    "Asked in the Agentium Inbox (question {}). End your turn now; the answer will arrive as a new message.",
+                    response["id"]
+                );
+            }
             Ok(())
         }
     }
@@ -1410,6 +1423,21 @@ mod inbox_cli_tests {
         assert_eq!(inbox_option_json(&options[1]), serde_json::json!({ "label": "UTC 0:00" }));
         assert_eq!(inbox_option_json(&options[2])["label"], "--assume");
     }
+
+    #[test]
+    fn inbox_ask_assume_requires_a_recommended_option() {
+        assert!(Args::try_parse_from(["agentium", "inbox", "ask", "Q?", "--assume"]).is_err());
+        let args = Args::try_parse_from([
+            "agentium", "inbox", "ask", "Q?", "--option", "A", "--recommended", "1", "--assume",
+        ])
+        .expect("inbox ask --assume arguments");
+        assert!(matches!(
+            args.command,
+            Some(Command::Inbox {
+                action: InboxAction::Ask { assume: true, .. }
+            })
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1865,6 +1893,7 @@ fn handle_cli_request(
                 request["context"].as_str().map(String::from),
                 options,
                 request["recommended"].as_u64().map(|index| index as usize),
+                request["assume"].as_bool().unwrap_or(false),
                 cx,
             )
             .map(|id| serde_json::json!({ "ok": true, "id": id }))

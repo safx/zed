@@ -366,6 +366,10 @@ struct InboxQuestion {
     context: Option<String>,
     options: Vec<InboxOption>,
     recommended: Option<usize>,
+    /// The agent kept working on the recommended option instead of ending
+    /// its turn (`inbox ask --assume`).
+    #[serde(default)]
+    assumed: bool,
     arena_name: String,
     asker: Option<InboxAsker>,
     #[serde(skip)]
@@ -438,6 +442,7 @@ struct InboxQuestionRow {
     context: Option<String>,
     options: Vec<(String, Option<String>)>,
     recommended: Option<usize>,
+    assumed: bool,
     error: Option<String>,
 }
 
@@ -2494,10 +2499,14 @@ impl AgentiumApp {
         context: Option<String>,
         options: Vec<InboxOption>,
         recommended: Option<usize>,
+        assumed: bool,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<u64> {
         if question.trim().is_empty() {
             anyhow::bail!("the question is empty");
+        }
+        if assumed && recommended.is_none() {
+            anyhow::bail!("--assume needs --recommended to name the assumed option");
         }
         if let Some(index) = recommended
             && index >= options.len()
@@ -2513,6 +2522,7 @@ impl AgentiumApp {
             context,
             options,
             recommended,
+            assumed,
             arena_name: arena.read(cx).name.clone(),
             asker: self.inbox_asker(item.as_ref(), cx),
             tab: Some(InboxTab {
@@ -2611,7 +2621,8 @@ impl AgentiumApp {
     /// Records each tab that entered the Completed state since the last sync.
     /// A tab keeps one record, replaced by its latest completion. Tabs with a
     /// pending question are skipped: the asking agent ends its turn right
-    /// after `inbox ask`, and that is not a finished task.
+    /// after `inbox ask`, and that is not a finished task. An `--assume`
+    /// question does not stop the agent, so its tab's completions count.
     ///
     /// Then ages the records: one whose tab is working again is dropped, one
     /// whose tab the user is looking at becomes confirmed, and a confirmed one
@@ -2620,6 +2631,7 @@ impl AgentiumApp {
         let asking_items: HashSet<EntityId> = self
             .inbox_questions
             .iter()
+            .filter(|question| !question.assumed)
             .filter_map(|question| question.tab.as_ref().map(|tab| tab.item.id()))
             .collect();
         let mut completed_items = HashSet::new();
@@ -2806,7 +2818,7 @@ impl AgentiumApp {
             .map(|editor| editor.read(cx).text(cx).trim().to_string())
             .unwrap_or_default();
         let question = &self.inbox_questions[position];
-        let answer = match option_index {
+        let mut answer = match option_index {
             Some(index) => {
                 let Some(option) = question.options.get(index) else {
                     return;
@@ -2817,9 +2829,33 @@ impl AgentiumApp {
                     format!("{}\nNote: {note}", option.label)
                 }
             }
-            None if question.options.is_empty() && !note.is_empty() => note,
+            None if question.options.is_empty() && !note.is_empty() => note.clone(),
             None => return,
         };
+        let assumed_index = question.recommended.filter(|_| question.assumed);
+        if let Some(assumed_index) = assumed_index {
+            if option_index == Some(assumed_index) && note.is_empty() {
+                // The agent is already working on this answer; telling it so
+                // would only start a needless turn.
+                self.inbox_questions.remove(position);
+                self.inbox_note_editors.remove(&question_id);
+                self.persist_inbox(cx);
+                cx.notify();
+                return;
+            }
+            let assumed_label = question
+                .options
+                .get(assumed_index)
+                .map(|option| option.label.as_str())
+                .unwrap_or_default();
+            if option_index == Some(assumed_index) {
+                answer.push_str("\nThis matches the option you assumed; apply the note.");
+            } else {
+                answer.push_str(&format!(
+                    "\nYou assumed \"{assumed_label}\". Revise the work you did on that assumption."
+                ));
+            }
+        }
         let text = with_from_line(
             "Agentium Inbox",
             &format!(
@@ -6467,6 +6503,7 @@ impl AgentiumApp {
                     .map(|option| (option.label.clone(), option.description.clone()))
                     .collect(),
                 recommended: question.recommended,
+                assumed: question.assumed,
                 error: question.error.clone(),
             });
         }
@@ -6738,7 +6775,11 @@ impl AgentiumApp {
                                     div()
                                         .text_xs()
                                         .text_color(inbox_decision_color())
-                                        .child("recommended"),
+                                        .child(if row.assumed {
+                                            "assumed · agent continues"
+                                        } else {
+                                            "recommended"
+                                        }),
                                 )
                             }),
                     )
@@ -7919,6 +7960,7 @@ mod tests {
                 description: Some("matches invoices".to_string()),
             }],
             recommended: Some(0),
+            assumed: true,
             arena_name: "backlog-scala".to_string(),
             asker: Some(InboxAsker::ClaudeSession {
                 session_id: "c8832ec2".to_string(),
@@ -7933,8 +7975,17 @@ mod tests {
         );
         assert!(json.get("error").is_none());
 
-        let restored: InboxQuestion = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(json["assumed"], true);
+
+        let restored: InboxQuestion = serde_json::from_value(json.clone()).expect("deserialize");
         assert!(restored.tab.is_none() && restored.error.is_none());
+        assert!(restored.assumed);
+
+        // Files written before `--assume` existed lack the field.
+        let mut older = json;
+        older.as_object_mut().expect("object").remove("assumed");
+        let restored: InboxQuestion = serde_json::from_value(older).expect("deserialize older");
+        assert!(!restored.assumed);
         assert!(
             restored.asker
                 == Some(InboxAsker::ClaudeSession {
