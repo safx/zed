@@ -476,6 +476,9 @@ struct InboxEntries {
     questions: Vec<InboxQuestionRow>,
     permission: Vec<InboxEntry>,
     completed: Vec<InboxCompletionRow>,
+    /// Shown for orientation only: running tabs need nothing from the user,
+    /// so they stay out of the badge.
+    in_progress: Vec<InboxEntry>,
 }
 
 impl InboxEntries {
@@ -6753,6 +6756,11 @@ impl AgentiumApp {
                     .into_iter()
                     .map(to_entry),
             );
+            entries.in_progress.extend(
+                self.collect_running_terminal_infos(arena_entity, cx)
+                    .into_iter()
+                    .map(to_entry),
+            );
         }
         entries
     }
@@ -6786,6 +6794,7 @@ impl AgentiumApp {
                 .child("None")
         };
         let render_rows = |lane: &'static str, lane_entries: Vec<InboxEntry>, cx: &mut Context<Self>| {
+            let is_in_progress = lane == "in-progress";
             lane_entries
                 .into_iter()
                 .enumerate()
@@ -6809,6 +6818,7 @@ impl AgentiumApp {
                     };
                     v_flex()
                         .id(SharedString::from(format!("inbox-{lane}-{row_index}")))
+                        .when(is_in_progress, |d| d.opacity(0.7))
                         .mx_1()
                         .px_2()
                         .py_1()
@@ -6860,6 +6870,8 @@ impl AgentiumApp {
         let permission_count = entries.permission.len();
         let completed_count = entries.completed.len();
         let permission_rows = render_rows("permission", entries.permission, cx);
+        let in_progress_count = entries.in_progress.len();
+        let in_progress_rows = render_rows("in-progress", entries.in_progress, cx);
         let completed_rows = entries
             .completed
             .into_iter()
@@ -6881,6 +6893,9 @@ impl AgentiumApp {
             .child(lane_header("Completed", completed_count, colors.text_accent))
             .when(completed_rows.is_empty(), |d| d.child(empty_row()))
             .children(completed_rows)
+            .child(lane_header("In progress", in_progress_count, status_colors.success))
+            .when(in_progress_rows.is_empty(), |d| d.child(empty_row()))
+            .children(in_progress_rows)
             .into_any_element()
     }
 
