@@ -29,6 +29,8 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 
 Choose **Codex (ACP)** from a pane's **+** menu to open a Codex conversation in that Arena's working directory. Each tab owns its connection and session. Tabs can move between panes in the same Arena, and closing a tab terminates its adapter process group.
 
+Double-click a Codex (ACP) tab to rename it. Press Enter to save, or Escape to cancel; moving focus away also cancels the edit. Tab names must be nonempty, contain no control characters, and be unique within the Arena. The saved name is also the name used by CLI commands such as `tab send-message --title`.
+
 Install the current adapter separately:
 
 ```sh
@@ -57,6 +59,10 @@ Review file changes in the conversation's edit cards or its review tab, which pr
 Approval notifications can appear while another pane has focus, even when the Codex conversation remains visible.
 
 ACP tabs left open at Quit are restored when you next open that worktree's Arena. Closing a tab with Cmd+W or closing its Arena removes it from automatic restoration; it does not delete the adapter's conversation history. Agentium stores session IDs and fixed tab names in `codex_acp_tabs.json` in its data directory. Pane layouts and other tabs are not restored; every Arena still opens an initial terminal. A failed restore keeps the tab and offers retry. A conversation interrupted by Quit may restore partial history or report a load error.
+
+Choose **Resume Codex Conversation…** from the same **+** menu (also available with Cmd+T) to search past conversations for the current worktree. The list shows titles and update times, newest first. Select a conversation to restore its history in a new tab; an existing tab in the same Arena is selected instead. Conversations already open in another Arena or reserved in saved restoration records cannot be opened twice. The adapter must support both session listing and history loading. If authentication is required, sign in using a new Codex (ACP) tab, then choose **Retry** in the history dialog.
+
+The history list may include conversations created in Codex CLI. Agentium cannot detect whether another process currently has the same conversation open; avoid using the same conversation simultaneously from multiple processes. Resuming restores the conversation but does not automatically send a message or restart interrupted commands.
 
 Dropping files from Finder onto the tab attaches them to the message: raster images (PNG, JPEG, GIF, WebP, BMP) become image attachments, other files and directories become `@` mentions. Pasting works the same way.
 

@@ -133,6 +133,18 @@ impl CodexAcpPersistence {
         self.error.lock().clone()
     }
 
+    pub(crate) fn session_records(&self, session_id: &str) -> Vec<(PathBuf, SavedCodexTab)> {
+        self.saved
+            .worktrees
+            .iter()
+            .flat_map(|(directory, tabs)| {
+                tabs.iter()
+                    .filter(|tab| tab.session_id == session_id)
+                    .map(|tab| (directory.clone(), tab.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn replace(
         &mut self,
         directory: PathBuf,
@@ -209,6 +221,42 @@ mod tests {
             title: format!("Codex {session}"),
             session_id: session.into(),
         }
+    }
+
+    #[gpui::test]
+    async fn resume_rejects_saved_ids_without_disabling_persistence(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("tabs.json");
+        let store = cx.new(|_| CodexAcpPersistence::new(path.clone()));
+        let saved = tab("resume-conflict");
+        let other = tab("unrelated");
+        store.update(cx, |store, cx| {
+            store.replace("/other-worktree".into(), vec![saved.clone()], cx);
+            store.replace("/origin".into(), vec![other.clone()], cx);
+        });
+        for origin in [
+            Path::new("/origin"),
+            Path::new("/other-worktree"),
+            Path::new("/other-worktree-alias"),
+        ] {
+            store.update(cx, |store, cx| {
+                let records = store.session_records(&saved.session_id);
+                let result = crate::codex_acp_resume::check_saved_conflicts(origin, None, &records);
+                assert!(result.is_err());
+                if result.is_ok() {
+                    store.replace(origin.into(), vec![saved.clone()], cx);
+                }
+            });
+        }
+        store
+            .read_with(cx, |store, _| store.write_task.clone())
+            .expect("save task")
+            .await;
+        let restored = CodexAcpPersistence::new(path);
+        assert!(!restored.disabled);
+        assert_eq!(restored.tabs(Path::new("/other-worktree")), vec![saved]);
+        assert_eq!(restored.tabs(Path::new("/origin")), vec![other]);
+        assert_eq!(restored.saved.worktrees.len(), 2);
     }
 
     #[test]

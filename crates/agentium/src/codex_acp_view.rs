@@ -8,13 +8,14 @@ use agent_ui::{
     Agent, AgentConnectionStore, AgentThreadSource, ConversationView, RootThreadUpdated,
 };
 use anyhow::{Context as _, Result};
+use editor::{Editor, EditorEvent, actions::SelectAll};
 use collections::{HashMap, HashSet};
 use fs::Fs;
 use futures::future::{Shared, join_all};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle,
     Focusable, Global, IntoElement, Render, SharedString, Subscription, Task, WeakEntity, Window,
-    prelude::*,
+    actions, prelude::*,
 };
 use parking_lot::Mutex;
 use project::{
@@ -24,7 +25,10 @@ use project::{
 use settings::{AgentConfigOptionValue, SettingsStore, update_settings_file};
 use task::Shell;
 use ui::{Indicator, prelude::*};
-use workspace::{Item, Pane, Workspace, item::ItemEvent};
+use util::ResultExt as _;
+use workspace::{Item, Pane, Workspace, item::{ItemEvent, TabContentParams}};
+
+actions!(agentium, [RenameCodexTab]);
 
 #[derive(Clone)]
 pub struct LoginEnvironmentReady(pub Shared<futures::channel::oneshot::Receiver<()>>);
@@ -70,6 +74,11 @@ impl CodexAcpState {
 }
 
 pub(crate) struct CodexAcpView {
+    self_handle: WeakEntity<Self>,
+    arena: WeakEntity<crate::arena::Arena>,
+    rename_editor: Option<Entity<Editor>>,
+    rename_subscription: Option<Subscription>,
+    rename_error: Option<SharedString>,
     saved_id: uuid::Uuid,
     cli_title: SharedString,
     session_id: Option<acp::SessionId>,
@@ -88,6 +97,84 @@ pub(crate) struct CodexAcpView {
 }
 
 impl CodexAcpView {
+    pub(crate) fn set_arena(&mut self, arena: WeakEntity<crate::arena::Arena>) {
+        self.arena = arena;
+    }
+
+    fn rename_tab(&mut self, _: &RenameCodexTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.rename_editor {
+            editor.focus_handle(cx).focus(window, cx);
+            return;
+        }
+        let editor = cx.new(|cx| Editor::single_line(window, cx));
+        self.rename_subscription =
+            Some(
+                cx.subscribe_in(&editor, window, |_, editor, event, window, cx| {
+                    if let EditorEvent::Blurred = event {
+                        // Double-clicking can temporarily move focus while the inline editor opens.
+                        let editor = editor.clone();
+                        cx.defer_in(window, move |this, window, cx| {
+                            if this.rename_editor.as_ref() == Some(&editor)
+                                && !editor.focus_handle(cx).is_focused(window)
+                            {
+                                this.finish_rename(false, window, cx);
+                            }
+                        });
+                    }
+                }),
+            );
+        editor.update(cx, |editor, cx| {
+            editor.set_text(self.cli_title.clone(), window, cx);
+            editor.select_all(&SelectAll, window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        self.rename_editor = Some(editor);
+        self.rename_error = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.rename_editor.as_ref() else {
+            return;
+        };
+        let had_focus = editor.focus_handle(cx).is_focused(window);
+        if save {
+            let title = editor.read(cx).text(cx).trim().to_owned();
+            let result = self
+                .arena
+                .read_with(cx, |arena, cx| {
+                    arena.validate_tab_title(self.self_handle.entity_id(), &title, cx)
+                })
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.rename_error = Some(format!("{error:#}").into());
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+                return;
+            }
+            self.cli_title = title.into();
+        }
+        self.rename_editor = None;
+        self.rename_subscription = None;
+        self.rename_error = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+        if had_focus {
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
+    pub(crate) fn server(
+        working_directory: Option<PathBuf>,
+        warning: Arc<Mutex<Option<String>>>,
+    ) -> Rc<dyn AgentServer> {
+        Rc::new(CodexAcpServer {
+            working_directory,
+            warning,
+        })
+    }
+
     pub(crate) fn new(
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
@@ -98,10 +185,7 @@ impl CodexAcpView {
         cx: &mut Context<Self>,
     ) -> Self {
         let warning = Arc::new(Mutex::new(None));
-        let server = Rc::new(CodexAcpServer {
-            working_directory: working_directory.clone(),
-            warning: warning.clone(),
-        });
+        let server = Self::server(working_directory.clone(), warning.clone());
         Self::with_server(
             server,
             project,
@@ -176,6 +260,11 @@ impl CodexAcpView {
         ];
         let focus_handle = conversation.read(cx).focus_handle(cx);
         Self {
+            self_handle: cx.weak_entity(),
+            arena: WeakEntity::new_invalid(),
+            rename_editor: None,
+            rename_subscription: None,
+            rename_error: None,
             saved_id: saved
                 .as_ref()
                 .map(|saved| saved.id)
@@ -336,6 +425,64 @@ impl CodexAcpView {
 }
 
 impl Item for CodexAcpView {
+    fn tab_content(&self, params: TabContentParams, _: &Window, cx: &App) -> gpui::AnyElement {
+        let this = self.self_handle.clone();
+        let confirm = this.clone();
+        let cancel = this.clone();
+        h_flex()
+            .when(!params.selected, |element| {
+                element.track_focus(&self.focus_handle)
+            })
+            .on_action(move |action: &RenameCodexTab, window, cx| {
+                this.update(cx, |this, cx| this.rename_tab(action, window, cx))
+                    .log_err();
+            })
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        Label::new(self.cli_title.clone())
+                            .single_line()
+                            .color(params.text_color())
+                            .when(self.rename_editor.is_some(), |label| label.alpha(0.)),
+                    )
+                    .when_some(self.rename_editor.clone(), |element, editor| {
+                        element.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
+                                .when(self.rename_error.is_some(), |element| {
+                                    element.border_b_1().border_color(cx.theme().status().error)
+                                })
+                                .child(editor)
+                                .on_action(move |_: &menu::Confirm, window, cx| {
+                                    confirm
+                                        .update(cx, |this, cx| this.finish_rename(true, window, cx))
+                                        .log_err();
+                                })
+                                .on_action(move |_: &menu::Cancel, window, cx| {
+                                    cancel
+                                        .update(cx, |this, cx| {
+                                            this.finish_rename(false, window, cx)
+                                        })
+                                        .log_err();
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn tab_extra_context_menu_actions(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
+        vec![("Rename".into(), Box::new(RenameCodexTab))]
+    }
+
     type Event = ItemEvent;
     fn include_in_nav_history() -> bool {
         false
@@ -347,6 +494,9 @@ impl Item for CodexAcpView {
         self.cli_title.clone()
     }
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        if let Some(error) = &self.rename_error {
+            return Some(error.clone());
+        }
         let title = self
             .conversation
             .read(cx)
@@ -432,6 +582,10 @@ impl Render for CodexAcpView {
         v_flex()
             .size_full()
             .overflow_hidden()
+            .on_action(cx.listener(Self::rename_tab))
+            .when_some(self.rename_error.clone(), |element, error| {
+                element.child(div().p_2().text_sm().text_color(cx.theme().status().error).child(error))
+            })
             .when_some(restoration, |element, text| {
                 element.child(div().p_2().text_sm().child(text))
             })
@@ -941,6 +1095,183 @@ mod tests {
                 cx,
             )
         })
+    }
+
+    #[gpui::test]
+    async fn codex_acp_double_click_renames_the_tab_and_preserves_the_session(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, workspace, cx) = setup(cx).await;
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let arena = cx.new_window_entity(|window, cx| {
+            crate::arena::Arena::test_empty(
+                "Test".into(),
+                project.clone(),
+                "/arena".into(),
+                window,
+                cx,
+            )
+        });
+        arena.update(cx, |arena, _| {
+            arena.center = workspace::PaneGroup::new(pane.clone());
+            arena.active_pane = pane.clone();
+        });
+        let view = fake_tab(FakeAcpAgentServer::new(), "/arena", project, &workspace, cx);
+        view.update(cx, |view, _| view.set_arena(arena.downgrade()));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
+        });
+        cx.run_until_parked();
+        let saved = view
+            .read_with(cx, |view, _| view.saved_tab())
+            .expect("saved session");
+        let temporary = tempfile::tempdir().expect("persistence directory");
+        let saved_path = temporary.path().join("tabs.json");
+        let persistence =
+            cx.new(|_| crate::codex_acp_persistence::CodexAcpPersistence::new(saved_path.clone()));
+        let _subscription = cx.update(|_, cx| {
+            cx.observe(&view, {
+                let persistence = persistence.clone();
+                move |view, cx| {
+                    if let Some(saved) = view.read(cx).saved_tab() {
+                        persistence.update(cx, |store, cx| {
+                            store.replace("/arena".into(), vec![saved], cx)
+                        });
+                    }
+                }
+            })
+        });
+        let bounds = cx.debug_bounds("TAB-0").expect("Codex tab");
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: bounds.center(),
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: bounds.center(),
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 2,
+        });
+        cx.run_until_parked();
+        let editor = view
+            .read_with(cx, |view, _| view.rename_editor.clone())
+            .expect("inline editor");
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("  Review  ", window, cx)
+        });
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.rename_editor.is_none());
+            assert_eq!(view.tab_content_text(0, cx).as_ref(), "Review");
+            let renamed = view.saved_tab().expect("renamed session");
+            assert_eq!(renamed.title, "Review");
+            assert_eq!(renamed.id, saved.id);
+            assert_eq!(renamed.session_id, saved.session_id);
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.rename_tab(&RenameCodexTab, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view
+            .read_with(cx, |view, _| view.rename_editor.clone())
+            .expect("editor");
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Discarded", window, cx)
+        });
+        cx.dispatch_action(menu::Cancel);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.rename_editor.is_none());
+            assert_eq!(view.cli_title.as_ref(), "Review");
+        });
+        if let Some(pending) = persistence.update(cx, |store, _| store.finish()) {
+            pending.await;
+        }
+        let restored = crate::codex_acp_persistence::CodexAcpPersistence::new(saved_path);
+        assert!(restored.error().is_none());
+        assert_eq!(
+            restored.tabs(std::path::Path::new("/arena")),
+            vec![
+                view.read_with(cx, |view, _| view.saved_tab())
+                    .expect("renamed session")
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn codex_acp_rename_rejects_invalid_names_and_cancels_on_blur(cx: &mut TestAppContext) {
+        let (project, workspace, cx) = setup(cx).await;
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let arena = cx.new_window_entity(|window, cx| {
+            crate::arena::Arena::test_empty(
+                "Test".into(),
+                project.clone(),
+                "/arena".into(),
+                window,
+                cx,
+            )
+        });
+        arena.update(cx, |arena, _| {
+            arena.center = workspace::PaneGroup::new(pane.clone());
+            arena.active_pane = pane.clone();
+        });
+        let first = fake_tab(
+            FakeAcpAgentServer::new(),
+            "/arena",
+            project.clone(),
+            &workspace,
+            cx,
+        );
+        let second = fake_tab(FakeAcpAgentServer::new(), "/arena", project, &workspace, cx);
+        first.update(cx, |view, _| view.set_arena(arena.downgrade()));
+        second.update(cx, |view, _| {
+            view.set_arena(arena.downgrade());
+            view.cli_title = "Taken".into();
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(first.clone()), true, false, None, window, cx);
+            pane.add_item(Box::new(second), true, false, None, window, cx);
+        });
+        cx.run_until_parked();
+        first.update_in(cx, |view, window, cx| {
+            view.rename_tab(&RenameCodexTab, window, cx)
+        });
+        for title in [" ", "Taken", "Invalid\u{7}name"] {
+            first.update_in(cx, |view, window, cx| {
+                let editor = view.rename_editor.clone().expect("editor");
+                editor.update(cx, |editor, cx| editor.set_text(title, window, cx));
+                view.finish_rename(true, window, cx);
+                assert!(view.rename_error.is_some());
+                assert!(view.rename_editor.is_some());
+                assert_eq!(view.cli_title.as_ref(), "Codex ACP");
+            });
+        }
+        first.update_in(cx, |view, window, cx| view.finish_rename(false, window, cx));
+        first.read_with(cx, |view, _| {
+            assert!(view.rename_editor.is_none());
+            assert!(view.rename_error.is_none());
+            assert_eq!(view.cli_title.as_ref(), "Codex ACP");
+        });
+        first.update_in(cx, |view, window, cx| {
+            view.rename_tab(&RenameCodexTab, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = first
+            .read_with(cx, |view, _| view.rename_editor.clone())
+            .expect("editor");
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Discarded", window, cx)
+        });
+        cx.update(|window, cx| workspace.focus_handle(cx).focus(window, cx));
+        cx.run_until_parked();
+        first.read_with(cx, |view, _| {
+            assert!(view.rename_editor.is_none());
+            assert_eq!(view.cli_title.as_ref(), "Codex ACP");
+        });
     }
 
     fn thread(view: &Entity<CodexAcpView>, cx: &VisualTestContext) -> Entity<AcpThread> {
