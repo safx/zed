@@ -70,6 +70,12 @@ enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// This tab's to-do list in the Agentium Inbox: requests and proposals
+    /// for the user, handed over at the end of a turn
+    Todo {
+        #[command(subcommand)]
+        action: TodoAction,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -204,6 +210,26 @@ enum InboxAction {
         #[arg(long, requires = "recommended")]
         assume: bool,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum TodoAction {
+    /// Replace this tab's whole list. Pass every item that still applies, not
+    /// only new ones; the output names unanswered items that were dropped.
+    Set {
+        /// Something the user does (verify, configure), as `TITLE` or
+        /// `TITLE :: DETAIL`; repeatable
+        #[arg(long = "user-task", allow_hyphen_values = true)]
+        user_tasks: Vec<String>,
+        /// Work you propose and the user picks or skips, as `TITLE` or
+        /// `TITLE :: DETAIL`; repeatable
+        #[arg(long = "proposal", allow_hyphen_values = true)]
+        proposals: Vec<String>,
+    },
+    /// Print this tab's list, and the lists of the other tabs in this arena
+    List,
+    /// Empty this tab's list
+    Clear,
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -825,6 +851,88 @@ fn inbox_option_json(option: &str) -> serde_json::Value {
     }
 }
 
+fn todo_set_request(user_tasks: &[String], proposals: &[String]) -> serde_json::Value {
+    let entries = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| {
+                let option = inbox_option_json(item);
+                serde_json::json!({ "title": option["label"], "detail": option["description"] })
+            })
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({
+        "type": "todo_set",
+        "user_tasks": entries(user_tasks),
+        "proposals": entries(proposals),
+    })
+}
+
+fn print_todo_items(items: &[agentium::InboxTodoItem], indent: &str) {
+    for (index, item) in items.iter().enumerate() {
+        let kind = match item.kind {
+            agentium::InboxTodoKind::UserTask => "user task",
+            agentium::InboxTodoKind::Proposal => "proposal",
+        };
+        match &item.detail {
+            Some(detail) => println!("{indent}{}. [{kind}] {} :: {detail}", index + 1, item.title),
+            None => println!("{indent}{}. [{kind}] {}", index + 1, item.title),
+        }
+    }
+}
+
+fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
+    match action {
+        TodoAction::Set {
+            user_tasks,
+            proposals,
+        } => {
+            let request = todo_set_request(&user_tasks, &proposals);
+            // Fails before contacting the app, with the same rules it applies.
+            agentium::parse_todo_set_request(&request)?;
+            let response = cli_request(request)?;
+            let count = response["count"].as_u64().unwrap_or_default();
+            println!("To do: {count} {}.", if count == 1 { "item" } else { "items" });
+            let dropped: Vec<&str> = response["dropped"]
+                .as_array()
+                .map(|dropped| dropped.iter().filter_map(|title| title.as_str()).collect())
+                .unwrap_or_default();
+            if !dropped.is_empty() {
+                println!(
+                    "Dropped {} unanswered {}: {}. If they still apply, run todo set again including them.",
+                    dropped.len(),
+                    if dropped.len() == 1 { "item" } else { "items" },
+                    dropped.join("; ")
+                );
+            }
+            Ok(())
+        }
+        TodoAction::List => {
+            let response = cli_request(serde_json::json!({ "type": "todo_list" }))?;
+            let own: Vec<agentium::InboxTodoItem> =
+                serde_json::from_value(response["own"].clone())?;
+            let others: Vec<(String, Vec<agentium::InboxTodoItem>)> =
+                serde_json::from_value(response["others"].clone())?;
+            if own.is_empty() {
+                println!("This tab: no to-do list.");
+            } else {
+                println!("This tab:");
+                print_todo_items(&own, "  ");
+            }
+            for (title, items) in others {
+                println!("{title} (read-only):");
+                print_todo_items(&items, "  ");
+            }
+            Ok(())
+        }
+        TodoAction::Clear => {
+            let response = cli_request(serde_json::json!({ "type": "todo_clear" }))?;
+            println!("To do cleared ({} items).", response["count"]);
+            Ok(())
+        }
+    }
+}
+
 fn run_inbox_action(action: InboxAction) -> anyhow::Result<()> {
     match action {
         InboxAction::Ask {
@@ -1428,7 +1536,7 @@ mod peer_pid_tests {
 
 #[cfg(test)]
 mod inbox_cli_tests {
-    use super::{Args, Command, InboxAction, inbox_option_json};
+    use super::{Args, Command, InboxAction, TodoAction, inbox_option_json, todo_set_request};
     use clap::Parser as _;
 
     #[test]
@@ -1461,6 +1569,59 @@ mod inbox_cli_tests {
         );
         assert_eq!(inbox_option_json(&options[1]), serde_json::json!({ "label": "UTC 0:00" }));
         assert_eq!(inbox_option_json(&options[2])["label"], "--assume");
+    }
+
+    fn todo_set_items(arguments: &[&str]) -> anyhow::Result<Vec<agentium::InboxTodoItem>> {
+        let args = Args::try_parse_from(
+            ["agentium", "todo", "set"].iter().chain(arguments).copied(),
+        )?;
+        let Some(Command::Todo {
+            action: TodoAction::Set { user_tasks, proposals },
+        }) = args.command
+        else {
+            anyhow::bail!("expected todo set");
+        };
+        agentium::parse_todo_set_request(&todo_set_request(&user_tasks, &proposals))
+    }
+
+    #[test]
+    fn todo_set_lists_user_tasks_before_proposals() {
+        use agentium::InboxTodoKind::{Proposal, UserTask};
+        let items = todo_set_items(&[
+            "--proposal",
+            "Add GPUI tests :: rebinding, aging, badge",
+            "--user-task",
+            "Check the Failed lane",
+            "--proposal",
+            "--assume support",
+        ])
+        .expect("todo set");
+        let summary: Vec<_> = items
+            .iter()
+            .map(|item| (item.kind, item.title.as_str(), item.detail.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (UserTask, "Check the Failed lane", None),
+                (Proposal, "Add GPUI tests", Some("rebinding, aging, badge")),
+                (Proposal, "--assume support", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn todo_set_rejects_empty_oversized_and_ambiguous_lists() {
+        assert!(todo_set_items(&[]).is_err());
+        assert!(todo_set_items(&["--user-task", " :: only a detail"]).is_err());
+        assert!(todo_set_items(&["--user-task", "Same", "--proposal", "Same :: other"]).is_err());
+        let nine: Vec<String> = (1..=9).map(|n| format!("Item {n}")).collect();
+        let arguments: Vec<&str> = nine
+            .iter()
+            .flat_map(|title| ["--proposal", title.as_str()])
+            .collect();
+        assert!(todo_set_items(&arguments).is_err());
+        assert_eq!(todo_set_items(&arguments[..16]).map(|items| items.len()).ok(), Some(8));
     }
 
     #[test]
@@ -1956,11 +2117,29 @@ fn handle_cli_request(
             )
             .map(|id| serde_json::json!({ "ok": true, "id": id }))
         }
+        Some("todo_set") => agentium::parse_todo_set_request(&request)
+            .and_then(|items| app.todo_set(peer_ancestor_pids, items, cx))
+            .and_then(|reply| Ok(serde_json::to_value(reply)?))
+            .map(with_ok),
+        Some("todo_list") => app
+            .todo_list(peer_ancestor_pids, cx)
+            .and_then(|reply| Ok(serde_json::to_value(reply)?))
+            .map(with_ok),
+        Some("todo_clear") => app
+            .todo_clear(peer_ancestor_pids, cx)
+            .map(|count| serde_json::json!({ "ok": true, "count": count })),
         other => Err(anyhow::anyhow!("unknown request type {other:?}")),
     };
     Task::ready(
         result.unwrap_or_else(|error| serde_json::json!({ "ok": false, "error": format!("{error:#}") })),
     )
+}
+
+fn with_ok(mut reply: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = reply.as_object_mut() {
+        object.insert("ok".to_string(), serde_json::Value::Bool(true));
+    }
+    reply
 }
 
 /// Folds a `task_info` result into the `{ ok, ... }` reply shape the CLI
@@ -2372,6 +2551,13 @@ fn main() {
         }
         Some(Command::Inbox { action }) => {
             if let Err(error) = run_inbox_action(action) {
+                eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some(Command::Todo { action }) => {
+            if let Err(error) = run_todo_action(action) {
                 eprintln!("error: {error:#}");
                 std::process::exit(1);
             }
