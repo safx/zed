@@ -95,6 +95,7 @@ project = { workspace = true, features = ["test-support"] }
 # project/test-support adds RemoteConnectionOptions::Mock; this arm needs it.
 remote_connection = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
 
 [package.metadata.cargo-shear]
 ignored = ["remote_connection"]
