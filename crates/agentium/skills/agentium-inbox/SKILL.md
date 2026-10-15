@@ -1,6 +1,6 @@
 ---
 name: agentium-inbox
-description: "Ask the user to decide an implementation question (spec gap, design choice between alternatives) through the Agentium Inbox with `agentium inbox ask`, then end the turn. Use when TERM_PROGRAM=agentium and you need the user's decision before continuing. Not for permission to run commands, and not for questions you can settle from the code, the spec, or past decisions."
+description: "Ask the user to decide an implementation question (spec gap, design choice between alternatives) through the Agentium Inbox with `agentium inbox ask`, then end the turn; or, at the end of a turn, hand the user your requests and proposals with `agentium todo set` instead of listing them in chat. Use when TERM_PROGRAM=agentium and you need the user's decision before continuing, or are about to list remaining items, things for the user to do, or work you propose next. Not for permission to run commands, and not for questions you can settle from the code, the spec, or past decisions."
 ---
 
 # Agentium Inbox questions
@@ -32,3 +32,22 @@ The `Answer:` line carries the chosen option label, or the user's own text when 
 With `--assume`, continue on the recommended option and mention the assumption in your final report. A message arrives only if the user picks another option (revise the work built on the assumption) or attaches a note to the assumed one (apply it). No message means the assumption stands.
 
 If the command fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), ask the same question in the conversation instead.
+
+# Agentium To do
+
+Use at the end of a turn, when you would otherwise list remaining items in chat: things the user must do, or work you propose and the user should pick. The agent does not wait on these; that is the difference from `inbox ask`, which you use when you cannot continue without the answer.
+
+```bash
+agentium todo set \
+  --user-task "Check the Failed lane on screen :: stop a Codex ACP tab with an error; the lane is red" \
+  --proposal "Add GPUI tests :: rebinding after restart, record aging, badge colors" \
+  --proposal "Push and open a PR :: goes outside this machine"
+```
+
+- `--user-task`: something only the user can do (verify on screen, configure, link). `--proposal`: work you would do if the user says go. Each is `TITLE :: DETAIL`; titles must be unique.
+- `set` replaces this tab's whole list. Pass every item that still applies, not only the new ones. If the list is not in your context (e.g. after a compaction), run `agentium todo list` first.
+- Read the output: a `Dropped ... unanswered items` line means you left out items. If they still apply, run `todo set` again with them.
+- Aim for at most 5 items (8 is the hard limit). Leave out FYIs and known limitations; those go in your final report.
+- After a successful `set`, write only the count in chat (e.g. "4 items in the Inbox To do"), not the items.
+- If `todo set` fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), list the actual user tasks and proposals in chat and say they were not saved to the Inbox. Do not turn them into `inbox ask` questions.
+- `agentium todo clear` empties the list when nothing is left. Other tabs' lists in the same arena are shown by `todo list` and are read-only.

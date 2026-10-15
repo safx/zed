@@ -343,6 +343,155 @@ pub struct InboxOption {
     pub description: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxTodoKind {
+    /// The user does something, then answers "Done".
+    UserTask,
+    /// The user decides whether the agent does it ("Go" / "Skip").
+    Proposal,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InboxTodoItem {
+    pub kind: InboxTodoKind,
+    pub title: String,
+    pub detail: Option<String>,
+}
+
+pub const MAX_TODO_ITEMS: usize = 8;
+
+/// Shared by the CLI and the app. Titles must be unique because answers
+/// refer to items by title once the agent has replaced its list.
+pub fn validate_todo_items(items: &[InboxTodoItem]) -> anyhow::Result<()> {
+    if items.is_empty() {
+        anyhow::bail!("give at least one --user-task or --proposal; use `todo clear` to empty the list");
+    }
+    if items.len() > MAX_TODO_ITEMS {
+        anyhow::bail!(
+            "{} items is more than {MAX_TODO_ITEMS}; drop the least important ones",
+            items.len()
+        );
+    }
+    let mut titles = HashSet::new();
+    for item in items {
+        if item.title.trim().is_empty() {
+            anyhow::bail!("an item has an empty title");
+        }
+        if !titles.insert(item.title.as_str()) {
+            anyhow::bail!("the title {:?} is used twice", item.title);
+        }
+    }
+    Ok(())
+}
+
+/// Decodes a `todo_set` request strictly: one malformed entry fails the whole
+/// request, because the list is replaced wholesale and a silently skipped
+/// item would be lost.
+pub fn parse_todo_set_request(request: &serde_json::Value) -> anyhow::Result<Vec<InboxTodoItem>> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        title: String,
+        detail: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Request {
+        user_tasks: Vec<Entry>,
+        proposals: Vec<Entry>,
+    }
+    let request: Request = serde_json::from_value(request.clone())
+        .map_err(|error| anyhow::anyhow!("malformed todo_set request: {error}"))?;
+    let entries = |entries: Vec<Entry>, kind| {
+        entries.into_iter().map(move |entry| InboxTodoItem {
+            kind,
+            title: entry.title.trim().to_string(),
+            detail: entry
+                .detail
+                .map(|detail| detail.trim().to_string())
+                .filter(|detail| !detail.is_empty()),
+        })
+    };
+    let items: Vec<InboxTodoItem> = entries(request.user_tasks, InboxTodoKind::UserTask)
+        .chain(entries(request.proposals, InboxTodoKind::Proposal))
+        .collect();
+    validate_todo_items(&items)?;
+    Ok(items)
+}
+
+/// Titles of `old` items that `new` no longer has, in their old order.
+fn dropped_todo_titles(old: &[InboxTodoItem], new: &[InboxTodoItem]) -> Vec<String> {
+    old.iter()
+        .filter(|old| !new.iter().any(|new| new.title == old.title))
+        .map(|old| old.title.clone())
+        .collect()
+}
+
+#[derive(serde::Serialize)]
+pub struct TodoSetReply {
+    pub count: usize,
+    pub dropped: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TodoListReply {
+    pub own: Vec<InboxTodoItem>,
+    /// Other tabs of the caller's arena, by tab title.
+    pub others: Vec<(String, Vec<InboxTodoItem>)>,
+}
+
+/// Requests and proposals an agent handed to the user at the end of a turn.
+/// One list per tab; the agent replaces it wholesale with `todo set`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InboxTodoList {
+    id: u64,
+    /// The tab title at the last `todo set`.
+    title: String,
+    arena_name: String,
+    updated_at: DateTime<Utc>,
+    asker: Option<InboxAsker>,
+    items: Vec<InboxTodoItem>,
+    #[serde(skip)]
+    tab: Option<InboxTab>,
+}
+
+impl InboxTodoList {
+    fn live_tab(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
+        self.tab.as_ref()?.live()
+    }
+}
+
+/// The list owned by the tab `item_id`, or by the same asker in a tab
+/// reopened after a restart.
+fn todo_list_index(
+    lists: &[InboxTodoList],
+    item_id: EntityId,
+    asker: Option<&InboxAsker>,
+) -> Option<usize> {
+    lists
+        .iter()
+        .position(|list| list.tab.as_ref().is_some_and(|tab| tab.item.id() == item_id))
+        .or_else(|| {
+            let asker = asker?;
+            lists.iter().position(|list| list.asker.as_ref() == Some(asker))
+        })
+}
+
+/// The id to hand out next: every persisted kind of Inbox record shares one
+/// counter, so ids stay unique across a restart.
+fn next_inbox_id(
+    questions: &[InboxQuestion],
+    completions: &[InboxCompletion],
+    todos: &[InboxTodoList],
+) -> u64 {
+    questions
+        .iter()
+        .map(|question| question.id)
+        .chain(completions.iter().map(|completion| completion.id))
+        .chain(todos.iter().map(|todo| todo.id))
+        .max()
+        .map_or(1, |id| id + 1)
+}
+
 /// What survives an Agentium restart to find the asking tab again: tab
 /// entities and shell PIDs do not, but `claude --resume` keeps the session id
 /// and restored ACP tabs keep their saved id.
@@ -683,6 +832,18 @@ struct InboxCompletionRow {
     note: Option<&'static str>,
     failure: Option<String>,
     confirmed: bool,
+    /// Items in the same tab's to-do list.
+    todo_count: usize,
+}
+
+struct InboxTodoRow {
+    id: u64,
+    is_active: bool,
+    title: String,
+    arena_name: String,
+    item_count: usize,
+    updated_at: DateTime<Utc>,
+    note: Option<&'static str>,
 }
 
 struct InboxQuestionRow {
@@ -703,6 +864,8 @@ struct InboxEntries {
     questions: Vec<InboxQuestionRow>,
     permission: Vec<InboxEntry>,
     failed: Vec<InboxCompletionRow>,
+    /// Not counted in the badge: the agent is not waiting on them.
+    todos: Vec<InboxTodoRow>,
     completed: Vec<InboxCompletionRow>,
     /// Shown for orientation only: running tabs need nothing from the user,
     /// so they stay out of the badge.
@@ -921,6 +1084,8 @@ pub struct AgentiumApp {
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
     inbox_completions: Vec<InboxCompletion>,
+    inbox_todos: Vec<InboxTodoList>,
+    _inbox_todos_write_task: Option<Task<()>>,
     inbox_note_editors: HashMap<u64, Entity<Editor>>,
     inbox_permissions: Vec<InboxPermission>,
     completion_notifications: Vec<WindowHandle<agent_ui::AgentNotification>>,
@@ -1221,6 +1386,7 @@ impl AgentiumApp {
         let inbox_questions: Vec<InboxQuestion> = load_inbox_file(INBOX_QUESTIONS_FILE);
         let mut inbox_completions: Vec<InboxCompletion> = load_inbox_file(INBOX_COMPLETIONS_FILE);
         inbox_completions.retain(|completion| completion.confirmed_at.is_none());
+        let inbox_todos: Vec<InboxTodoList> = load_inbox_file(INBOX_TODOS_FILE);
         let mut this = Self {
             codex_tabs,
             _codex_tabs_subscription: codex_tabs_subscription,
@@ -1275,14 +1441,15 @@ impl AgentiumApp {
             failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
             sidebar_tab: SidebarTab::Repositories,
-            next_inbox_question_id: inbox_questions
-                .iter()
-                .map(|question| question.id + 1)
-                .chain(inbox_completions.iter().map(|completion| completion.id + 1))
-                .max()
-                .unwrap_or(1),
+            next_inbox_question_id: next_inbox_id(
+                &inbox_questions,
+                &inbox_completions,
+                &inbox_todos,
+            ),
             inbox_questions,
             inbox_completions,
+            inbox_todos,
+            _inbox_todos_write_task: None,
             inbox_note_editors: HashMap::new(),
             inbox_permissions: Vec::new(),
             completion_notifications: Vec::new(),
@@ -2937,6 +3104,148 @@ impl AgentiumApp {
         Ok(id)
     }
 
+    /// Replaces the to-do list of the tab whose process tree contains
+    /// `peer_ancestor_pids` (kernel-verified, as for `inbox_ask`). `items` is
+    /// already validated by `parse_todo_set_request`.
+    pub fn todo_set(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        items: Vec<InboxTodoItem>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<TodoSetReply> {
+        validate_todo_items(&items)?;
+        let (arena, pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
+        let asker = self.inbox_asker(item.as_ref(), cx);
+        let tab = InboxTab {
+            arena: arena.downgrade(),
+            pane: pane.downgrade(),
+            item: item.downgrade_item(),
+        };
+        let title = item.tab_content_text(0, cx).to_string();
+        let arena_name = arena.read(cx).name.clone();
+        let count = items.len();
+        let dropped = match todo_list_index(&self.inbox_todos, item.item_id(), asker.as_ref()) {
+            Some(index) => {
+                let list = &mut self.inbox_todos[index];
+                let dropped = dropped_todo_titles(&list.items, &items);
+                list.items = items;
+                list.title = title;
+                list.arena_name = arena_name;
+                list.updated_at = Utc::now();
+                list.asker = asker;
+                list.tab = Some(tab);
+                dropped
+            }
+            None => {
+                let id = self.next_inbox_question_id;
+                self.next_inbox_question_id += 1;
+                self.inbox_todos.push(InboxTodoList {
+                    id,
+                    title,
+                    arena_name,
+                    updated_at: Utc::now(),
+                    asker,
+                    items,
+                    tab: Some(tab),
+                });
+                Vec::new()
+            }
+        };
+        self.persist_inbox_todos(cx);
+        cx.notify();
+        Ok(TodoSetReply { count, dropped })
+    }
+
+    /// The caller's list, and read-only the lists of the other tabs in its arena.
+    pub fn todo_list(&self, peer_ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TodoListReply> {
+        let (arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
+        let asker = self.inbox_asker(item.as_ref(), cx);
+        let own_index = todo_list_index(&self.inbox_todos, item.item_id(), asker.as_ref());
+        let own = own_index
+            .map(|index| self.inbox_todos[index].items.clone())
+            .unwrap_or_default();
+        let others = self
+            .inbox_todos
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != own_index)
+            .filter_map(|(_, list)| {
+                let (list_arena, _, list_item) = list.live_tab()?;
+                (list_arena == arena).then(|| {
+                    (
+                        list_item.tab_content_text(0, cx).to_string(),
+                        list.items.clone(),
+                    )
+                })
+            })
+            .collect();
+        Ok(TodoListReply { own, others })
+    }
+
+    pub fn todo_clear(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<usize> {
+        let (_arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
+        let asker = self.inbox_asker(item.as_ref(), cx);
+        let Some(index) = todo_list_index(&self.inbox_todos, item.item_id(), asker.as_ref())
+        else {
+            return Ok(0);
+        };
+        let list = self.inbox_todos.remove(index);
+        self.persist_inbox_todos(cx);
+        cx.notify();
+        Ok(list.items.len())
+    }
+
+    fn dismiss_inbox_todo(&mut self, todo_id: u64, cx: &mut Context<Self>) {
+        self.inbox_todos.retain(|list| list.id != todo_id);
+        self.persist_inbox_todos(cx);
+        cx.notify();
+    }
+
+    fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((arena, pane, item)) = self
+            .inbox_todos
+            .iter()
+            .find(|list| list.id == todo_id)
+            .and_then(|list| list.live_tab())
+        else {
+            return;
+        };
+        let Some(arena_index) = self
+            .arenas
+            .iter()
+            .position(|candidate| candidate.entity_id() == arena.entity_id())
+        else {
+            return;
+        };
+        self.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
+    }
+
+    /// Lists of Codex terminal tabs have no asker to find them again after a
+    /// restart, so only lists with one are written, as for questions.
+    fn persist_inbox_todos(&mut self, cx: &mut Context<Self>) {
+        let previous = self._inbox_todos_write_task.take();
+        let snapshot = serde_json::to_vec_pretty(
+            &self
+                .inbox_todos
+                .iter()
+                .filter(|list| list.asker.is_some())
+                .collect::<Vec<_>>(),
+        );
+        self._inbox_todos_write_task = Some(cx.background_spawn(async move {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            snapshot
+                .map_err(anyhow::Error::from)
+                .and_then(|content| write_inbox_file(INBOX_TODOS_FILE, &content))
+                .log_err();
+        }));
+    }
+
     fn inbox_asker(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<InboxAsker> {
         if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
             return view
@@ -2997,6 +3306,25 @@ impl AgentiumApp {
         for (index, tab) in found {
             if let Some(completion) = self.inbox_completions.get_mut(index) {
                 completion.tab = Some(tab);
+            }
+        }
+
+        let mut found = Vec::new();
+        for (index, list) in self.inbox_todos.iter().enumerate() {
+            if list.live_tab().is_some() {
+                continue;
+            }
+            if let Some(tab) = list
+                .asker
+                .as_ref()
+                .and_then(|asker| self.tab_for_asker(asker, cx))
+            {
+                found.push((index, tab));
+            }
+        }
+        for (index, tab) in found {
+            if let Some(list) = self.inbox_todos.get_mut(index) {
+                list.tab = Some(tab);
             }
         }
     }
@@ -5419,6 +5747,12 @@ fn inbox_decision_color() -> Hsla {
     rgb(0xb48ef2).into()
 }
 
+/// Fixed for the same reason as `inbox_decision_color`, and kept apart from
+/// the In progress lane's `status.success` green.
+fn inbox_todo_color() -> Hsla {
+    rgb(0x55c4b8).into()
+}
+
 /// The one field of a tool call that says what it will touch, falling back to
 /// the whole input for tools without one.
 fn permission_summary(tool_input: &serde_json::Value) -> String {
@@ -5482,6 +5816,7 @@ fn render_inbox_permission(
 
 const INBOX_QUESTIONS_FILE: &str = "inbox.json";
 const INBOX_COMPLETIONS_FILE: &str = "inbox_completions.json";
+const INBOX_TODOS_FILE: &str = "todo.json";
 const INBOX_CONFIRMED_COMPLETION_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 fn load_inbox_file<T: serde::de::DeserializeOwned>(file_name: &str) -> Vec<T> {
@@ -7201,6 +7536,32 @@ impl AgentiumApp {
                 confirmed: completion.confirmed_at.is_some(),
                 note,
                 failure: completion.failure.clone(),
+                todo_count: completion
+                    .tab
+                    .as_ref()
+                    .and_then(|tab| {
+                        todo_list_index(&self.inbox_todos, tab.item.id(), completion.asker.as_ref())
+                    })
+                    .or_else(|| {
+                        let asker = completion.asker.as_ref()?;
+                        self.inbox_todos
+                            .iter()
+                            .position(|list| list.asker.as_ref() == Some(asker))
+                    })
+                    .map_or(0, |index| self.inbox_todos[index].items.len()),
+            });
+        }
+        for list in &self.inbox_todos {
+            entries.todos.push(InboxTodoRow {
+                id: list.id,
+                is_active: list.live_tab().is_some_and(|(arena, pane, item)| {
+                    self.is_active_tab(&arena, &pane, item.item_id(), cx)
+                }),
+                title: list.title.clone(),
+                arena_name: list.arena_name.clone(),
+                item_count: list.items.len(),
+                updated_at: list.updated_at,
+                note: list.live_tab().is_none().then_some("tab not open"),
             });
         }
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
@@ -7335,6 +7696,12 @@ impl AgentiumApp {
             .into_iter()
             .map(|row| self.render_inbox_completion(row, cx))
             .collect::<Vec<_>>();
+        let todo_count = entries.todos.len();
+        let todo_rows = entries
+            .todos
+            .into_iter()
+            .map(|row| self.render_inbox_todo(row, cx))
+            .collect::<Vec<_>>();
         let completed_count = entries.completed.len();
         let permission_rows = render_rows("permission", entries.permission, cx);
         let in_progress_count = entries.in_progress.len();
@@ -7361,12 +7728,85 @@ impl AgentiumApp {
                 d.child(lane_header("Failed", failed_count, status_colors.error))
                     .children(failed_rows)
             })
+            .when(!todo_rows.is_empty(), |d| {
+                d.child(lane_header("To do", todo_count, inbox_todo_color()))
+                    .children(todo_rows)
+            })
             .child(lane_header("Completed", completed_count, colors.text_accent))
             .when(completed_rows.is_empty(), |d| d.child(empty_row()))
             .children(completed_rows)
             .child(lane_header("In progress", in_progress_count, status_colors.success))
             .when(in_progress_rows.is_empty(), |d| d.child(empty_row()))
             .children(in_progress_rows)
+            .into_any_element()
+    }
+
+    fn render_inbox_todo(&self, row: InboxTodoRow, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let todo_id = row.id;
+        let title = if row.title.is_empty() {
+            row.arena_name.clone()
+        } else {
+            truncate_for_menu(&row.title)
+        };
+        let detail = format!(
+            "{} · {} {} · {}",
+            row.arena_name,
+            row.item_count,
+            if row.item_count == 1 { "item" } else { "items" },
+            row.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+        );
+        h_flex()
+            .id(SharedString::from(format!("inbox-todo-{todo_id}")))
+            .mx_1()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .rounded_md()
+            .bg(if row.is_active {
+                colors.element_selected
+            } else {
+                colors.element_background
+            })
+            .cursor_pointer()
+            .hover(|d| d.bg(colors.element_hover))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .truncate()
+                            .child(detail),
+                    )
+                    .when_some(row.note, |d, note| {
+                        d.child(div().text_xs().text_color(colors.text_accent).child(note))
+                    }),
+            )
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("inbox-todo-{todo_id}-dismiss")),
+                    IconName::Close,
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text("Dismiss"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.dismiss_inbox_todo(todo_id, cx);
+                })),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_inbox_todo(todo_id, window, cx);
+            }))
             .into_any_element()
     }
 
@@ -7408,11 +7848,30 @@ impl AgentiumApp {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .truncate()
-                            .child(title),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .when(row.todo_count > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(inbox_todo_color())
+                                        .bg(inbox_todo_color().opacity(0.15))
+                                        .child(format!("To do {}", row.todo_count)),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -8660,7 +9119,9 @@ mod tests {
     use super::{
         CiCheckEntry, CiFetchGenerations, CiInfo, CiStatus, FinishKey, FinishedTab,
         InboxCompletion, InboxCompletionRow, InboxEntries, InboxPullRequest, InboxQuestionRow,
-        InboxTab, RecordedTabState, age_inbox_records, apply_ci_status, record_finished_tabs,
+        InboxTab, InboxTodoItem, InboxTodoKind, InboxTodoList, RecordedTabState,
+        age_inbox_records, apply_ci_status, dropped_todo_titles, next_inbox_id,
+        parse_todo_set_request, record_finished_tabs, todo_list_index,
         ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line,
@@ -9119,6 +9580,7 @@ mod tests {
             note: None,
             failure: None,
             confirmed,
+            todo_count: 0,
         };
         cx.update(|cx| {
             use theme::ActiveTheme as _;
@@ -9146,6 +9608,102 @@ mod tests {
             });
             assert_eq!(entries.badge(cx), Some((3, super::inbox_decision_color())));
         });
+    }
+
+    #[test]
+    fn a_todo_set_request_with_one_malformed_item_is_rejected_whole() {
+        let request = serde_json::json!({
+            "type": "todo_set",
+            "user_tasks": [{ "title": "Check the Failed lane", "detail": null }],
+            "proposals": [{ "title": "Add GPUI tests" }, { "detail": "no title" }],
+        });
+        assert!(parse_todo_set_request(&request).is_err());
+        assert!(parse_todo_set_request(&serde_json::json!({ "user_tasks": [] })).is_err());
+        assert!(
+            parse_todo_set_request(&serde_json::json!({ "user_tasks": "a", "proposals": [] }))
+                .is_err()
+        );
+        let items = parse_todo_set_request(&serde_json::json!({
+            "proposals": [{ "title": " Add GPUI tests ", "detail": "  " }],
+            "user_tasks": [{ "title": "Check the Failed lane", "detail": "red lane" }],
+        }))
+        .expect("valid request");
+        assert_eq!(
+            items,
+            vec![
+                InboxTodoItem {
+                    kind: InboxTodoKind::UserTask,
+                    title: "Check the Failed lane".to_string(),
+                    detail: Some("red lane".to_string()),
+                },
+                InboxTodoItem {
+                    kind: InboxTodoKind::Proposal,
+                    title: "Add GPUI tests".to_string(),
+                    detail: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn todo_set_reports_the_items_it_dropped() {
+        let item = |kind, title: &str| InboxTodoItem {
+            kind,
+            title: title.to_string(),
+            detail: None,
+        };
+        let old = vec![
+            item(InboxTodoKind::UserTask, "Check the lane"),
+            item(InboxTodoKind::Proposal, "Add tests"),
+            item(InboxTodoKind::Proposal, "Open a PR"),
+        ];
+        // Only the new items, the mistake the output exists to catch.
+        let new = vec![item(InboxTodoKind::Proposal, "Fix the flaky test")];
+        assert_eq!(
+            dropped_todo_titles(&old, &new),
+            vec!["Check the lane", "Add tests", "Open a PR"]
+        );
+        // Reordered, or moved to the other kind: still there.
+        let new = vec![
+            item(InboxTodoKind::Proposal, "Open a PR"),
+            item(InboxTodoKind::UserTask, "Add tests"),
+            item(InboxTodoKind::UserTask, "Check the lane"),
+        ];
+        assert!(dropped_todo_titles(&old, &new).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_todo_list_is_found_by_its_tab_or_by_its_asker_after_a_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, tab) = test_tab(cx);
+        let (reopened, _) = test_tab(cx);
+        let asker = InboxAsker::ClaudeSession {
+            session_id: "c8832ec2".to_string(),
+        };
+        let list = |id, tab: Option<InboxTab>, asker: Option<InboxAsker>| InboxTodoList {
+            id,
+            title: "Fix the Inbox".to_string(),
+            arena_name: "zed".to_string(),
+            updated_at: chrono::Utc::now(),
+            asker,
+            items: Vec::new(),
+            tab,
+        };
+        let lists = vec![list(3, None, None), list(5, Some(tab), Some(asker.clone()))];
+        assert_eq!(todo_list_index(&lists, item, None), Some(1));
+
+        // After a restart the list is loaded without a tab.
+        let json = serde_json::to_value(&lists[1]).expect("serialize");
+        assert!(json.get("tab").is_none());
+        let restored: InboxTodoList = serde_json::from_value(json).expect("deserialize");
+        let lists = vec![restored];
+        assert_eq!(todo_list_index(&lists, reopened, Some(&asker)), Some(0));
+        assert_eq!(todo_list_index(&lists, reopened, None), None);
+
+        // Ids continue after the to-do lists even with nothing else saved.
+        assert_eq!(next_inbox_id(&[], &[], &lists), 6);
+        assert_eq!(next_inbox_id(&[], &[], &[]), 1);
     }
 
     #[test]
