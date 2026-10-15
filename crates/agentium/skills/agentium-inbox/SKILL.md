@@ -50,4 +50,6 @@ agentium todo set \
 - Aim for at most 5 items (8 is the hard limit). Leave out FYIs and known limitations; those go in your final report.
 - After a successful `set`, write only the count in chat (e.g. "4 items in the Inbox To do"), not the items.
 - If `todo set` fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), list the actual user tasks and proposals in chat and say they were not saved to the Inbox. Do not turn them into `inbox ask` questions.
+- Include things the user said they will do later (e.g. "I'll check the CI failure later") as user tasks, so they are not lost.
+- The user answers from the Inbox in one message starting with `[from: Agentium Inbox]` and `To do`, one line per answered item: `Done: N TITLE` (the user did it), `Go: N TITLE` (start it now), `Skip: N TITLE` (drop it; do not propose it again). A `— Note:` suffix is the user's condition and overrides the item's detail. Numbers are the positions in your list at that time; match items by title. Answered items are already removed from your list, so do not repeat them in the next `todo set`; unanswered ones are still there.
 - `agentium todo clear` empties the list when nothing is left. Other tabs' lists in the same arena are shown by `todo list` and are read-only.

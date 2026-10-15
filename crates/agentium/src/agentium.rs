@@ -5,11 +5,13 @@ pub mod codex_acp_view;
 pub mod board;
 pub mod file_browser_view;
 mod git_status_view;
+mod inbox_todo_view;
 pub mod questionnaire_view;
 mod review_view;
 mod svg_view;
 
 pub use questionnaire_view::QuestionnaireView;
+pub use inbox_todo_view::SendAnswers as SendInboxTodoAnswers;
 pub use review_view::ReviewView;
 pub use svg_view::SvgView;
 
@@ -450,14 +452,14 @@ struct InboxTodoList {
     updated_at: DateTime<Utc>,
     asker: Option<InboxAsker>,
     items: Vec<InboxTodoItem>,
+    /// The owner arena's branch at the last `todo set`.
+    #[serde(default)]
+    branch: Option<String>,
     #[serde(skip)]
     tab: Option<InboxTab>,
-}
-
-impl InboxTodoList {
-    fn live_tab(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
-        self.tab.as_ref()?.live()
-    }
+    /// The user's draft answers, by item title. Not persisted: cheap to redo.
+    #[serde(skip)]
+    choices: HashMap<String, inbox_todo_view::TodoChoice>,
 }
 
 /// The list owned by the tab `item_id`, or by the same asker in a tab
@@ -1084,8 +1086,9 @@ pub struct AgentiumApp {
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
     inbox_completions: Vec<InboxCompletion>,
-    inbox_todos: Vec<InboxTodoList>,
-    _inbox_todos_write_task: Option<Task<()>>,
+    inbox_todos: Entity<inbox_todo_view::InboxTodos>,
+    inbox_todo_views: HashMap<u64, WeakEntity<inbox_todo_view::InboxTodoView>>,
+    _inbox_todos_subscription: Subscription,
     inbox_note_editors: HashMap<u64, Entity<Editor>>,
     inbox_permissions: Vec<InboxPermission>,
     completion_notifications: Vec<WindowHandle<agent_ui::AgentNotification>>,
@@ -1386,7 +1389,22 @@ impl AgentiumApp {
         let inbox_questions: Vec<InboxQuestion> = load_inbox_file(INBOX_QUESTIONS_FILE);
         let mut inbox_completions: Vec<InboxCompletion> = load_inbox_file(INBOX_COMPLETIONS_FILE);
         inbox_completions.retain(|completion| completion.confirmed_at.is_none());
-        let inbox_todos: Vec<InboxTodoList> = load_inbox_file(INBOX_TODOS_FILE);
+        let inbox_todos = cx.new(|_| {
+            inbox_todo_view::InboxTodos::new(Some(paths::data_dir().join(INBOX_TODOS_FILE)))
+        });
+        // Arenas re-render too: their pane decorators show which tab owns the
+        // to-do list in front.
+        let inbox_todos_subscription = cx.observe(&inbox_todos, |this, _, cx| {
+            for arena in &this.arenas {
+                arena.update(cx, |_, cx| cx.notify());
+            }
+            cx.notify();
+        });
+        let next_inbox_question_id = next_inbox_id(
+            &inbox_questions,
+            &inbox_completions,
+            inbox_todos.read(cx).lists(),
+        );
         let mut this = Self {
             codex_tabs,
             _codex_tabs_subscription: codex_tabs_subscription,
@@ -1441,15 +1459,12 @@ impl AgentiumApp {
             failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
             sidebar_tab: SidebarTab::Repositories,
-            next_inbox_question_id: next_inbox_id(
-                &inbox_questions,
-                &inbox_completions,
-                &inbox_todos,
-            ),
+            next_inbox_question_id,
             inbox_questions,
             inbox_completions,
             inbox_todos,
-            _inbox_todos_write_task: None,
+            inbox_todo_views: HashMap::new(),
+            _inbox_todos_subscription: inbox_todos_subscription,
             inbox_note_editors: HashMap::new(),
             inbox_permissions: Vec::new(),
             completion_notifications: Vec::new(),
@@ -2982,12 +2997,12 @@ impl AgentiumApp {
     }
 
     fn send_message_to_item(
-        &mut self,
+        &self,
         item: &dyn workspace::ItemHandle,
         submit: bool,
         text: &str,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> anyhow::Result<()> {
         let title = item.tab_content_text(0, cx).to_string();
         if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
@@ -3121,56 +3136,67 @@ impl AgentiumApp {
             pane: pane.downgrade(),
             item: item.downgrade_item(),
         };
-        let title = item.tab_content_text(0, cx).to_string();
+        let title = self.tab_headline(item.as_ref(), cx);
         let arena_name = arena.read(cx).name.clone();
+        let branch = self.branch_name_for_arena(arena.entity_id(), cx);
         let count = items.len();
-        let dropped = match todo_list_index(&self.inbox_todos, item.item_id(), asker.as_ref()) {
-            Some(index) => {
-                let list = &mut self.inbox_todos[index];
-                let dropped = dropped_todo_titles(&list.items, &items);
-                list.items = items;
-                list.title = title;
-                list.arena_name = arena_name;
-                list.updated_at = Utc::now();
-                list.asker = asker;
-                list.tab = Some(tab);
-                dropped
-            }
-            None => {
-                let id = self.next_inbox_question_id;
-                self.next_inbox_question_id += 1;
-                self.inbox_todos.push(InboxTodoList {
-                    id,
-                    title,
-                    arena_name,
-                    updated_at: Utc::now(),
-                    asker,
-                    items,
-                    tab: Some(tab),
-                });
-                Vec::new()
-            }
-        };
-        self.persist_inbox_todos(cx);
-        cx.notify();
+        let mut next_id = self.next_inbox_question_id;
+        let dropped = self.inbox_todos.update(cx, |todos, cx| {
+            todos.set_items(
+                item.item_id(),
+                tab,
+                asker,
+                title,
+                arena_name,
+                branch,
+                items,
+                &mut next_id,
+                cx,
+            )
+        });
+        self.next_inbox_question_id = next_id;
         Ok(TodoSetReply { count, dropped })
+    }
+
+    /// What the agent in the tab is working on: the prompt for a Claude
+    /// terminal (the tab title is just "Claude"), the terminal title for other
+    /// agents, the tab title otherwise.
+    fn tab_headline(&self, item: &dyn workspace::ItemHandle, cx: &App) -> String {
+        if let Some(view) = item.act_as::<TerminalView>(cx) {
+            let terminal = view.read(cx).terminal().read(cx);
+            if let Some(pid) = terminal.pid_getter().map(|getter| getter.fallback_pid().as_u32())
+                && let Some(session) = self
+                    .claude_sessions
+                    .values()
+                    .find(|session| session.ancestor_pids.contains(&pid))
+                && !session.user_prompt.trim().is_empty()
+            {
+                return session.user_prompt.clone();
+            }
+            if !terminal.breadcrumb_text.trim().is_empty() {
+                return terminal.breadcrumb_text.clone();
+            }
+        }
+        item.tab_content_text(0, cx).to_string()
     }
 
     /// The caller's list, and read-only the lists of the other tabs in its arena.
     pub fn todo_list(&self, peer_ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TodoListReply> {
         let (arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
         let asker = self.inbox_asker(item.as_ref(), cx);
-        let own_index = todo_list_index(&self.inbox_todos, item.item_id(), asker.as_ref());
+        let lists = self.inbox_todos.read(cx).lists();
+        let own_index = todo_list_index(lists, item.item_id(), asker.as_ref());
         let own = own_index
-            .map(|index| self.inbox_todos[index].items.clone())
+            .map(|index| lists[index].items.clone())
             .unwrap_or_default();
-        let others = self
-            .inbox_todos
+        let others = lists
             .iter()
             .enumerate()
             .filter(|(index, _)| Some(*index) != own_index)
             .filter_map(|(_, list)| {
-                let (list_arena, _, list_item) = list.live_tab()?;
+                let item_id = list.tab.as_ref()?.item.id();
+                let (list_arena, _, list_item) =
+                    inbox_todo_view::find_item_location(&self.arenas, item_id, cx)?;
                 (list_arena == arena).then(|| {
                     (
                         list_item.tab_content_text(0, cx).to_string(),
@@ -3189,61 +3215,108 @@ impl AgentiumApp {
     ) -> anyhow::Result<usize> {
         let (_arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
         let asker = self.inbox_asker(item.as_ref(), cx);
-        let Some(index) = todo_list_index(&self.inbox_todos, item.item_id(), asker.as_ref())
-        else {
-            return Ok(0);
-        };
-        let list = self.inbox_todos.remove(index);
-        self.persist_inbox_todos(cx);
-        cx.notify();
-        Ok(list.items.len())
+        Ok(self.inbox_todos.update(cx, |todos, cx| {
+            todos.clear_for(item.item_id(), asker.as_ref(), cx)
+        }))
     }
 
     fn dismiss_inbox_todo(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        self.inbox_todos.retain(|list| list.id != todo_id);
-        self.persist_inbox_todos(cx);
+        self.inbox_todos
+            .update(cx, |todos, cx| todos.dismiss(todo_id, cx));
+    }
+
+    /// Opens the list's detail tab beside its owner tab, or brings back the
+    /// one already open (moving it beside the owner if needed).
+    fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let view = match self
+            .inbox_todo_views
+            .get(&todo_id)
+            .and_then(|view| view.upgrade())
+        {
+            Some(view) => view,
+            None => {
+                let todos = self.inbox_todos.clone();
+                let view = cx.new(|cx| {
+                    inbox_todo_view::InboxTodoView::new(todos, todo_id, window, cx)
+                });
+                cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event)
+                    .detach();
+                self.inbox_todo_views.insert(todo_id, view.downgrade());
+                view
+            }
+        };
+        let owner = self
+            .inbox_todos
+            .read(cx)
+            .list(todo_id)
+            .and_then(|list| list.tab.as_ref().map(|tab| tab.item.id()))
+            .and_then(|item_id| inbox_todo_view::find_item_location(&self.arenas, item_id, cx));
+        match owner {
+            Some((owner_arena, owner_pane, owner_item)) => {
+                if let Some(index) = self.arenas.iter().position(|arena| *arena == owner_arena) {
+                    self.switch_arena(index, window, cx);
+                }
+                inbox_todo_view::show_detail_beside_owner(
+                    &view,
+                    &owner_arena,
+                    &owner_pane,
+                    owner_item.as_ref(),
+                    &self.arenas,
+                    window,
+                    cx,
+                );
+            }
+            // No owner to sit beside: wherever it already is, else the
+            // active pane.
+            None => match inbox_todo_view::find_item_location(&self.arenas, view.entity_id(), cx) {
+                Some((arena, pane, item)) => {
+                    if let Some(index) = self.arenas.iter().position(|candidate| *candidate == arena) {
+                        self.navigate_to_item(index, &pane, item.as_ref(), window, cx);
+                    }
+                }
+                None => {
+                    let Some(arena) = self.active_arena().cloned() else {
+                        return;
+                    };
+                    let pane = arena.read(cx).active_pane.clone();
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(Box::new(view), true, true, None, window, cx);
+                    });
+                }
+            },
+        }
         cx.notify();
     }
 
-    fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((arena, pane, item)) = self
+    fn handle_inbox_todo_view_event(
+        &mut self,
+        view: &Entity<inbox_todo_view::InboxTodoView>,
+        event: &inbox_todo_view::InboxTodoViewEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inbox_todo_view::InboxTodoViewEvent::Send { todo_id, notes } = event;
+        // Located again now: the binding is only refreshed on render, and the
+        // tab may have been closed since.
+        let owner = self
             .inbox_todos
-            .iter()
-            .find(|list| list.id == todo_id)
-            .and_then(|list| list.live_tab())
-        else {
-            return;
-        };
-        let Some(arena_index) = self
-            .arenas
-            .iter()
-            .position(|candidate| candidate.entity_id() == arena.entity_id())
-        else {
-            return;
-        };
-        self.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
-    }
-
-    /// Lists of Codex terminal tabs have no asker to find them again after a
-    /// restart, so only lists with one are written, as for questions.
-    fn persist_inbox_todos(&mut self, cx: &mut Context<Self>) {
-        let previous = self._inbox_todos_write_task.take();
-        let snapshot = serde_json::to_vec_pretty(
-            &self
-                .inbox_todos
-                .iter()
-                .filter(|list| list.asker.is_some())
-                .collect::<Vec<_>>(),
-        );
-        self._inbox_todos_write_task = Some(cx.background_spawn(async move {
-            if let Some(previous) = previous {
-                previous.await;
-            }
-            snapshot
-                .map_err(anyhow::Error::from)
-                .and_then(|content| write_inbox_file(INBOX_TODOS_FILE, &content))
-                .log_err();
-        }));
+            .read(cx)
+            .list(*todo_id)
+            .and_then(|list| list.tab.as_ref().map(|tab| tab.item.id()))
+            .and_then(|item_id| inbox_todo_view::find_item_location(&self.arenas, item_id, cx))
+            .map(|(_, _, item)| item);
+        let todos = self.inbox_todos.clone();
+        let result = todos.update(cx, |todos, cx| {
+            todos.send(
+                *todo_id,
+                notes,
+                owner.as_deref(),
+                |item, message, cx| self.send_message_to_item(item, true, message, window, cx),
+                cx,
+            )
+        });
+        let error = result.err().map(|error| format!("{error:#}"));
+        view.update(cx, |view, cx| view.set_error(error, cx));
     }
 
     fn inbox_asker(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<InboxAsker> {
@@ -3267,7 +3340,7 @@ impl AgentiumApp {
     /// not yet reopened after a restart) to the tab now hosting the same
     /// asker, and drops questions that have lost their tab and have no asker
     /// to wait for. Completions stay until dismissed.
-    fn bind_inbox_tabs(&mut self, cx: &App) {
+    fn bind_inbox_tabs(&mut self, cx: &mut Context<Self>) {
         let mut found = Vec::new();
         for (index, question) in self.inbox_questions.iter().enumerate() {
             if question.live_tab().is_some() {
@@ -3309,24 +3382,35 @@ impl AgentiumApp {
             }
         }
 
-        let mut found = Vec::new();
-        for (index, list) in self.inbox_todos.iter().enumerate() {
-            if list.live_tab().is_some() {
-                continue;
-            }
-            if let Some(tab) = list
-                .asker
-                .as_ref()
-                .and_then(|asker| self.tab_for_asker(asker, cx))
-            {
-                found.push((index, tab));
-            }
-        }
-        for (index, tab) in found {
-            if let Some(list) = self.inbox_todos.get_mut(index) {
-                list.tab = Some(tab);
-            }
-        }
+        // Ownership means being in a pane now: a closed tab's entity can
+        // outlive it, and a moved tab keeps its item but not its pane.
+        let bindings: Vec<(u64, Option<InboxTab>)> = self
+            .inbox_todos
+            .read(cx)
+            .lists()
+            .iter()
+            .map(|list| {
+                let current = list
+                    .tab
+                    .as_ref()
+                    .and_then(|tab| {
+                        inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx)
+                    })
+                    .map(|(arena, pane, item)| InboxTab {
+                        arena: arena.downgrade(),
+                        pane: pane.downgrade(),
+                        item: item.downgrade_item(),
+                    });
+                let tab = current.or_else(|| {
+                    list.asker
+                        .as_ref()
+                        .and_then(|asker| self.tab_for_asker(asker, cx))
+                });
+                (list.id, tab)
+            })
+            .collect();
+        self.inbox_todos
+            .update(cx, |todos, cx| todos.rebind(bindings, cx));
     }
 
     fn tab_for_asker(&self, asker: &InboxAsker, cx: &App) -> Option<InboxTab> {
@@ -5831,7 +5915,10 @@ fn load_inbox_file<T: serde::de::DeserializeOwned>(file_name: &str) -> Vec<T> {
 }
 
 fn write_inbox_file(file_name: &str, content: &[u8]) -> anyhow::Result<()> {
-    let path = paths::data_dir().join(file_name);
+    write_file_atomically(&paths::data_dir().join(file_name), content)
+}
+
+fn write_file_atomically(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -7516,6 +7603,7 @@ impl AgentiumApp {
                 error: question.error.clone(),
             });
         }
+        let todo_lists = self.inbox_todos.read(cx).lists();
         for completion in &self.inbox_completions {
             let note = (completion.pull_request.is_none() && completion.live_tab().is_none())
                 .then_some("tab not open");
@@ -7539,29 +7627,37 @@ impl AgentiumApp {
                 todo_count: completion
                     .tab
                     .as_ref()
-                    .and_then(|tab| {
-                        todo_list_index(&self.inbox_todos, tab.item.id(), completion.asker.as_ref())
+                    .map(|tab| tab.item.id())
+                    .and_then(|item_id| {
+                        todo_list_index(todo_lists, item_id, completion.asker.as_ref())
                     })
                     .or_else(|| {
                         let asker = completion.asker.as_ref()?;
-                        self.inbox_todos
+                        todo_lists
                             .iter()
                             .position(|list| list.asker.as_ref() == Some(asker))
                     })
-                    .map_or(0, |index| self.inbox_todos[index].items.len()),
+                    .map_or(0, |index| todo_lists[index].items.len()),
             });
         }
-        for list in &self.inbox_todos {
+        for list in todo_lists {
+            let detail_view = self
+                .inbox_todo_views
+                .get(&list.id)
+                .and_then(|view| view.upgrade());
             entries.todos.push(InboxTodoRow {
                 id: list.id,
-                is_active: list.live_tab().is_some_and(|(arena, pane, item)| {
-                    self.is_active_tab(&arena, &pane, item.item_id(), cx)
+                is_active: detail_view.is_some_and(|view| {
+                    inbox_todo_view::find_item_location(&self.arenas, view.entity_id(), cx)
+                        .is_some_and(|(arena, pane, item)| {
+                            self.is_active_tab(&arena, &pane, item.item_id(), cx)
+                        })
                 }),
                 title: list.title.clone(),
                 arena_name: list.arena_name.clone(),
                 item_count: list.items.len(),
                 updated_at: list.updated_at,
-                note: list.live_tab().is_none().then_some("tab not open"),
+                note: list.tab.is_none().then_some("tab not open"),
             });
         }
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
@@ -9688,7 +9784,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
             asker,
             items: Vec::new(),
+            branch: None,
             tab,
+            choices: HashMap::new(),
         };
         let lists = vec![list(3, None, None), list(5, Some(tab), Some(asker.clone()))];
         assert_eq!(todo_list_index(&lists, item, None), Some(1));

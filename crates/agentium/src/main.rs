@@ -2886,6 +2886,10 @@ fn main() {
                         KeyBinding::new("ctrl-]", workspace::ActivateNextPane, Some("Workspace")),
                         KeyBinding::new("cmd-[", workspace::ActivatePreviousItem::default(), Some("Pane")),
                         KeyBinding::new("cmd-]", workspace::ActivateNextItem::default(), Some("Pane")),
+                        // Also under Editor: the note editors are inside the
+                        // view, and Editor binds cmd-enter itself.
+                        KeyBinding::new("cmd-enter", agentium::SendInboxTodoAnswers, Some("InboxTodo")),
+                        KeyBinding::new("cmd-enter", agentium::SendInboxTodoAnswers, Some("InboxTodo > Editor")),
                         KeyBinding::new("cmd-t", agentium::OpenNewItemMenu, Some("Workspace")),
                         KeyBinding::new("cmd-t", agentium::OpenNewItemMenu, Some("Agentium")),
                         KeyBinding::new("c", agentium::NewClaudeCode, Some("AgentiumNewItemMenu")),

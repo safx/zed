@@ -761,6 +761,21 @@ impl Arena {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let active_pane = self.active_pane.clone();
+        let new_pane = self.split_pane_with_item(&active_pane, item, direction, window, cx);
+        if !keep_focus {
+            window.focus(&new_pane.focus_handle(cx), cx);
+        }
+    }
+
+    pub(crate) fn split_pane_with_item(
+        &mut self,
+        pane: &Entity<Pane>,
+        item: Box<dyn workspace::ItemHandle>,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
         let new_pane = new_agentium_pane(
             self.workspace.clone(),
             self.project.clone(),
@@ -771,11 +786,8 @@ impl Arena {
         new_pane.update(cx, |pane, cx| {
             pane.add_item(item, true, true, None, window, cx);
         });
-        self.center
-            .split(&self.active_pane, &new_pane, direction, cx);
-        if !keep_focus {
-            window.focus(&new_pane.focus_handle(cx), cx);
-        }
+        self.center.split(pane, &new_pane, direction, cx);
+        new_pane
     }
 
     fn split_with_terminal(
@@ -1325,6 +1337,7 @@ impl Render for Arena {
             .unwrap_or_else(div);
         let ready_pids = self.session_state.ready_shell_pids.borrow().clone();
         let permission_pids = self.session_state.permission_shell_pids.borrow().clone();
+        let owner_highlight = inbox_owner_highlight(&self.active_pane, cx);
         self.workspace
             .update(cx, |_workspace, cx| {
                 let decorator = AgentiumPaneDecorator {
@@ -1332,6 +1345,7 @@ impl Render for Arena {
                     workspace: &self.workspace,
                     ready_shell_pids: &ready_pids,
                     permission_shell_pids: &permission_pids,
+                    owner_highlight,
                 };
                 search_actions_div
                     .relative()
@@ -1615,15 +1629,40 @@ impl Render for Arena {
     }
 }
 
+/// While the active pane shows an Inbox to-do list, the tab that wrote it and
+/// the color to frame it with.
+fn inbox_owner_highlight(active_pane: &Entity<Pane>, cx: &App) -> Option<(EntityId, Hsla)> {
+    let view = active_pane
+        .read(cx)
+        .active_item()?
+        .downcast::<crate::inbox_todo_view::InboxTodoView>()?;
+    let owner = view.read(cx).owner_item_id(cx)?;
+    Some((owner, crate::inbox_todo_color()))
+}
+
 struct AgentiumPaneDecorator<'a> {
     active_pane: &'a Entity<Pane>,
     workspace: &'a WeakEntity<Workspace>,
     ready_shell_pids: &'a HashSet<u32>,
     permission_shell_pids: &'a HashSet<u32>,
+    owner_highlight: Option<(EntityId, Hsla)>,
 }
 
 impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
+        // Matched against the item in front of each pane, so it follows the
+        // owner wherever it moved and never frames a closed one.
+        if let Some((owner, color)) = self.owner_highlight
+            && pane
+                .read(cx)
+                .active_item()
+                .is_some_and(|item| item.item_id() == owner)
+        {
+            return LeaderDecoration {
+                border: Some(color),
+                status_box: None,
+            };
+        }
         if let Some(view) = pane
             .read(cx)
             .active_item()
