@@ -89,6 +89,7 @@ pub(crate) struct CodexAcpView {
     working_directory: Option<PathBuf>,
     warning: Arc<Mutex<Option<String>>>,
     state: CodexAcpState,
+    finished_turns: u64,
     generation: u64,
     active_generation: Option<u64>,
     thread_id: Option<EntityId>,
@@ -244,14 +245,14 @@ impl CodexAcpView {
             cx.observe(&conversation, |this, conversation, cx| {
                 this.focus_handle = conversation.read(cx).focus_handle(cx);
                 if conversation.read(cx).load_error().is_some() {
-                    this.state = CodexAcpState::Error;
+                    this.set_state(CodexAcpState::Error);
                 }
                 if conversation.read(cx).root_thread(cx).is_none() {
                     this.thread_id = None;
                     this.thread_subscription = None;
                     this.active_generation = None;
                     if conversation.read(cx).load_error().is_none() {
-                        this.state = CodexAcpState::Idle;
+                        this.set_state(CodexAcpState::Idle);
                     }
                 }
                 cx.emit(ItemEvent::UpdateTab);
@@ -278,6 +279,7 @@ impl CodexAcpView {
             working_directory,
             warning,
             state: CodexAcpState::Idle,
+            finished_turns: 0,
             generation: 0,
             active_generation: None,
             thread_id: None,
@@ -292,6 +294,22 @@ impl CodexAcpView {
 
     pub(crate) fn state(&self) -> CodexAcpState {
         self.state
+    }
+
+    /// Counts entries into Completed or Error. Observers can see only the
+    /// final state of a batch of notifications, so this tells a new finished
+    /// turn apart from the one they already saw.
+    pub(crate) fn finished_turns(&self) -> u64 {
+        self.finished_turns
+    }
+
+    fn set_state(&mut self, state: CodexAcpState) {
+        if state != self.state
+            && matches!(state, CodexAcpState::Completed | CodexAcpState::Error)
+        {
+            self.finished_turns += 1;
+        }
+        self.state = state;
     }
 
     pub(crate) fn saved_tab(&self) -> Option<SavedCodexTab> {
@@ -343,7 +361,7 @@ impl CodexAcpView {
         }
         self.thread_id = Some(thread.entity_id());
         self.session_id = Some(thread.read(cx).session_id().clone());
-        self.state = CodexAcpState::Idle;
+        self.set_state(CodexAcpState::Idle);
         self.generation = thread.read(cx).activity_generation();
         self.active_generation = None;
         self.thread_subscription = Some(cx.subscribe(&thread, |this, thread, event, cx| {
@@ -372,7 +390,7 @@ impl CodexAcpView {
         let generation = thread.activity_generation();
         match event {
             AcpThreadEvent::Error | AcpThreadEvent::LoadError(_) | AcpThreadEvent::Refusal => {
-                self.state = CodexAcpState::Error
+                self.set_state(CodexAcpState::Error)
             }
             AcpThreadEvent::Stopped {
                 activity_generation,
@@ -381,7 +399,7 @@ impl CodexAcpView {
             } if *activity_generation == generation
                 && self.active_generation == Some(generation) =>
             {
-                self.state = if thread.had_error()
+                let state = if thread.had_error()
                     || matches!(stop_reason, Some(acp_v2::StopReason::Refusal))
                 {
                     CodexAcpState::Error
@@ -392,6 +410,7 @@ impl CodexAcpView {
                 } else {
                     self.state
                 };
+                self.set_state(state);
                 self.active_generation = None;
             }
             AcpThreadEvent::StatusChanged
@@ -400,9 +419,9 @@ impl CodexAcpView {
             | AcpThreadEvent::ElicitationRequested(_)
             | AcpThreadEvent::ElicitationResponded(_) => {
                 if thread.is_waiting_for_confirmation() {
-                    self.state = CodexAcpState::Permission;
+                    self.set_state(CodexAcpState::Permission);
                 } else if thread.status() == ThreadStatus::Generating {
-                    self.state = CodexAcpState::Running;
+                    self.set_state(CodexAcpState::Running);
                     if generation > self.generation {
                         self.active_generation = Some(generation);
                         self.generation = generation;
@@ -417,7 +436,7 @@ impl CodexAcpView {
 
     pub(crate) fn acknowledge(&mut self, cx: &mut Context<Self>) {
         if self.state == CodexAcpState::Completed {
-            self.state = CodexAcpState::Idle;
+            self.set_state(CodexAcpState::Idle);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         }
@@ -1790,6 +1809,36 @@ mod tests {
             });
         }
         assert!(thread.read_with(cx, |thread, _| thread.entries().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn codex_acp_counts_finished_turns_that_observers_never_see(cx: &mut TestAppContext) {
+        let (project, workspace, cx) = setup(cx).await;
+        let view = fake_tab(FakeAcpAgentServer::new(), "/arena", project, &workspace, cx);
+        cx.run_until_parked();
+        let notifications = Rc::new(std::cell::Cell::new(0));
+        let _observer = cx.update({
+            let notifications = notifications.clone();
+            |_, cx| cx.observe(&view, move |_, _| notifications.set(notifications.get() + 1))
+        });
+        let before = view.read_with(cx, |view, _| view.finished_turns());
+        view.update(cx, |view, cx| {
+            view.set_state(CodexAcpState::Error);
+            cx.notify();
+            view.set_state(CodexAcpState::Running);
+            cx.notify();
+            view.set_state(CodexAcpState::Error);
+            cx.notify();
+            // Re-entering the same state is not another turn.
+            view.set_state(CodexAcpState::Error);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.state(), CodexAcpState::Error);
+            assert_eq!(view.finished_turns(), before + 2);
+        });
     }
 
     #[gpui::test]

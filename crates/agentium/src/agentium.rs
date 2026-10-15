@@ -407,6 +407,232 @@ struct InboxCompletion {
     asker: Option<InboxAsker>,
     #[serde(skip)]
     tab: Option<InboxTab>,
+    /// Set for a Failed-lane record: why it failed.
+    #[serde(default)]
+    failure: Option<String>,
+    /// Set for a PR CI failure, which has no tab.
+    #[serde(default)]
+    pull_request: Option<InboxPullRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct InboxPullRequest {
+    arena_path: PathBuf,
+    number: u32,
+}
+
+/// Identifies one finished turn of a tab. ACP tabs count their turns because
+/// an observer may only see the last state of a batch of notifications;
+/// terminal tabs report each state change synchronously and use turn 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinishKey {
+    failed: bool,
+    turn: u64,
+}
+
+/// A tab that is Completed or Failed at one Inbox sync.
+struct FinishedTab {
+    item_id: EntityId,
+    key: FinishKey,
+    tab: Option<InboxTab>,
+    asker: Option<InboxAsker>,
+    arena_name: String,
+    title: String,
+    detail: String,
+    failure: Option<String>,
+    notify: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedTabState {
+    Gone,
+    Busy,
+    Viewed,
+    Idle,
+}
+
+/// Records each tab whose finish key changed since the previous sync, replacing
+/// that tab's existing record (same item, or same asker). Tabs in
+/// `asking_items` are not recorded as completed: the asking agent ends its turn
+/// right after `inbox ask`, and that is not a finished task. They are still
+/// remembered as seen, so answering the question does not record the stale
+/// completion. Returns each new record id with whether to pop up a notification.
+fn record_finished_tabs(
+    records: &mut Vec<InboxCompletion>,
+    seen: &mut HashMap<EntityId, FinishKey>,
+    finished: Vec<FinishedTab>,
+    asking_items: &HashSet<EntityId>,
+    next_id: &mut u64,
+    now: DateTime<Utc>,
+) -> Vec<(u64, bool)> {
+    let previous = std::mem::take(seen);
+    let mut recorded = Vec::new();
+    for finished in finished {
+        seen.insert(finished.item_id, finished.key);
+        if previous.get(&finished.item_id) == Some(&finished.key)
+            || (!finished.key.failed && asking_items.contains(&finished.item_id))
+        {
+            continue;
+        }
+        records.retain(|record| {
+            let same_tab = record
+                .tab
+                .as_ref()
+                .is_some_and(|tab| tab.item.id() == finished.item_id);
+            let same_asker = finished.asker.is_some() && record.asker == finished.asker;
+            !same_tab && !same_asker
+        });
+        let id = *next_id;
+        *next_id += 1;
+        records.insert(
+            0,
+            InboxCompletion {
+                id,
+                title: finished.title,
+                detail: finished.detail,
+                arena_name: finished.arena_name,
+                completed_at: now,
+                confirmed_at: None,
+                asker: finished.asker,
+                tab: finished.tab,
+                failure: finished.failure,
+                pull_request: None,
+            },
+        );
+        recorded.push((id, finished.notify));
+    }
+    recorded
+}
+
+/// Drops records whose tab is working again or that stayed confirmed past
+/// `INBOX_CONFIRMED_COMPLETION_TTL`, and confirms the ones the user is looking
+/// at. Returns whether anything changed.
+fn age_inbox_records(
+    records: &mut Vec<InboxCompletion>,
+    now: DateTime<Utc>,
+    state_of: impl Fn(&InboxCompletion) -> RecordedTabState,
+) -> bool {
+    let before = records.len();
+    records.retain(|record| {
+        let expired = record
+            .confirmed_at
+            .is_some_and(|confirmed_at| now - confirmed_at > INBOX_CONFIRMED_COMPLETION_TTL);
+        !expired && state_of(record) != RecordedTabState::Busy
+    });
+    let mut changed = records.len() != before;
+    for record in records.iter_mut() {
+        if record.confirmed_at.is_none() && state_of(record) == RecordedTabState::Viewed {
+            record.confirmed_at = Some(now);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn ci_is_failing(status: &CiStatus) -> bool {
+    matches!(status, CiStatus::Failed | CiStatus::PendingWithFailure)
+}
+
+/// Updates the PR's Failed-lane record for a new CI result. A clean result
+/// removes it whatever came before, so a failure persisted across a restart
+/// clears too. A failure is recorded only on a change from a known
+/// non-failing status: the first status seen (e.g. right after startup) is
+/// not news, and a failure the user dismissed stays dismissed until CI
+/// recovers. Returns whether records changed and the new record id.
+fn apply_ci_status(
+    records: &mut Vec<InboxCompletion>,
+    pull_request: &InboxPullRequest,
+    previous: Option<&CiStatus>,
+    next: Option<&CiInfo>,
+    title: String,
+    arena_name: String,
+    next_id: &mut u64,
+    now: DateTime<Utc>,
+) -> (bool, Option<u64>) {
+    let Some(next) = next else {
+        return (false, None);
+    };
+    let before = records.len();
+    if !ci_is_failing(&next.status) {
+        records.retain(|record| record.pull_request.as_ref() != Some(pull_request));
+        return (records.len() != before, None);
+    }
+    if !previous.is_some_and(|previous| !ci_is_failing(previous)) {
+        return (false, None);
+    }
+    records.retain(|record| record.pull_request.as_ref() != Some(pull_request));
+    let failing_checks = next
+        .checks
+        .iter()
+        .filter(|check| check.bucket == "fail")
+        .map(|check| check.name.to_string())
+        .collect::<Vec<_>>();
+    let failure = if failing_checks.is_empty() {
+        "CI failed".to_string()
+    } else {
+        format!("Failing: {}", failing_checks.join(", "))
+    };
+    let id = *next_id;
+    *next_id += 1;
+    records.insert(
+        0,
+        InboxCompletion {
+            id,
+            title,
+            detail: format!("PR #{}", pull_request.number),
+            arena_name,
+            completed_at: now,
+            confirmed_at: None,
+            asker: None,
+            tab: None,
+            failure: Some(failure),
+            pull_request: Some(pull_request.clone()),
+        },
+    );
+    (true, Some(id))
+}
+
+/// Tags each CI request so a response is applied only if no newer request for
+/// the same PR started since, and not at all after the arena closed or switched
+/// branches. Tokens come from one counter that never resets, so a request
+/// started after `forget_arena` cannot reuse an older request's token.
+#[derive(Default)]
+struct CiFetchGenerations {
+    next_token: u64,
+    latest: HashMap<(EntityId, u32), u64>,
+}
+
+impl CiFetchGenerations {
+    fn start(&mut self, key: (EntityId, u32)) -> u64 {
+        self.next_token += 1;
+        self.latest.insert(key, self.next_token);
+        self.next_token
+    }
+
+    fn is_current(&self, key: (EntityId, u32), token: u64) -> bool {
+        self.latest.get(&key) == Some(&token)
+    }
+
+    fn forget_arena(&mut self, entity_id: EntityId) {
+        self.latest.retain(|(id, _), _| *id != entity_id);
+    }
+
+    /// Accepts a response if its request is still the latest for the PR, and
+    /// only then counts the PR as checked: a dropped response must not delay
+    /// the fetch that replaces it.
+    fn accept(
+        &self,
+        key: (EntityId, u32),
+        token: u64,
+        last_checked: &mut HashMap<(EntityId, u32), Instant>,
+        now: Instant,
+    ) -> bool {
+        let current = self.is_current(key, token);
+        if current {
+            last_checked.insert(key, now);
+        }
+        current
+    }
 }
 
 impl InboxCompletion {
@@ -455,6 +681,7 @@ struct InboxCompletionRow {
     arena_name: String,
     completed_at: DateTime<Utc>,
     note: Option<&'static str>,
+    failure: Option<String>,
     confirmed: bool,
 }
 
@@ -475,6 +702,7 @@ struct InboxQuestionRow {
 struct InboxEntries {
     questions: Vec<InboxQuestionRow>,
     permission: Vec<InboxEntry>,
+    failed: Vec<InboxCompletionRow>,
     completed: Vec<InboxCompletionRow>,
     /// Shown for orientation only: running tabs need nothing from the user,
     /// so they stay out of the badge.
@@ -485,17 +713,21 @@ impl InboxEntries {
     /// The count of entries still awaiting the user (confirmed completions
     /// excluded), colored by the most urgent lane that has any.
     fn badge(&self, cx: &App) -> Option<(usize, Hsla)> {
+        let unconfirmed_failures = self.failed.iter().filter(|row| !row.confirmed).count();
         let unconfirmed = self.completed.iter().filter(|row| !row.confirmed).count();
         let color = if !self.questions.is_empty() {
             inbox_decision_color()
         } else if !self.permission.is_empty() {
             cx.theme().status().warning
+        } else if unconfirmed_failures > 0 {
+            cx.theme().status().error
         } else if unconfirmed > 0 {
             cx.theme().colors().text_accent
         } else {
             return None;
         };
-        let count = self.questions.len() + self.permission.len() + unconfirmed;
+        let count =
+            self.questions.len() + self.permission.len() + unconfirmed_failures + unconfirmed;
         Some((count, color))
     }
 }
@@ -693,9 +925,10 @@ pub struct AgentiumApp {
     inbox_permissions: Vec<InboxPermission>,
     completion_notifications: Vec<WindowHandle<agent_ui::AgentNotification>>,
     _completion_notification_subscriptions: Vec<Subscription>,
-    /// Tabs seen in the Completed state on the previous sync, so a tab that
-    /// stays Completed is recorded once, and not again after a dismiss.
-    inbox_completed_items: HashSet<EntityId>,
+    /// Tabs seen Completed or Failed on the previous sync, so a finished turn
+    /// is recorded once, and not again after a dismiss.
+    inbox_finished_items: HashMap<EntityId, FinishKey>,
+    ci_fetch_generations: CiFetchGenerations,
     _inbox_completions_write_task: Option<Task<()>>,
     renaming_task: Option<Uuid>,
     task_rename_editor: Entity<Editor>,
@@ -754,6 +987,7 @@ impl AgentiumApp {
 
                     this.pr_info.remove(&entity_id);
                     this.ci_status.retain(|(id, _), _| *id != entity_id);
+                    this.ci_fetch_generations.forget_arena(entity_id);
                     if this.gh_available || this.bee_available {
                         this.fetch_pr_for_arena(entity_id, cx);
                     }
@@ -1053,7 +1287,8 @@ impl AgentiumApp {
             inbox_permissions: Vec::new(),
             completion_notifications: Vec::new(),
             _completion_notification_subscriptions: Vec::new(),
-            inbox_completed_items: HashSet::new(),
+            inbox_finished_items: HashMap::new(),
+            ci_fetch_generations: CiFetchGenerations::default(),
             renaming_task: None,
             task_rename_editor,
             adding_issue_to_task: None,
@@ -1138,7 +1373,12 @@ impl AgentiumApp {
             cx.subscribe(
                 &arena_entity,
                 |this, arena, event: &ArenaEvent, cx| match event {
-                    ArenaEvent::CodexTabsChanged => this.sync_codex_tabs(&arena, cx),
+                    ArenaEvent::CodexTabsChanged => {
+                        this.sync_codex_tabs(&arena, cx);
+                        // Records ACP completions and failures while nothing
+                        // renders (e.g. Agentium in the background).
+                        this.sync_inbox_completions(cx);
+                    }
                     ArenaEvent::ActiveItemChanged => cx.notify(),
                     // Claude session clearing routes through AgentiumApp because
                     // claude_sessions state lives here. Non-Claude task acknowledgment
@@ -1571,7 +1811,10 @@ impl AgentiumApp {
                                     if let Some(working_dir) =
                                         arena.read(cx).working_directory.clone()
                                     {
-                                        targets.push((entity_id, working_dir, pr_number));
+                                        let token = this
+                                            .ci_fetch_generations
+                                            .start((entity_id, pr_number));
+                                        targets.push((entity_id, working_dir, pr_number, token));
                                     }
                                 }
                             }
@@ -1581,12 +1824,27 @@ impl AgentiumApp {
                     .unwrap_or_default();
 
                 let mut should_stop = false;
-                for (entity_id, working_dir, pr_number) in targets {
+                for (entity_id, working_dir, pr_number, token) in targets {
+                    // A direct fetch, an arena close or a branch switch since
+                    // this batch was queued supersedes the queued request.
+                    let superseded = this
+                        .read_with(cx, |this, _| {
+                            !this
+                                .ci_fetch_generations
+                                .is_current((entity_id, pr_number), token)
+                        })
+                        .unwrap_or(true);
+                    if superseded {
+                        continue;
+                    }
                     let start = Instant::now();
                     let result = cx
                         .background_executor()
-                        .spawn(async move {
-                            fetch_ci_status(Some(&working_dir), pr_number, None).await
+                        .spawn({
+                            let working_dir = working_dir.clone();
+                            async move {
+                                fetch_ci_status(Some(&working_dir), pr_number, None).await
+                            }
                         })
                         .await;
                     let elapsed = start.elapsed();
@@ -1598,17 +1856,14 @@ impl AgentiumApp {
                                 this._ci_poll_task = None;
                                 return true;
                             }
-                            this.ci_last_checked
-                                .insert((entity_id, pr_number), Instant::now());
-                            match result {
-                                Ok(Some(status)) => {
-                                    this.ci_status.insert((entity_id, pr_number), status);
-                                }
-                                Ok(None) | Err(_) => {
-                                    this.ci_status.remove(&(entity_id, pr_number));
-                                }
-                            }
-                            cx.notify();
+                            this.set_ci_status(
+                                entity_id,
+                                working_dir,
+                                pr_number,
+                                token,
+                                result.ok().flatten(),
+                                cx,
+                            );
                             false
                         })
                         .unwrap_or(true);
@@ -1673,24 +1928,25 @@ impl AgentiumApp {
         let Some(working_dir) = working_dir else {
             return;
         };
+        let token = self.ci_fetch_generations.start((entity_id, pr_number));
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_ci_status(Some(&working_dir), pr_number, None).await })
+                .spawn({
+                    let working_dir = working_dir.clone();
+                    async move { fetch_ci_status(Some(&working_dir), pr_number, None).await }
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.ci_last_checked
-                    .insert((entity_id, pr_number), Instant::now());
-                match result {
-                    Ok(Some(status)) => {
-                        this.ci_status.insert((entity_id, pr_number), status);
-                    }
-                    Ok(None) | Err(_) => {
-                        this.ci_status.remove(&(entity_id, pr_number));
-                    }
-                }
-                cx.notify();
+                this.set_ci_status(
+                    entity_id,
+                    working_dir,
+                    pr_number,
+                    token,
+                    result.ok().flatten(),
+                    cx,
+                );
             })
             .ok();
         })
@@ -1952,6 +2208,7 @@ impl AgentiumApp {
         self.pr_last_checked.remove(&entity_id);
         self.ci_status.retain(|(id, _), _| *id != entity_id);
         self.ci_last_checked.retain(|(id, _), _| *id != entity_id);
+        self.ci_fetch_generations.forget_arena(entity_id);
         self.pr_dirty.remove(&entity_id);
         self.last_branch_names.remove(&entity_id);
         self.arenas.remove(index);
@@ -2761,15 +3018,9 @@ impl AgentiumApp {
         None
     }
 
-    /// Records each tab that entered the Completed state since the last sync.
-    /// A tab keeps one record, replaced by its latest completion. Tabs with a
-    /// pending question are skipped: the asking agent ends its turn right
-    /// after `inbox ask`, and that is not a finished task. An `--assume`
-    /// question does not stop the agent, so its tab's completions count.
-    ///
-    /// Then ages the records: one whose tab is working again is dropped, one
-    /// whose tab the user is looking at becomes confirmed, and a confirmed one
-    /// is dropped after `INBOX_CONFIRMED_COMPLETION_TTL`.
+    /// Records each tab that finished a turn (Completed, or a Codex ACP tab in
+    /// Error) since the last sync, then ages the records; see
+    /// `record_finished_tabs` and `age_inbox_records`.
     fn sync_inbox_completions(&mut self, cx: &mut Context<Self>) {
         let asking_items: HashSet<EntityId> = self
             .inbox_questions
@@ -2777,113 +3028,162 @@ impl AgentiumApp {
             .filter(|question| !question.assumed)
             .filter_map(|question| question.tab.as_ref().map(|tab| tab.item.id()))
             .collect();
-        let mut completed_items = HashSet::new();
-        let mut fresh = Vec::new();
+        let mut finished = Vec::new();
         for arena in &self.arenas {
             let arena_name = arena.read(cx).name.clone();
-            for info in self.collect_ready_terminal_infos(arena, cx) {
+            let completed = self
+                .collect_ready_terminal_infos(arena, cx)
+                .into_iter()
+                .map(|info| (info, None));
+            let failed = codex_badge_entries(arena.read(cx), codex_acp_view::CodexAcpState::Error, cx)
+                .into_iter()
+                .map(|info| (info, Some("Stopped with an error".to_string())));
+            for (info, failure) in completed.chain(failed) {
                 let item_id = info.item.item_id();
-                completed_items.insert(item_id);
-                if !self.inbox_completed_items.contains(&item_id)
-                    && !asking_items.contains(&item_id)
-                {
-                    fresh.push((arena.downgrade(), arena_name.clone(), info));
-                }
-            }
-        }
-        self.inbox_completed_items = completed_items;
-        let mut changed = !fresh.is_empty();
-        for (arena, arena_name, info) in fresh {
-            let item_id = info.item.item_id();
-            // ACP tabs pop up their own notification from the conversation view.
-            let should_notify = info.item.act_as::<codex_acp_view::CodexAcpView>(cx).is_none()
-                && !self.is_tab_in_view(&arena, &info.pane, item_id, cx);
-            let notification = should_notify.then(|| {
-                (
-                    info.primary.clone(),
-                    info.secondary.clone(),
-                    arena_name.clone(),
-                )
-            });
-            let asker = self.inbox_asker(info.item.as_ref(), cx);
-            self.inbox_completions.retain(|completion| {
-                let same_tab = completion
-                    .tab
-                    .as_ref()
-                    .is_some_and(|tab| tab.item.id() == item_id);
-                let same_asker = asker.is_some() && completion.asker == asker;
-                !same_tab && !same_asker
-            });
-            let id = self.next_inbox_question_id;
-            self.next_inbox_question_id += 1;
-            self.inbox_completions.insert(
-                0,
-                InboxCompletion {
-                    id,
-                    title: info.primary,
-                    detail: info.secondary,
-                    arena_name,
-                    completed_at: Utc::now(),
-                    confirmed_at: None,
-                    asker,
+                let acp_view = info.item.act_as::<codex_acp_view::CodexAcpView>(cx);
+                let key = FinishKey {
+                    failed: failure.is_some(),
+                    turn: acp_view
+                        .as_ref()
+                        .map_or(0, |view| view.read(cx).finished_turns()),
+                };
+                // ACP tabs pop up their own notification from the conversation view.
+                let notify = acp_view.is_none()
+                    && !self.is_tab_in_view(&arena.downgrade(), &info.pane, item_id, cx);
+                finished.push(FinishedTab {
+                    item_id,
+                    key,
                     tab: Some(InboxTab {
-                        arena,
+                        arena: arena.downgrade(),
                         pane: info.pane.downgrade(),
                         item: info.item.downgrade_item(),
                     }),
-                },
-            );
-            if let Some((title, caption, arena_name)) = notification {
-                // Deferred: this sync also runs inside `render`, where opening
-                // a window is not safe.
-                cx.spawn(async move |this, cx| {
-                    this.update(cx, |this, cx| {
-                        this.show_completion_notification(id, title, caption, arena_name, cx);
-                    })
-                })
-                .detach_and_log_err(cx);
+                    asker: self.inbox_asker(info.item.as_ref(), cx),
+                    arena_name: arena_name.clone(),
+                    title: info.primary,
+                    detail: info.secondary,
+                    failure,
+                    notify,
+                });
+            }
+        }
+        let now = Utc::now();
+        let recorded = record_finished_tabs(
+            &mut self.inbox_completions,
+            &mut self.inbox_finished_items,
+            finished,
+            &asking_items,
+            &mut self.next_inbox_question_id,
+            now,
+        );
+        let mut changed = !recorded.is_empty();
+        for (id, notify) in recorded {
+            if notify {
+                self.notify_inbox_record(id, cx);
             }
         }
 
-        let now = Utc::now();
-        let mut expired = HashSet::new();
-        let mut confirmed = HashSet::new();
-        for completion in &self.inbox_completions {
-            if completion
-                .confirmed_at
-                .is_some_and(|confirmed_at| now - confirmed_at > INBOX_CONFIRMED_COMPLETION_TTL)
-            {
-                expired.insert(completion.id);
-                continue;
+        let mut records = std::mem::take(&mut self.inbox_completions);
+        changed |= age_inbox_records(&mut records, now, |record| {
+            if record.pull_request.is_some() {
+                return RecordedTabState::Idle;
             }
-            let Some((arena, pane, item)) = completion.live_tab() else {
-                continue;
+            let Some((arena, pane, item)) = record.live_tab() else {
+                return RecordedTabState::Gone;
             };
             if matches!(
                 self.tab_info(item.as_ref(), &arena, cx).state,
                 Some("running" | "permission")
             ) {
-                expired.insert(completion.id);
-            } else if completion.confirmed_at.is_none()
-                && self.is_active_tab(&arena, &pane, item.item_id(), cx)
-            {
-                confirmed.insert(completion.id);
+                RecordedTabState::Busy
+            } else if self.is_active_tab(&arena, &pane, item.item_id(), cx) {
+                RecordedTabState::Viewed
+            } else {
+                RecordedTabState::Idle
             }
-        }
-        if !expired.is_empty() {
-            self.inbox_completions
-                .retain(|completion| !expired.contains(&completion.id));
-            changed = true;
-        }
-        for completion in &mut self.inbox_completions {
-            if confirmed.contains(&completion.id) {
-                completion.confirmed_at = Some(now);
-                changed = true;
-            }
-        }
+        });
+        self.inbox_completions = records;
         if changed {
             self.persist_inbox_completions(cx);
         }
+    }
+
+    fn notify_inbox_record(&self, id: u64, cx: &mut Context<Self>) {
+        let Some(record) = self.inbox_completions.iter().find(|record| record.id == id) else {
+            return;
+        };
+        let title = record.title.clone();
+        let caption = record.failure.clone().unwrap_or_else(|| record.detail.clone());
+        let arena_name = record.arena_name.clone();
+        // Deferred: the sync also runs inside `render`, where opening a window
+        // is not safe.
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.show_completion_notification(id, title, caption, arena_name, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Applies one CI response. Stale responses (a newer request for the PR
+    /// started, or the arena closed or switched branches since) are dropped.
+    fn set_ci_status(
+        &mut self,
+        entity_id: EntityId,
+        arena_path: PathBuf,
+        pr_number: u32,
+        token: u64,
+        status: Option<CiInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (entity_id, pr_number);
+        if !self
+            .ci_fetch_generations
+            .accept(key, token, &mut self.ci_last_checked, Instant::now())
+        {
+            return;
+        }
+        let Some(arena) = self
+            .arenas
+            .iter()
+            .find(|arena| arena.entity_id() == entity_id)
+        else {
+            return;
+        };
+        let arena_name = arena.read(cx).name.clone();
+        let title = self
+            .pr_info
+            .get(&entity_id)
+            .and_then(|prs| prs.iter().find(|pr| pr.number == pr_number))
+            .map_or_else(|| format!("PR #{pr_number}"), |pr| pr.title.to_string());
+        let (changed, recorded) = apply_ci_status(
+            &mut self.inbox_completions,
+            &InboxPullRequest {
+                arena_path,
+                number: pr_number,
+            },
+            self.ci_status.get(&key).map(|info| &info.status),
+            status.as_ref(),
+            title,
+            arena_name,
+            &mut self.next_inbox_question_id,
+            Utc::now(),
+        );
+        if changed {
+            self.persist_inbox_completions(cx);
+        }
+        if let Some(id) = recorded {
+            self.notify_inbox_record(id, cx);
+        }
+        match status {
+            Some(status) => {
+                self.ci_status.insert(key, status);
+            }
+            None => {
+                self.ci_status.remove(&key);
+            }
+        }
+        cx.notify();
     }
 
     /// Whether the user is looking at the tab: Agentium is the active window
@@ -3008,12 +3308,28 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((arena, pane, item)) = self
+        let Some(completion) = self
             .inbox_completions
-            .iter()
+            .iter_mut()
             .find(|completion| completion.id == completion_id)
-            .and_then(|completion| completion.live_tab())
         else {
+            return;
+        };
+        if let Some(pull_request) = completion.pull_request.clone() {
+            // No tab to look at, so opening the row is the confirmation.
+            if completion.confirmed_at.is_none() {
+                completion.confirmed_at = Some(Utc::now());
+                self.persist_inbox_completions(cx);
+            }
+            if let Some(index) = self.arenas.iter().position(|arena| {
+                arena.read(cx).working_directory.as_ref() == Some(&pull_request.arena_path)
+            }) {
+                self.switch_arena(index, window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let Some((arena, pane, item)) = completion.live_tab() else {
             return;
         };
         let Some(arena_index) = self
@@ -6866,8 +7182,14 @@ impl AgentiumApp {
             });
         }
         for completion in &self.inbox_completions {
-            let note = completion.live_tab().is_none().then_some("tab not open");
-            entries.completed.push(InboxCompletionRow {
+            let note = (completion.pull_request.is_none() && completion.live_tab().is_none())
+                .then_some("tab not open");
+            let lane = if completion.failure.is_some() {
+                &mut entries.failed
+            } else {
+                &mut entries.completed
+            };
+            lane.push(InboxCompletionRow {
                 id: completion.id,
                 is_active: completion.live_tab().is_some_and(|(arena, pane, item)| {
                     self.is_active_tab(&arena, &pane, item.item_id(), cx)
@@ -6878,6 +7200,7 @@ impl AgentiumApp {
                 completed_at: completion.completed_at,
                 confirmed: completion.confirmed_at.is_some(),
                 note,
+                failure: completion.failure.clone(),
             });
         }
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
@@ -7006,6 +7329,12 @@ impl AgentiumApp {
             .map(|row| self.render_inbox_question(row, cx))
             .collect::<Vec<_>>();
         let permission_count = entries.permission.len();
+        let failed_count = entries.failed.len();
+        let failed_rows = entries
+            .failed
+            .into_iter()
+            .map(|row| self.render_inbox_completion(row, cx))
+            .collect::<Vec<_>>();
         let completed_count = entries.completed.len();
         let permission_rows = render_rows("permission", entries.permission, cx);
         let in_progress_count = entries.in_progress.len();
@@ -7028,6 +7357,10 @@ impl AgentiumApp {
             .child(lane_header("Needs permission", permission_count, status_colors.warning))
             .when(permission_rows.is_empty(), |d| d.child(empty_row()))
             .children(permission_rows)
+            .when(!failed_rows.is_empty(), |d| {
+                d.child(lane_header("Failed", failed_count, status_colors.error))
+                    .children(failed_rows)
+            })
             .child(lane_header("Completed", completed_count, colors.text_accent))
             .when(completed_rows.is_empty(), |d| d.child(empty_row()))
             .children(completed_rows)
@@ -7039,6 +7372,7 @@ impl AgentiumApp {
 
     fn render_inbox_completion(&self, row: InboxCompletionRow, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let error_color = cx.theme().status().error;
         let completion_id = row.id;
         let title = if row.title.is_empty() {
             "(no prompt)".to_string()
@@ -7087,6 +7421,15 @@ impl AgentiumApp {
                             .truncate()
                             .child(detail),
                     )
+                    .when_some(row.failure, |d, failure| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(error_color)
+                                .truncate()
+                                .child(failure),
+                        )
+                    })
                     .when_some(row.note, |d, note| {
                         d.child(div().text_xs().text_color(colors.text_accent).child(note))
                     }),
@@ -8315,6 +8658,9 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
+        CiCheckEntry, CiFetchGenerations, CiInfo, CiStatus, FinishKey, FinishedTab,
+        InboxCompletion, InboxCompletionRow, InboxEntries, InboxPullRequest, InboxQuestionRow,
+        InboxTab, RecordedTabState, age_inbox_records, apply_ci_status, record_finished_tabs,
         ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line,
@@ -8385,6 +8731,435 @@ mod tests {
                 })
         );
         assert_eq!(restored.options[0].label, "JST");
+    }
+
+    fn test_tab(cx: &mut gpui::TestAppContext) -> (gpui::EntityId, InboxTab) {
+        use workspace::ItemHandle as _;
+        use gpui::AppContext as _;
+        let item = cx.update(|cx| cx.new(workspace::item::test::TestItem::new));
+        let tab = InboxTab {
+            arena: gpui::WeakEntity::new_invalid(),
+            pane: gpui::WeakEntity::new_invalid(),
+            item: item.downgrade_item(),
+        };
+        (item.entity_id(), tab)
+    }
+
+    fn finished(
+        item_id: gpui::EntityId,
+        tab: &InboxTab,
+        failed: bool,
+        turn: u64,
+        asker: Option<InboxAsker>,
+    ) -> FinishedTab {
+        FinishedTab {
+            item_id,
+            key: FinishKey { failed, turn },
+            tab: Some(InboxTab {
+                arena: tab.arena.clone(),
+                pane: tab.pane.clone(),
+                item: tab.item.boxed_clone(),
+            }),
+            asker,
+            arena_name: "zed".to_string(),
+            title: "Fix the Inbox".to_string(),
+            detail: "Codex (ACP)".to_string(),
+            failure: failed.then(|| "Stopped with an error".to_string()),
+            notify: false,
+        }
+    }
+
+    fn ci(status: CiStatus, failing: &[&str]) -> CiInfo {
+        CiInfo {
+            status,
+            checks: failing
+                .iter()
+                .map(|name| CiCheckEntry {
+                    name: name.to_string().into(),
+                    bucket: "fail".into(),
+                })
+                .chain(std::iter::once(CiCheckEntry {
+                    name: "docs".into(),
+                    bucket: "pass".into(),
+                }))
+                .collect(),
+        }
+    }
+
+    #[gpui::test]
+    fn finished_turns_are_recorded_once_and_replace_the_tabs_record(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, tab) = test_tab(cx);
+        let mut records = Vec::new();
+        let mut seen = HashMap::new();
+        let mut next_id = 1;
+        let now = chrono::Utc::now();
+        let no_questions = std::collections::HashSet::new();
+        let mut sync = |records: &mut Vec<InboxCompletion>, tabs: Vec<FinishedTab>| {
+            record_finished_tabs(records, &mut seen, tabs, &no_questions, &mut next_id, now)
+        };
+
+        assert_eq!(sync(&mut records, vec![finished(item, &tab, false, 0, None)]).len(), 1);
+        // Still Completed at the next sync: not news.
+        assert!(sync(&mut records, vec![finished(item, &tab, false, 0, None)]).is_empty());
+        assert_eq!(records.len(), 1);
+
+        // The same tab failing replaces its completion.
+        assert_eq!(sync(&mut records, vec![finished(item, &tab, true, 1, None)]).len(), 1);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].failure.is_some());
+
+        // Error -> Running -> Error seen only as its final state: the turn
+        // counter still tells the second failure apart.
+        let first_failure = records[0].id;
+        assert_eq!(sync(&mut records, vec![finished(item, &tab, true, 2, None)]).len(), 1);
+        assert_eq!(records.len(), 1);
+        assert_ne!(records[0].id, first_failure);
+
+        // Completing again replaces the failure.
+        assert_eq!(sync(&mut records, vec![finished(item, &tab, false, 3, None)]).len(), 1);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].failure.is_none());
+
+        // Not finished at one sync, finished again at the next: a new turn.
+        assert!(sync(&mut records, Vec::new()).is_empty());
+        assert_eq!(sync(&mut records, vec![finished(item, &tab, false, 0, None)]).len(), 1);
+        assert_eq!(records.len(), 1);
+    }
+
+    #[gpui::test]
+    fn a_reopened_tab_replaces_the_record_of_the_same_asker(cx: &mut gpui::TestAppContext) {
+        let (before_restart, old_tab) = test_tab(cx);
+        let (after_restart, new_tab) = test_tab(cx);
+        let asker = || {
+            Some(InboxAsker::ClaudeSession {
+                session_id: "c8832ec2".to_string(),
+            })
+        };
+        let mut records = Vec::new();
+        let mut seen = HashMap::new();
+        let mut next_id = 1;
+        let now = chrono::Utc::now();
+        let no_questions = std::collections::HashSet::new();
+        record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(before_restart, &old_tab, false, 0, asker())],
+            &no_questions,
+            &mut next_id,
+            now,
+        );
+        record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(after_restart, &new_tab, false, 0, asker())],
+            &no_questions,
+            &mut next_id,
+            now,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].tab.as_ref().map(|tab| tab.item.id()),
+            Some(after_restart)
+        );
+    }
+
+    #[gpui::test]
+    fn an_asking_tab_is_not_completed_but_can_fail(cx: &mut gpui::TestAppContext) {
+        let (item, tab) = test_tab(cx);
+        let asking = std::collections::HashSet::from([item]);
+        let mut records = Vec::new();
+        let mut seen = HashMap::new();
+        let mut next_id = 1;
+        let now = chrono::Utc::now();
+        let recorded = record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(item, &tab, false, 0, None)],
+            &asking,
+            &mut next_id,
+            now,
+        );
+        assert!(recorded.is_empty());
+        // Answering the question leaves the tab Completed: still not recorded.
+        let recorded = record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(item, &tab, false, 0, None)],
+            &std::collections::HashSet::new(),
+            &mut next_id,
+            now,
+        );
+        assert!(recorded.is_empty());
+        let recorded = record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(item, &tab, true, 1, None)],
+            &asking,
+            &mut next_id,
+            now,
+        );
+        assert_eq!(recorded.len(), 1);
+    }
+
+    #[gpui::test]
+    fn records_age_by_their_tab_state(cx: &mut gpui::TestAppContext) {
+        let (item, tab) = test_tab(cx);
+        let mut records = Vec::new();
+        let mut seen = HashMap::new();
+        let mut next_id = 1;
+        let now = chrono::Utc::now();
+        record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(item, &tab, false, 0, None)],
+            &std::collections::HashSet::new(),
+            &mut next_id,
+            now,
+        );
+
+        assert!(!age_inbox_records(&mut records, now, |_| RecordedTabState::Gone));
+        assert!(!age_inbox_records(&mut records, now, |_| RecordedTabState::Idle));
+        assert!(records[0].confirmed_at.is_none());
+
+        assert!(age_inbox_records(&mut records, now, |_| RecordedTabState::Viewed));
+        assert_eq!(records[0].confirmed_at, Some(now));
+
+        let within_ttl = now + chrono::TimeDelta::minutes(59);
+        assert!(!age_inbox_records(&mut records, within_ttl, |_| RecordedTabState::Gone));
+        assert_eq!(records.len(), 1);
+        let past_ttl = now + chrono::TimeDelta::minutes(61);
+        assert!(age_inbox_records(&mut records, past_ttl, |_| RecordedTabState::Gone));
+        assert!(records.is_empty());
+
+        record_finished_tabs(
+            &mut records,
+            &mut seen,
+            vec![finished(item, &tab, true, 1, None)],
+            &std::collections::HashSet::new(),
+            &mut next_id,
+            now,
+        );
+        assert!(age_inbox_records(&mut records, now, |_| RecordedTabState::Busy));
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn ci_failures_are_recorded_on_a_change_from_a_known_good_status() {
+        let pull_request = InboxPullRequest {
+            arena_path: PathBuf::from("/src/zed"),
+            number: 812,
+        };
+        let mut records = Vec::new();
+        let mut next_id = 1;
+        let now = chrono::Utc::now();
+        let mut apply = |records: &mut Vec<InboxCompletion>,
+                         previous: Option<CiStatus>,
+                         next: Option<CiInfo>| {
+            apply_ci_status(
+                records,
+                &pull_request,
+                previous.as_ref(),
+                next.as_ref(),
+                "Retry on 429".to_string(),
+                "zed".to_string(),
+                &mut next_id,
+                now,
+            )
+        };
+
+        // The first status seen (e.g. at startup) is not news.
+        assert_eq!(
+            apply(&mut records, None, Some(ci(CiStatus::Failed, &["lint"]))),
+            (false, None)
+        );
+        assert!(records.is_empty());
+
+        let (changed, recorded) = apply(
+            &mut records,
+            Some(CiStatus::PendingClean),
+            Some(ci(CiStatus::PendingWithFailure, &["lint", "test"])),
+        );
+        assert!(changed && recorded.is_some());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].failure.as_deref(), Some("Failing: lint, test"));
+        assert_eq!(records[0].detail, "PR #812");
+
+        // Still failing: no duplicate.
+        assert_eq!(
+            apply(
+                &mut records,
+                Some(CiStatus::PendingWithFailure),
+                Some(ci(CiStatus::Failed, &["lint"]))
+            ),
+            (false, None)
+        );
+        assert_eq!(records.len(), 1);
+
+        // A dismissed failure stays dismissed while CI keeps failing...
+        records.clear();
+        assert_eq!(
+            apply(&mut records, Some(CiStatus::Failed), Some(ci(CiStatus::Failed, &["lint"]))),
+            (false, None)
+        );
+        assert!(records.is_empty());
+        // ...and a recovery followed by a new failure is recorded again.
+        assert_eq!(
+            apply(&mut records, Some(CiStatus::Failed), Some(ci(CiStatus::AllPassed, &[]))),
+            (false, None)
+        );
+        let (_, recorded) = apply(
+            &mut records,
+            Some(CiStatus::AllPassed),
+            Some(ci(CiStatus::Failed, &["lint"])),
+        );
+        assert!(recorded.is_some());
+
+        // A response with no status (gh error) leaves the record alone.
+        assert_eq!(apply(&mut records, Some(CiStatus::Failed), None), (false, None));
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn a_clean_ci_result_clears_a_failure_persisted_across_a_restart() {
+        let pull_request = InboxPullRequest {
+            arena_path: PathBuf::from("/src/zed"),
+            number: 812,
+        };
+        let mut records = vec![InboxCompletion {
+            id: 4,
+            title: "Retry on 429".to_string(),
+            detail: "PR #812".to_string(),
+            arena_name: "zed".to_string(),
+            completed_at: chrono::Utc::now(),
+            confirmed_at: None,
+            asker: None,
+            tab: None,
+            failure: Some("Failing: lint".to_string()),
+            pull_request: Some(pull_request.clone()),
+        }];
+        let mut next_id = 5;
+        // After a restart `ci_status` is empty, so there is no previous status.
+        let (changed, recorded) = apply_ci_status(
+            &mut records,
+            &pull_request,
+            None,
+            Some(&ci(CiStatus::PendingClean, &[])),
+            "Retry on 429".to_string(),
+            "zed".to_string(),
+            &mut next_id,
+            chrono::Utc::now(),
+        );
+        assert!(changed && recorded.is_none());
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn stale_ci_responses_are_rejected() {
+        let arena = gpui::EntityId::from(7u64);
+        let key = (arena, 812);
+        let mut generations = CiFetchGenerations::default();
+
+        let older = generations.start(key);
+        let newer = generations.start(key);
+        assert!(!generations.is_current(key, older));
+        assert!(generations.is_current(key, newer));
+
+        // Closing the arena or switching its branch invalidates what is in
+        // flight, including a request started again for the same key later.
+        generations.forget_arena(arena);
+        assert!(!generations.is_current(key, newer));
+        let after_reset = generations.start(key);
+        assert!(!generations.is_current(key, newer));
+        assert!(!generations.is_current(key, older));
+        assert!(generations.is_current(key, after_reset));
+    }
+
+    #[test]
+    fn a_superseded_ci_request_leaves_the_pr_due_for_a_fetch() {
+        let key = (gpui::EntityId::from(7u64), 812);
+        let mut generations = CiFetchGenerations::default();
+        let mut last_checked = HashMap::new();
+        let now = std::time::Instant::now();
+
+        // A poll batch queues the PR, then a direct fetch (arena switch)
+        // starts a newer request before the queued one runs.
+        let queued = generations.start(key);
+        let direct = generations.start(key);
+        assert!(!generations.is_current(key, queued));
+
+        assert!(!generations.accept(key, queued, &mut last_checked, now));
+        assert!(last_checked.is_empty());
+        assert!(generations.accept(key, direct, &mut last_checked, now));
+        assert_eq!(last_checked.get(&key), Some(&now));
+
+        // After the arena closes, a late response does not mark it checked.
+        let mut last_checked = HashMap::new();
+        let in_flight = generations.start(key);
+        generations.forget_arena(key.0);
+        assert!(!generations.accept(key, in_flight, &mut last_checked, now));
+        assert!(last_checked.is_empty());
+    }
+
+    #[gpui::test]
+    fn the_badge_puts_failures_between_permission_and_completions(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let row = |confirmed: bool| InboxCompletionRow {
+            id: 1,
+            is_active: false,
+            title: String::new(),
+            detail: String::new(),
+            arena_name: String::new(),
+            completed_at: chrono::Utc::now(),
+            note: None,
+            failure: None,
+            confirmed,
+        };
+        cx.update(|cx| {
+            use theme::ActiveTheme as _;
+            let error = cx.theme().status().error;
+            let accent = cx.theme().colors().text_accent;
+
+            let mut entries = InboxEntries::default();
+            assert_eq!(entries.badge(cx), None);
+            entries.completed.push(row(false));
+            assert_eq!(entries.badge(cx), Some((1, accent)));
+            entries.failed.push(row(false));
+            entries.failed.push(row(true));
+            assert_eq!(entries.badge(cx), Some((2, error)));
+            entries.questions.push(InboxQuestionRow {
+                id: 2,
+                is_active: false,
+                arena_name: String::new(),
+                resume_hint: None,
+                question: String::new(),
+                context: None,
+                options: Vec::new(),
+                recommended: None,
+                assumed: false,
+                error: None,
+            });
+            assert_eq!(entries.badge(cx), Some((3, super::inbox_decision_color())));
+        });
+    }
+
+    #[test]
+    fn inbox_completions_written_before_the_failed_lane_still_load() {
+        let older = serde_json::json!([{
+            "id": 9,
+            "title": "Fix the Inbox",
+            "detail": "",
+            "arena_name": "zed",
+            "completed_at": "2026-10-14T09:12:00Z",
+            "asker": null
+        }]);
+        let restored: Vec<InboxCompletion> = serde_json::from_value(older).expect("deserialize");
+        assert!(restored[0].failure.is_none() && restored[0].pull_request.is_none());
     }
 
     fn task_with(title: &str, issues: Vec<IssueLink>, prs: Vec<PrRef>) -> BoardTask {
