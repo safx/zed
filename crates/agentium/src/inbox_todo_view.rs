@@ -233,6 +233,148 @@ pub(crate) fn show_detail_beside_owner(
     }
 }
 
+/// What a list records about its owner tab at `todo set`.
+pub(crate) struct TodoOwner {
+    pub(crate) title: String,
+    pub(crate) arena_name: String,
+    pub(crate) arena_path: Option<PathBuf>,
+    pub(crate) branch: Option<String>,
+}
+
+/// How to bring back the tab of a list that is not bound to an open tab.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RestorePlan {
+    ResumeClaude { arena_path: PathBuf, session_id: String },
+    OpenArena { arena_path: PathBuf },
+    Fallback(String),
+}
+
+/// Lists written before `arena_path` existed only know the arena's display
+/// name, which several worktrees can share; guessing would resume the agent
+/// in the wrong directory, so the name must match exactly one open arena.
+pub(crate) fn todo_restore_plan(
+    list: &InboxTodoList,
+    open_arenas: &[(String, PathBuf)],
+) -> RestorePlan {
+    let Some(asker) = &list.asker else {
+        return RestorePlan::Fallback(
+            "This tab cannot be restored; open it again to answer.".to_string(),
+        );
+    };
+    let arena_path = match &list.arena_path {
+        Some(path) => path.clone(),
+        None => {
+            let mut matches = open_arenas
+                .iter()
+                .filter(|(name, _)| *name == list.arena_name);
+            match (matches.next(), matches.next()) {
+                (Some((_, path)), None) => path.clone(),
+                _ => {
+                    return RestorePlan::Fallback(format!(
+                        "Cannot tell which arena '{}' is; open the tab manually.",
+                        list.arena_name
+                    ));
+                }
+            }
+        }
+    };
+    match asker {
+        InboxAsker::ClaudeSession { session_id } => RestorePlan::ResumeClaude {
+            arena_path,
+            session_id: session_id.clone(),
+        },
+        InboxAsker::CodexAcp { .. } => RestorePlan::OpenArena { arena_path },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingRestore {
+    /// `claude --resume` is being started.
+    Launching,
+    /// Started in this tab; waiting for its session to reconnect.
+    Launched { item_id: EntityId },
+    /// The tab exists again (ACP, restored with its arena); binds at the next sync.
+    Restored,
+}
+
+/// Applies the outcome of starting `claude --resume`; returns the error to
+/// show on the row when it failed.
+pub(crate) fn record_restore_launch(
+    pending: &mut HashMap<u64, PendingRestore>,
+    todo_id: u64,
+    result: anyhow::Result<EntityId>,
+) -> Option<String> {
+    match result {
+        Ok(item_id) => {
+            if let Some(entry) = pending.get_mut(&todo_id) {
+                *entry = PendingRestore::Launched { item_id };
+            }
+            None
+        }
+        Err(error) => {
+            pending.remove(&todo_id);
+            Some(format!("Could not restore the tab: {error:#}"))
+        }
+    }
+}
+
+/// Decides an ACP restoration right after its arena was ensured: ACP tabs
+/// come back synchronously with their arena, so a missing one will not appear.
+pub(crate) fn acp_restore_outcome(
+    arena_found: bool,
+    asker_tab_found: bool,
+) -> Result<PendingRestore, String> {
+    match (arena_found, asker_tab_found) {
+        (false, _) => Err("Could not open the arena of this tab.".to_string()),
+        (true, false) => Err("This Codex ACP tab is no longer saved in its arena.".to_string()),
+        (true, true) => Ok(PendingRestore::Restored),
+    }
+}
+
+pub(crate) struct RestoreObservation {
+    pub(crate) list_exists: bool,
+    pub(crate) list_bound: bool,
+    pub(crate) launched_tab_open: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RestoreOutcome {
+    Open,
+    Failed(String),
+}
+
+/// Settles pending restorations at a sync: a bound list opens its detail
+/// tab, a vanished list is forgotten, and a launched tab that closed before
+/// its session reconnected fails so that the next click retries.
+pub(crate) fn advance_pending_restores(
+    pending: &mut HashMap<u64, PendingRestore>,
+    observe: impl Fn(u64, &PendingRestore) -> RestoreObservation,
+) -> Vec<(u64, RestoreOutcome)> {
+    let mut outcomes = Vec::new();
+    pending.retain(|todo_id, restore| {
+        let observation = observe(*todo_id, restore);
+        if !observation.list_exists {
+            return false;
+        }
+        if observation.list_bound {
+            outcomes.push((*todo_id, RestoreOutcome::Open));
+            return false;
+        }
+        if matches!(restore, PendingRestore::Launched { .. }) && !observation.launched_tab_open {
+            outcomes.push((
+                *todo_id,
+                RestoreOutcome::Failed(
+                    "The restored tab closed before its session reconnected.".to_string(),
+                ),
+            ));
+            return false;
+        }
+        true
+    });
+    outcomes.sort_by_key(|(todo_id, _)| *todo_id);
+    outcomes
+}
+
 /// Every tab's to-do list. An entity of its own so detail tabs can observe
 /// it, and so tests can use it without `AgentiumApp` (whose construction
 /// reads and writes the user's data_dir).
@@ -275,9 +417,7 @@ impl InboxTodos {
         item_id: EntityId,
         tab: InboxTab,
         asker: Option<InboxAsker>,
-        title: String,
-        arena_name: String,
-        branch: Option<String>,
+        owner: TodoOwner,
         items: Vec<InboxTodoItem>,
         next_id: &mut u64,
         cx: &mut Context<Self>,
@@ -288,9 +428,10 @@ impl InboxTodos {
                 let dropped = dropped_todo_titles(&list.items, &items);
                 list.choices = carry_todo_choices(&list.choices, &items);
                 list.items = items;
-                list.title = title;
-                list.arena_name = arena_name;
-                list.branch = branch;
+                list.title = owner.title;
+                list.arena_name = owner.arena_name;
+                list.arena_path = owner.arena_path;
+                list.branch = owner.branch;
                 list.updated_at = chrono::Utc::now();
                 list.asker = asker;
                 list.tab = Some(tab);
@@ -301,9 +442,10 @@ impl InboxTodos {
                 *next_id += 1;
                 self.lists.push(InboxTodoList {
                     id,
-                    title,
-                    arena_name,
-                    branch,
+                    title: owner.title,
+                    arena_name: owner.arena_name,
+                    arena_path: owner.arena_path,
+                    branch: owner.branch,
                     updated_at: chrono::Utc::now(),
                     asker,
                     items,
@@ -888,10 +1030,14 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
-        DetailPane, InboxTodoView, InboxTodoViewEvent, InboxTodos, SendAnswers, TodoChoice,
-        carry_todo_choices, detail_pane_for, find_item_location, show_detail_beside_owner,
-        todo_answer_message, todo_items_after_send,
+        DetailPane, InboxTodoView, InboxTodoViewEvent, InboxTodos, PendingRestore,
+        RestoreObservation, RestoreOutcome, RestorePlan, SendAnswers, TodoChoice,
+        acp_restore_outcome, advance_pending_restores, carry_todo_choices, detail_pane_for,
+        find_item_location, record_restore_launch, show_detail_beside_owner,
+        todo_answer_message, todo_items_after_send, todo_restore_plan,
     };
+    use crate::{InboxAsker, InboxTodoList};
+    use std::path::PathBuf;
     use crate::arena::Arena;
     use crate::{InboxTab, InboxTodoItem, InboxTodoKind};
     use fs::FakeFs;
@@ -909,6 +1055,15 @@ mod tests {
             kind,
             title: title.to_string(),
             detail: None,
+        }
+    }
+
+    fn test_owner() -> super::TodoOwner {
+        super::TodoOwner {
+            title: "Fix the Inbox".to_string(),
+            arena_name: "zed".to_string(),
+            arena_path: None,
+            branch: None,
         }
     }
 
@@ -1035,9 +1190,7 @@ mod tests {
                 item_id,
                 tab,
                 None,
-                "Fix the Inbox".to_string(),
-                "zed".to_string(),
-                None,
+                test_owner(),
                 sample_items(),
                 &mut next_id,
                 cx,
@@ -1217,9 +1370,7 @@ mod tests {
                 owner.entity_id(),
                 owner_tab(&arena, &left, &owner),
                 None,
-                "Fix the Inbox".to_string(),
-                "zed".to_string(),
-                None,
+                test_owner(),
                 vec![item(InboxTodoKind::Proposal, "Add tests")],
                 &mut next_id,
                 cx,
@@ -1405,6 +1556,128 @@ mod tests {
         });
         cx.simulate_keystrokes("cmd-enter");
         assert_eq!(sent.get(), 1);
+    }
+
+    fn unbound_list(asker: Option<InboxAsker>, arena_path: Option<&str>) -> InboxTodoList {
+        InboxTodoList {
+            id: 4,
+            title: "Fix the Inbox".to_string(),
+            arena_name: "zed".to_string(),
+            updated_at: chrono::Utc::now(),
+            asker,
+            items: sample_items(),
+            branch: None,
+            arena_path: arena_path.map(PathBuf::from),
+            tab: None,
+            choices: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_closed_owner_is_restored_only_where_it_unambiguously_lived() {
+        let claude = || {
+            Some(InboxAsker::ClaudeSession {
+                session_id: "c8832ec2".to_string(),
+            })
+        };
+        let open = |names: &[(&str, &str)]| {
+            names
+                .iter()
+                .map(|(name, path)| (name.to_string(), PathBuf::from(path)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            todo_restore_plan(&unbound_list(claude(), Some("/src/zed")), &[]),
+            RestorePlan::ResumeClaude {
+                arena_path: PathBuf::from("/src/zed"),
+                session_id: "c8832ec2".to_string()
+            }
+        );
+        assert_eq!(
+            todo_restore_plan(
+                &unbound_list(
+                    Some(InboxAsker::CodexAcp {
+                        saved_id: uuid::Uuid::nil()
+                    }),
+                    Some("/src/zed")
+                ),
+                &[]
+            ),
+            RestorePlan::OpenArena {
+                arena_path: PathBuf::from("/src/zed")
+            }
+        );
+        assert!(matches!(
+            todo_restore_plan(&unbound_list(None, Some("/src/zed")), &[]),
+            RestorePlan::Fallback(_)
+        ));
+
+        // Lists written before arena_path: the name must be unique.
+        let legacy = unbound_list(claude(), None);
+        assert_eq!(
+            todo_restore_plan(&legacy, &open(&[("zed", "/src/zed"), ("scala", "/src/scala")])),
+            RestorePlan::ResumeClaude {
+                arena_path: PathBuf::from("/src/zed"),
+                session_id: "c8832ec2".to_string()
+            }
+        );
+        assert!(matches!(
+            todo_restore_plan(&legacy, &open(&[("zed", "/src/zed"), ("zed", "/work/zed")])),
+            RestorePlan::Fallback(_)
+        ));
+        assert!(matches!(
+            todo_restore_plan(&legacy, &open(&[("scala", "/src/scala")])),
+            RestorePlan::Fallback(_)
+        ));
+    }
+
+    #[test]
+    fn restorations_settle_on_bind_failure_or_closure() {
+        let tab = gpui::EntityId::from(9u64);
+        let mut pending = HashMap::from([(1, PendingRestore::Launching)]);
+
+        // The launch fails: forgotten, with a reason for the row.
+        let error = record_restore_launch(&mut pending, 1, Err(anyhow::anyhow!("no claude")));
+        assert!(error.is_some_and(|error| error.contains("no claude")));
+        assert!(pending.is_empty());
+
+        // Retry: nothing stale blocks a new attempt.
+        pending.insert(1, PendingRestore::Launching);
+        assert_eq!(record_restore_launch(&mut pending, 1, Ok(tab)), None);
+        assert_eq!(pending.get(&1), Some(&PendingRestore::Launched { item_id: tab }));
+
+        let observe = |exists: bool, bound: bool, tab_open: bool| {
+            move |_: u64, _: &PendingRestore| RestoreObservation {
+                list_exists: exists,
+                list_bound: bound,
+                launched_tab_open: tab_open,
+            }
+        };
+        // Still reconnecting: kept.
+        assert!(advance_pending_restores(&mut pending, observe(true, false, true)).is_empty());
+        assert_eq!(pending.len(), 1);
+        // The tab was closed (or claude exited) before the session reconnected.
+        let outcomes = advance_pending_restores(&mut pending, observe(true, false, false));
+        assert!(matches!(outcomes.as_slice(), [(1, RestoreOutcome::Failed(_))]));
+        assert!(pending.is_empty());
+
+        pending.insert(1, PendingRestore::Launched { item_id: tab });
+        pending.insert(2, PendingRestore::Restored);
+        pending.insert(3, PendingRestore::Launching);
+        let outcomes = advance_pending_restores(&mut pending, |todo_id, _| RestoreObservation {
+            list_exists: todo_id != 3,
+            list_bound: todo_id == 1,
+            launched_tab_open: true,
+        });
+        assert_eq!(outcomes, vec![(1, RestoreOutcome::Open)]);
+        assert_eq!(pending, HashMap::from([(2, PendingRestore::Restored)]));
+    }
+
+    #[test]
+    fn an_acp_owner_comes_back_only_if_its_arena_still_saves_it() {
+        assert_eq!(acp_restore_outcome(true, true), Ok(PendingRestore::Restored));
+        assert!(acp_restore_outcome(true, false).is_err());
+        assert!(acp_restore_outcome(false, false).is_err());
     }
 }
 
