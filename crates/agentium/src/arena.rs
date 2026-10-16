@@ -768,6 +768,44 @@ impl Arena {
         }
     }
 
+    /// Reopens a Claude Code session closed with its tab (e.g. by an Agentium
+    /// restart) in a new terminal tab of the active pane. Resolves to the new
+    /// tab, or to the error if the terminal could not be started.
+    pub(crate) fn resume_claude_session(
+        &mut self,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<EntityId>> {
+        let shell = Shell::WithArguments {
+            program: "claude".to_string(),
+            args: vec!["--resume".to_string(), session_id],
+            title_override: None,
+        };
+        let terminal_task = self.project.update(cx, |project, cx| {
+            project.create_terminal_with_shell(self.working_directory.clone(), shell, cx)
+        });
+        let workspace_weak = self.workspace.clone();
+        let project_weak = self.project.downgrade();
+        let ready_shell_pids = self.session_state.ready_shell_pids.clone();
+        let pane = self.active_pane.clone();
+        cx.spawn_in(window, async move |_this, cx| {
+            let terminal = terminal_task.await?;
+            cx.update(|window, cx| {
+                add_terminal_view_to_pane(
+                    terminal,
+                    workspace_weak,
+                    project_weak,
+                    ready_shell_pids,
+                    &pane,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+        })
+    }
+
     pub(crate) fn split_pane_with_item(
         &mut self,
         pane: &Entity<Pane>,
@@ -1724,15 +1762,17 @@ fn add_terminal_view_to_pane(
     focus: bool,
     window: &mut Window,
     cx: &mut App,
-) {
-    let terminal_view = Box::new(cx.new(|cx| {
+) -> EntityId {
+    let terminal_view = cx.new(|cx| {
         let mut view = TerminalView::new(terminal, workspace, None, project, window, cx);
         view.set_prompt_waiting_pids(ready_shell_pids);
         view
-    }));
-    pane.update(cx, |pane, cx| {
-        pane.add_item(terminal_view, true, focus, None, window, cx);
     });
+    let item_id = terminal_view.entity_id();
+    pane.update(cx, |pane, cx| {
+        pane.add_item(Box::new(terminal_view), true, focus, None, window, cx);
+    });
+    item_id
 }
 
 /// Claude leads its title with ◐/◑ and Codex with a braille spinner only while

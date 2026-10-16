@@ -420,6 +420,16 @@ pub fn parse_todo_set_request(request: &serde_json::Value) -> anyhow::Result<Vec
     Ok(items)
 }
 
+/// `None` when the prompt is a message another tab or the Inbox pasted in
+/// (`[from: ...]`) and there is no earlier title to keep.
+fn headline_from_prompt(prompt: &str, previous: Option<String>) -> Option<String> {
+    if prompt.trim_start().starts_with("[from: ") {
+        previous
+    } else {
+        Some(prompt.to_string())
+    }
+}
+
 /// Titles of `old` items that `new` no longer has, in their old order.
 fn dropped_todo_titles(old: &[InboxTodoItem], new: &[InboxTodoItem]) -> Vec<String> {
     old.iter()
@@ -455,6 +465,9 @@ struct InboxTodoList {
     /// The owner arena's branch at the last `todo set`.
     #[serde(default)]
     branch: Option<String>,
+    /// The owner arena's directory, to restore the tab after a restart.
+    #[serde(default)]
+    arena_path: Option<PathBuf>,
     #[serde(skip)]
     tab: Option<InboxTab>,
     /// The user's draft answers, by item title. Not persisted: cheap to redo.
@@ -845,7 +858,7 @@ struct InboxTodoRow {
     arena_name: String,
     item_count: usize,
     updated_at: DateTime<Utc>,
-    note: Option<&'static str>,
+    note: Option<String>,
 }
 
 struct InboxQuestionRow {
@@ -1088,6 +1101,12 @@ pub struct AgentiumApp {
     inbox_completions: Vec<InboxCompletion>,
     inbox_todos: Entity<inbox_todo_view::InboxTodos>,
     inbox_todo_views: HashMap<u64, WeakEntity<inbox_todo_view::InboxTodoView>>,
+    /// Lists whose closed owner tab is being brought back; the detail tab
+    /// opens once the owner binds.
+    pending_todo_restores: HashMap<u64, inbox_todo_view::PendingRestore>,
+    /// Why restoring a list's owner tab failed, shown on its row until the
+    /// next click retries.
+    todo_restore_errors: HashMap<u64, String>,
     _inbox_todos_subscription: Subscription,
     inbox_note_editors: HashMap<u64, Entity<Editor>>,
     inbox_permissions: Vec<InboxPermission>,
@@ -1464,6 +1483,8 @@ impl AgentiumApp {
             inbox_completions,
             inbox_todos,
             inbox_todo_views: HashMap::new(),
+            pending_todo_restores: HashMap::new(),
+            todo_restore_errors: HashMap::new(),
             _inbox_todos_subscription: inbox_todos_subscription,
             inbox_note_editors: HashMap::new(),
             inbox_permissions: Vec::new(),
@@ -3136,9 +3157,18 @@ impl AgentiumApp {
             pane: pane.downgrade(),
             item: item.downgrade_item(),
         };
-        let title = self.tab_headline(item.as_ref(), cx);
-        let arena_name = arena.read(cx).name.clone();
-        let branch = self.branch_name_for_arena(arena.entity_id(), cx);
+        let previous_title = todo_list_index(
+            self.inbox_todos.read(cx).lists(),
+            item.item_id(),
+            asker.as_ref(),
+        )
+        .map(|index| self.inbox_todos.read(cx).lists()[index].title.clone());
+        let owner = inbox_todo_view::TodoOwner {
+            title: self.tab_headline(item.as_ref(), previous_title, cx),
+            arena_name: arena.read(cx).name.clone(),
+            arena_path: arena.read(cx).working_directory.clone(),
+            branch: self.branch_name_for_arena(arena.entity_id(), cx),
+        };
         let count = items.len();
         let mut next_id = self.next_inbox_question_id;
         let dropped = self.inbox_todos.update(cx, |todos, cx| {
@@ -3146,9 +3176,7 @@ impl AgentiumApp {
                 item.item_id(),
                 tab,
                 asker,
-                title,
-                arena_name,
-                branch,
+                owner,
                 items,
                 &mut next_id,
                 cx,
@@ -3161,7 +3189,14 @@ impl AgentiumApp {
     /// What the agent in the tab is working on: the prompt for a Claude
     /// terminal (the tab title is just "Claude"), the terminal title for other
     /// agents, the tab title otherwise.
-    fn tab_headline(&self, item: &dyn workspace::ItemHandle, cx: &App) -> String {
+    /// The latest prompt can be the Inbox's own answer to this list; the
+    /// list keeps `previous` then rather than titling itself after it.
+    fn tab_headline(
+        &self,
+        item: &dyn workspace::ItemHandle,
+        previous: Option<String>,
+        cx: &App,
+    ) -> String {
         if let Some(view) = item.act_as::<TerminalView>(cx) {
             let terminal = view.read(cx).terminal().read(cx);
             if let Some(pid) = terminal.pid_getter().map(|getter| getter.fallback_pid().as_u32())
@@ -3171,7 +3206,8 @@ impl AgentiumApp {
                     .find(|session| session.ancestor_pids.contains(&pid))
                 && !session.user_prompt.trim().is_empty()
             {
-                return session.user_prompt.clone();
+                return headline_from_prompt(&session.user_prompt, previous)
+                    .unwrap_or_else(|| item.tab_content_text(0, cx).to_string());
             }
             if !terminal.breadcrumb_text.trim().is_empty() {
                 return terminal.breadcrumb_text.clone();
@@ -3228,6 +3264,51 @@ impl AgentiumApp {
     /// Opens the list's detail tab beside its owner tab, or brings back the
     /// one already open (moving it beside the owner if needed).
     fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(list) = self.inbox_todos.read(cx).list(todo_id) else {
+            return;
+        };
+        let owner_open = list.tab.as_ref().is_some_and(|tab| {
+            inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx).is_some()
+        });
+        if !owner_open {
+            match self.pending_todo_restores.get(&todo_id).copied() {
+                Some(inbox_todo_view::PendingRestore::Launched { item_id }) => {
+                    // Show what the resumed session is doing (asking
+                    // something, or failing) instead of starting another.
+                    if let Some((arena, pane, item)) =
+                        inbox_todo_view::find_item_location(&self.arenas, item_id, cx)
+                        && let Some(index) =
+                            self.arenas.iter().position(|candidate| *candidate == arena)
+                    {
+                        self.navigate_to_item(index, &pane, item.as_ref(), window, cx);
+                    }
+                    return;
+                }
+                Some(_) => return,
+                None => {}
+            }
+            let open_arenas: Vec<(String, PathBuf)> = self
+                .arenas
+                .iter()
+                .filter_map(|arena| {
+                    let arena = arena.read(cx);
+                    Some((arena.name.clone(), arena.working_directory.clone()?))
+                })
+                .collect();
+            let plan = inbox_todo_view::todo_restore_plan(list, &open_arenas);
+            let asker = list.asker.clone();
+            self.todo_restore_errors.remove(&todo_id);
+            match plan {
+                inbox_todo_view::RestorePlan::Fallback(reason) => {
+                    self.todo_restore_errors.insert(todo_id, reason);
+                }
+                plan => {
+                    self.restore_todo_owner(todo_id, plan, asker, window, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let view = match self
             .inbox_todo_views
             .get(&todo_id)
@@ -3288,6 +3369,83 @@ impl AgentiumApp {
         cx.notify();
     }
 
+    /// Brings back the closed owner tab of a list: `claude --resume` for a
+    /// Claude session, its arena (which restores saved ACP tabs) for Codex ACP.
+    fn restore_todo_owner(
+        &mut self,
+        todo_id: u64,
+        plan: inbox_todo_view::RestorePlan,
+        asker: Option<InboxAsker>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let arena_path = match &plan {
+            inbox_todo_view::RestorePlan::ResumeClaude { arena_path, .. }
+            | inbox_todo_view::RestorePlan::OpenArena { arena_path } => arena_path.clone(),
+            inbox_todo_view::RestorePlan::Fallback(_) => return,
+        };
+        // `add_arena_with_path` reports failure only through `arena_error`, so
+        // success is checked by finding the arena, never by the active one.
+        self.add_arena_with_path(arena_path.clone(), window, cx);
+        let canonical = std::fs::canonicalize(&arena_path).ok();
+        let arena = self
+            .arenas
+            .iter()
+            .find(|arena| {
+                arena.read(cx).working_directory.as_ref().is_some_and(|path| {
+                    *path == arena_path || Some(path) == canonical.as_ref()
+                })
+            })
+            .cloned();
+        match plan {
+            inbox_todo_view::RestorePlan::ResumeClaude { session_id, .. } => {
+                let Some(arena) = arena else {
+                    let detail = self.arena_error.clone().unwrap_or_default();
+                    self.todo_restore_errors.insert(
+                        todo_id,
+                        format!("Could not open {}. {detail}", arena_path.display())
+                            .trim()
+                            .to_string(),
+                    );
+                    return;
+                };
+                self.pending_todo_restores
+                    .insert(todo_id, inbox_todo_view::PendingRestore::Launching);
+                let launch = arena.update(cx, |arena, cx| {
+                    arena.resume_claude_session(session_id, window, cx)
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = launch.await;
+                    this.update(cx, |this, cx| {
+                        if let Some(error) = inbox_todo_view::record_restore_launch(
+                            &mut this.pending_todo_restores,
+                            todo_id,
+                            result,
+                        ) {
+                            this.todo_restore_errors.insert(todo_id, error);
+                        }
+                        cx.notify();
+                    })
+                })
+                .detach_and_log_err(cx);
+            }
+            inbox_todo_view::RestorePlan::OpenArena { .. } => {
+                let asker_tab = asker
+                    .as_ref()
+                    .is_some_and(|asker| self.tab_for_asker(asker, cx).is_some());
+                match inbox_todo_view::acp_restore_outcome(arena.is_some(), asker_tab) {
+                    Ok(pending) => {
+                        self.pending_todo_restores.insert(todo_id, pending);
+                    }
+                    Err(error) => {
+                        self.todo_restore_errors.insert(todo_id, error);
+                    }
+                }
+            }
+            inbox_todo_view::RestorePlan::Fallback(_) => {}
+        }
+    }
+
     fn handle_inbox_todo_view_event(
         &mut self,
         view: &Entity<inbox_todo_view::InboxTodoView>,
@@ -3340,7 +3498,7 @@ impl AgentiumApp {
     /// not yet reopened after a restart) to the tab now hosting the same
     /// asker, and drops questions that have lost their tab and have no asker
     /// to wait for. Completions stay until dismissed.
-    fn bind_inbox_tabs(&mut self, cx: &mut Context<Self>) {
+    fn bind_inbox_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut found = Vec::new();
         for (index, question) in self.inbox_questions.iter().enumerate() {
             if question.live_tab().is_some() {
@@ -3411,6 +3569,39 @@ impl AgentiumApp {
             .collect();
         self.inbox_todos
             .update(cx, |todos, cx| todos.rebind(bindings, cx));
+
+        let todos = self.inbox_todos.read(cx);
+        let outcomes = inbox_todo_view::advance_pending_restores(
+            &mut self.pending_todo_restores,
+            |todo_id, restore| {
+                let list = todos.list(todo_id);
+                inbox_todo_view::RestoreObservation {
+                    list_exists: list.is_some(),
+                    list_bound: list.is_some_and(|list| list.tab.is_some()),
+                    launched_tab_open: match restore {
+                        inbox_todo_view::PendingRestore::Launched { item_id } => {
+                            inbox_todo_view::find_item_location(&self.arenas, *item_id, cx)
+                                .is_some()
+                        }
+                        _ => true,
+                    },
+                }
+            },
+        );
+        self.todo_restore_errors
+            .retain(|todo_id, _| todos.list(*todo_id).is_some());
+        for (todo_id, outcome) in outcomes {
+            match outcome {
+                inbox_todo_view::RestoreOutcome::Open => {
+                    cx.defer_in(window, move |this, window, cx| {
+                        this.open_inbox_todo(todo_id, window, cx);
+                    });
+                }
+                inbox_todo_view::RestoreOutcome::Failed(error) => {
+                    self.todo_restore_errors.insert(todo_id, error);
+                }
+            }
+        }
     }
 
     fn tab_for_asker(&self, asker: &InboxAsker, cx: &App) -> Option<InboxTab> {
@@ -7657,7 +7848,13 @@ impl AgentiumApp {
                 arena_name: list.arena_name.clone(),
                 item_count: list.items.len(),
                 updated_at: list.updated_at,
-                note: list.tab.is_none().then_some("tab not open"),
+                note: self.todo_restore_errors.get(&list.id).cloned().or_else(|| {
+                    if self.pending_todo_restores.contains_key(&list.id) {
+                        Some("restoring the tab…".to_string())
+                    } else {
+                        list.tab.is_none().then(|| "tab not open · click to restore".to_string())
+                    }
+                }),
             });
         }
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
@@ -8547,7 +8744,7 @@ impl Render for AgentiumApp {
         // Owned so that closures needing `&mut cx` (e.g. the per-arena row
         // renderer) can run while colors are still in scope.
         let colors = cx.theme().colors().clone();
-        self.bind_inbox_tabs(cx);
+        self.bind_inbox_tabs(window, cx);
         self.drop_stale_inbox_permissions();
         self.sync_inbox_note_editors(window, cx);
         self.sync_inbox_completions(cx);
@@ -9742,6 +9939,19 @@ mod tests {
     }
 
     #[test]
+    fn a_list_is_not_titled_after_a_pasted_message() {
+        assert_eq!(
+            super::headline_from_prompt("Fix the flaky test", Some("Old".to_string())),
+            Some("Fix the flaky test".to_string())
+        );
+        assert_eq!(
+            super::headline_from_prompt("[from: Agentium Inbox]\nTo do\nGo: 1 x", Some("Old".to_string())),
+            Some("Old".to_string())
+        );
+        assert_eq!(super::headline_from_prompt("[from: Codex]\nhello", None), None);
+    }
+
+    #[test]
     fn todo_set_reports_the_items_it_dropped() {
         let item = |kind, title: &str| InboxTodoItem {
             kind,
@@ -9785,6 +9995,7 @@ mod tests {
             asker,
             items: Vec::new(),
             branch: None,
+            arena_path: None,
             tab,
             choices: HashMap::new(),
         };
