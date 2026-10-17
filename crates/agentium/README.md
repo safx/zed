@@ -87,7 +87,7 @@ Add the following to your Claude Code `settings.json`:
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command", "command": "agentium claude hook session-start" }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "agentium claude hook session-start" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "agentium claude hook session-end" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "agentium claude hook stop" }] }],
     "Notification": [{ "matcher": "", "hooks": [{ "type": "command", "command": "agentium claude hook notification" }] }],
