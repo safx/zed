@@ -887,29 +887,6 @@ struct InboxEntries {
     in_progress: Vec<InboxEntry>,
 }
 
-impl InboxEntries {
-    /// The count of entries still awaiting the user (confirmed completions
-    /// excluded), colored by the most urgent lane that has any.
-    fn badge(&self, cx: &App) -> Option<(usize, Hsla)> {
-        let unconfirmed_failures = self.failed.iter().filter(|row| !row.confirmed).count();
-        let unconfirmed = self.completed.iter().filter(|row| !row.confirmed).count();
-        let color = if !self.questions.is_empty() {
-            inbox_decision_color()
-        } else if !self.permission.is_empty() {
-            cx.theme().status().warning
-        } else if unconfirmed_failures > 0 {
-            cx.theme().status().error
-        } else if unconfirmed > 0 {
-            cx.theme().colors().text_accent
-        } else {
-            return None;
-        };
-        let count =
-            self.questions.len() + self.permission.len() + unconfirmed_failures + unconfirmed;
-        Some((count, color))
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalPidInfo {
     pub pid: u32,
@@ -1007,7 +984,6 @@ pub struct CiInfo {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarTab {
-    Inbox,
     Repositories,
     Tasks,
 }
@@ -1096,6 +1072,7 @@ pub struct AgentiumApp {
     failed_backlog_issue_keys: HashSet<String>,
     _issue_fetch_task: Option<Task<()>>,
     sidebar_tab: SidebarTab,
+    agent_activity: Option<(EntityId, Point<Pixels>)>,
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
     inbox_completions: Vec<InboxCompletion>,
@@ -1478,6 +1455,7 @@ impl AgentiumApp {
             failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
             sidebar_tab: SidebarTab::Repositories,
+            agent_activity: None,
             next_inbox_question_id,
             inbox_questions,
             inbox_completions,
@@ -1672,6 +1650,7 @@ impl AgentiumApp {
 
     fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.arenas.len() {
+            self.agent_activity = None;
             self.active_arena_index = Some(index);
             self.arenas[index].update(cx, |arena, cx| {
                 arena.activate_context(cx);
@@ -6003,6 +5982,22 @@ fn argv0_name(process: &sysinfo::Process) -> Option<&str> {
         .and_then(|name| name.to_str())
 }
 
+fn arena_agent_icon(
+    is_codex_acp: bool,
+    has_claude_session: bool,
+    process_name: Option<&str>,
+) -> Option<IconName> {
+    if is_codex_acp {
+        Some(IconName::AiOpenAi)
+    } else if has_claude_session || process_name == Some("claude") {
+        Some(IconName::AiClaude)
+    } else if process_name == Some("codex") {
+        Some(IconName::AiOpenAi)
+    } else {
+        None
+    }
+}
+
 fn is_agent_process_name(name: &str) -> bool {
     matches!(name, "claude" | "codex")
 }
@@ -7145,10 +7140,204 @@ impl Focusable for AgentiumApp {
 }
 
 impl AgentiumApp {
+    fn render_arena_agents(
+        &self,
+        arena_index: usize,
+        arena: &Entity<Arena>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
+        let mut rows = Vec::new();
+        for pane in arena.read(cx).center.panes() {
+            for item in pane.read(cx).items() {
+                let asker = self.inbox_asker(item.as_ref(), cx);
+                let is_codex = item.act_as::<codex_acp_view::CodexAcpView>(cx).is_some();
+                let process_name = item
+                    .act_as::<TerminalView>(cx)
+                    .and_then(|view| view.read(cx).terminal().read(cx).foreground_process_name());
+                let has_claude_session = matches!(asker, Some(InboxAsker::ClaudeSession { .. }));
+                let Some(icon) =
+                    arena_agent_icon(is_codex, has_claude_session, process_name.as_deref())
+                else {
+                    continue;
+                };
+                let info = self.tab_info(item.as_ref(), arena, cx);
+                let item_id = item.item_id();
+                let todo = {
+                    let todos = self.inbox_todos.read(cx).lists();
+                    todo_list_index(todos, item_id, asker.as_ref())
+                        .and_then(|index| todos.get(index))
+                        .filter(|list| !list.items.is_empty())
+                        .map(|list| (list.id, list.items.len()))
+                };
+                let has_question = self.inbox_questions.iter().any(|question| {
+                    question
+                        .tab
+                        .as_ref()
+                        .is_some_and(|tab| tab.item.id() == item_id)
+                });
+                let (status, status_color) = if has_question {
+                    ("Decision", inbox_decision_color())
+                } else {
+                    match info.state {
+                        Some("permission") => ("Permission", status_colors.warning),
+                        Some("running") => ("Running", status_colors.success),
+                        Some("ready") => ("Completed", colors.text_accent),
+                        Some("error") => ("Failed", status_colors.error),
+                        _ => ("Idle", colors.text_muted),
+                    }
+                };
+                let selected = self.is_active_tab(arena, pane, item_id, cx);
+                let target_pane = pane.clone();
+                let target_item = item.clone();
+                let title = if info.title.is_empty() {
+                    if icon == IconName::AiClaude {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    }
+                    .to_owned()
+                } else {
+                    info.title
+                };
+                rows.push(
+                    h_flex()
+                        .id(("arena-agent", item_id))
+                        .ml_3()
+                        .px_1()
+                        .py_1()
+                        .gap_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(selected, |row| row.bg(colors.element_active))
+                        .hover(|row| row.bg(colors.element_hover))
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_xs()
+                                .child(title.clone()),
+                        )
+                        .tooltip(Tooltip::text(title))
+                        .when_some(todo, |row, (todo_id, count)| {
+                            row.child(
+                                render_arena_pill(
+                                    ("agent-todo", item_id),
+                                    count,
+                                    inbox_todo_color(),
+                                    colors.surface_background,
+                                )
+                                .flex_shrink_0()
+                                .tooltip(Tooltip::text(format!("Open To do · {count} items")))
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.agent_activity = None;
+                                        this.open_inbox_todo(todo_id, window, cx);
+                                    },
+                                )),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(("agent-status", item_id))
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(status_color)
+                                .child(status)
+                                .tooltip(Tooltip::text("Show agent activity"))
+                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.agent_activity = Some((item_id, event.position()));
+                                    cx.notify();
+                                })),
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.agent_activity = None;
+                            this.navigate_to_item(
+                                arena_index,
+                                &target_pane,
+                                target_item.as_ref(),
+                                window,
+                                cx,
+                            );
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        for list in self.inbox_todos.read(cx).lists() {
+            let arena_state = arena.read(cx);
+            let belongs_to_arena = match &list.arena_path {
+                Some(path) => arena_state.working_directory.as_ref() == Some(path),
+                None => list.arena_name == arena_state.name,
+            };
+            if !belongs_to_arena
+                || list.items.is_empty()
+                || list.tab.as_ref().is_some_and(|tab| {
+                    inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx).is_some()
+                })
+            {
+                continue;
+            }
+            let todo_id = list.id;
+            rows.push(
+                h_flex()
+                    .id(("closed-arena-agent", todo_id))
+                    .ml_3()
+                    .px_1()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .child(list.title.clone()),
+                    )
+                    .child(
+                        render_arena_pill(
+                            ("closed-agent-todo", todo_id),
+                            list.items.len(),
+                            inbox_todo_color(),
+                            colors.surface_background,
+                        )
+                        .cursor_pointer()
+                        .tooltip(Tooltip::text("Restore agent and open To do"))
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_inbox_todo(todo_id, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .child("Tab closed"),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
     fn render_arena_row(&mut self, i: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(arena_entity) = self.arenas.get(i).cloned() else {
             return div().into_any_element();
         };
+        let agent_rows = self.render_arena_agents(i, &arena_entity, cx);
         let arena_entity = &arena_entity;
         let colors = cx.theme().colors();
         let active_index = self.active_arena_index;
@@ -7240,16 +7429,8 @@ impl AgentiumApp {
                                 })
                                 .child({
                                     let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
-                                    let permission_infos = self.collect_permission_terminal_infos(arena_entity, cx);
-                                    let running_infos = self.collect_running_terminal_infos(arena_entity, cx);
-                                    let ready_infos = self.collect_ready_terminal_infos(arena_entity, cx);
                                     let busy_infos = self.collect_busy_terminal_infos(arena_entity, cx);
-                                    let error_infos = codex_badge_entries(arena, codex_acp_view::CodexAcpState::Error, cx);
-                                    let has_pills = !permission_infos.is_empty()
-                                        || !running_infos.is_empty()
-                                        || !ready_infos.is_empty()
-                                        || !busy_infos.is_empty()
-                                        || !error_infos.is_empty();
+                                    let has_pills = !busy_infos.is_empty();
                                     div()
                                         .flex()
                                         .flex_row()
@@ -7287,106 +7468,6 @@ impl AgentiumApp {
                                             d.child(
                                                 h_flex()
                                                     .gap_0p5()
-                                                    .when(!permission_infos.is_empty(), |d| {
-                                                        let entries = permission_infos.clone();
-                                                        let tooltip_entries = entries.clone();
-                                                        d.child(
-                                                            render_arena_pill(
-                                                                ("arena-permission-badge", arena.id),
-                                                                entries.len(),
-                                                                status_colors.warning,
-                                                                colors.surface_background,
-                                                            )
-                                                            .cursor_pointer()
-                                                            .tooltip(Tooltip::element(move |_window, cx| {
-                                                                render_badge_tooltip(&tooltip_entries, cx)
-                                                            }))
-                                                            .on_click(cx.listener(
-                                                                move |this, event: &ClickEvent, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.switch_arena(i, window, cx);
-                                                                    this.deploy_badge_menu(
-                                                                        i, entries.clone(), event.position(), window, cx,
-                                                                    );
-                                                                },
-                                                            ))
-                                                        )
-                                                    })
-                                                    .when(!running_infos.is_empty(), |d| {
-                                                        let entries = running_infos.clone();
-                                                        let tooltip_entries = entries.clone();
-                                                        d.child(
-                                                            render_arena_pill(
-                                                                ("arena-running-badge", arena.id),
-                                                                entries.len(),
-                                                                status_colors.success,
-                                                                colors.surface_background,
-                                                            )
-                                                            .cursor_pointer()
-                                                            .tooltip(Tooltip::element(move |_window, cx| {
-                                                                render_badge_tooltip(&tooltip_entries, cx)
-                                                            }))
-                                                            .on_click(cx.listener(
-                                                                move |this, event: &ClickEvent, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.switch_arena(i, window, cx);
-                                                                    this.deploy_badge_menu(
-                                                                        i, entries.clone(), event.position(), window, cx,
-                                                                    );
-                                                                },
-                                                            ))
-                                                        )
-                                                    })
-                                                    .when(!ready_infos.is_empty(), |d| {
-                                                        let entries = ready_infos.clone();
-                                                        let tooltip_entries = entries.clone();
-                                                        d.child(
-                                                            render_arena_pill(
-                                                                ("arena-ready-badge", arena.id),
-                                                                entries.len(),
-                                                                colors.text_accent,
-                                                                colors.surface_background,
-                                                            )
-                                                            .cursor_pointer()
-                                                            .tooltip(Tooltip::element(move |_window, cx| {
-                                                                render_badge_tooltip(&tooltip_entries, cx)
-                                                            }))
-                                                            .on_click(cx.listener(
-                                                                move |this, event: &ClickEvent, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.switch_arena(i, window, cx);
-                                                                    this.deploy_badge_menu(
-                                                                        i, entries.clone(), event.position(), window, cx,
-                                                                    );
-                                                                },
-                                                            ))
-                                                        )
-                                                    })
-                                                    .when(!error_infos.is_empty(), |d| {
-                                                        let entries = error_infos.clone();
-                                                        let tooltip_entries = entries.clone();
-                                                        d.child(
-                                                            render_arena_pill(
-                                                                ("arena-acp-error-badge", arena.id),
-                                                                entries.len(),
-                                                                status_colors.error,
-                                                                colors.surface_background,
-                                                            )
-                                                            .cursor_pointer()
-                                                            .tooltip(Tooltip::element(move |_window, cx| {
-                                                                render_badge_tooltip(&tooltip_entries, cx)
-                                                            }))
-                                                            .on_click(cx.listener(
-                                                                move |this, event: &ClickEvent, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.switch_arena(i, window, cx);
-                                                                    this.deploy_badge_menu(
-                                                                        i, entries.clone(), event.position(), window, cx,
-                                                                    );
-                                                                },
-                                                            ))
-                                                        )
-                                                    })
                                                     .when(!busy_infos.is_empty(), |d| {
                                                         let entries = busy_infos.clone();
                                                         let tooltip_entries = entries.clone();
@@ -7522,6 +7603,7 @@ impl AgentiumApp {
                                         .child(pr_el)
                                         .children(review_el)
                                 }))
+                                .children(agent_rows)
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.switch_arena(i, window, cx)
@@ -7880,7 +7962,91 @@ impl AgentiumApp {
         entries
     }
 
-    fn render_inbox(&self, entries: InboxEntries, cx: &mut Context<Self>) -> AnyElement {
+    fn render_agent_activity_popover(
+        &self,
+        item_id: EntityId,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let mut entries = self.collect_inbox_entries(cx);
+        entries.questions.retain(|row| {
+            self.inbox_questions.iter().any(|question| {
+                question.id == row.id
+                    && question
+                        .tab
+                        .as_ref()
+                        .is_some_and(|tab| tab.item.id() == item_id)
+            })
+        });
+        entries
+            .permission
+            .retain(|entry| entry.info.item.item_id() == item_id);
+        entries
+            .in_progress
+            .retain(|entry| entry.info.item.item_id() == item_id);
+        entries.completed.retain(|row| {
+            self.inbox_completions.iter().any(|completion| {
+                completion.id == row.id
+                    && completion
+                        .tab
+                        .as_ref()
+                        .is_some_and(|tab| tab.item.id() == item_id)
+            })
+        });
+        entries.failed.retain(|row| {
+            self.inbox_completions.iter().any(|completion| {
+                completion.id == row.id
+                    && completion
+                        .tab
+                        .as_ref()
+                        .is_some_and(|tab| tab.item.id() == item_id)
+            })
+        });
+        entries.todos.clear();
+        let empty = entries.questions.is_empty()
+            && entries.permission.is_empty()
+            && entries.in_progress.is_empty()
+            && entries.completed.is_empty()
+            && entries.failed.is_empty();
+        let title = inbox_todo_view::find_item_location(&self.arenas, item_id, cx)
+            .map(|(_, _, item)| item.tab_content_text(0, cx))
+            .unwrap_or_else(|| "Agent activity".into());
+        deferred(
+            anchored().position(position).anchor(Anchor::TopLeft).child(
+                v_flex()
+                    .id("agent-activity")
+                    .occlude()
+                    .w(px(440.0))
+                    .max_h(px(600.0))
+                    .p_2()
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_md()
+                    .bg(colors.elevated_surface_background)
+                    .shadow_lg()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.agent_activity = None;
+                        cx.notify();
+                    }))
+                    .child(h_flex().justify_between().child(Label::new(title)).child(
+                        Button::new("close-agent-activity", "Close").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.agent_activity = None;
+                                cx.notify();
+                            },
+                        )),
+                    ))
+                    .when(empty, |element| {
+                        element.child(Label::new("No pending activity").color(Color::Muted))
+                    })
+                    .child(self.render_agent_activity(entries, cx)),
+            ),
+        )
+        .with_priority(1)
+    }
+
+    fn render_agent_activity(&self, entries: InboxEntries, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let status_colors = cx.theme().status().clone();
 
@@ -7899,14 +8065,6 @@ impl AgentiumApp {
                         .text_color(colors.text_muted)
                         .child(count.to_string()),
                 )
-        };
-        let empty_row = || {
-            div()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .text_color(colors.text_muted)
-                .child("None")
         };
         let render_rows = |lane: &'static str, lane_entries: Vec<InboxEntry>, cx: &mut Context<Self>| {
             let is_in_progress = lane == "in-progress";
@@ -8006,17 +8164,19 @@ impl AgentiumApp {
             .collect::<Vec<_>>();
 
         v_flex()
-            .id("inbox")
+            .id("agent-activity-list")
             .flex_1()
             .overflow_y_scroll()
             .gap_1()
             .px_1()
-            .child(lane_header("Needs decision", question_count, inbox_decision_color()))
-            .when(question_rows.is_empty(), |d| d.child(empty_row()))
-            .children(question_rows)
-            .child(lane_header("Needs permission", permission_count, status_colors.warning))
-            .when(permission_rows.is_empty(), |d| d.child(empty_row()))
-            .children(permission_rows)
+            .when(!question_rows.is_empty(), |d| {
+                d.child(lane_header("Needs decision", question_count, inbox_decision_color()))
+                    .children(question_rows)
+            })
+            .when(!permission_rows.is_empty(), |d| {
+                d.child(lane_header("Needs permission", permission_count, status_colors.warning))
+                    .children(permission_rows)
+            })
             .when(!failed_rows.is_empty(), |d| {
                 d.child(lane_header("Failed", failed_count, status_colors.error))
                     .children(failed_rows)
@@ -8025,12 +8185,14 @@ impl AgentiumApp {
                 d.child(lane_header("To do", todo_count, inbox_todo_color()))
                     .children(todo_rows)
             })
-            .child(lane_header("Completed", completed_count, colors.text_accent))
-            .when(completed_rows.is_empty(), |d| d.child(empty_row()))
-            .children(completed_rows)
-            .child(lane_header("In progress", in_progress_count, status_colors.success))
-            .when(in_progress_rows.is_empty(), |d| d.child(empty_row()))
-            .children(in_progress_rows)
+            .when(!completed_rows.is_empty(), |d| {
+                d.child(lane_header("Completed", completed_count, colors.text_accent))
+                    .children(completed_rows)
+            })
+            .when(!in_progress_rows.is_empty(), |d| {
+                d.child(lane_header("In progress", in_progress_count, status_colors.success))
+                    .children(in_progress_rows)
+            })
             .into_any_element()
     }
 
@@ -8362,7 +8524,6 @@ impl AgentiumApp {
         &self,
         label: &'static str,
         tab: SidebarTab,
-        badge: Option<(usize, Hsla)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -8386,15 +8547,8 @@ impl AgentiumApp {
             })
             .gap_1()
             .child(label)
-            .when_some(badge, |d, (count, color)| {
-                d.child(render_arena_pill(
-                    SharedString::from(format!("{label}-count")),
-                    count,
-                    color,
-                    colors.surface_background,
-                ))
-            })
             .on_click(cx.listener(move |this, _, _window, cx| {
+                this.agent_activity = None;
                 this.sidebar_tab = tab;
                 cx.notify();
             }))
@@ -8748,7 +8902,6 @@ impl Render for AgentiumApp {
         self.drop_stale_inbox_permissions();
         self.sync_inbox_note_editors(window, cx);
         self.sync_inbox_completions(cx);
-        let inbox_entries = self.collect_inbox_entries(cx);
 
         div()
             .key_context("Agentium")
@@ -8838,21 +8991,13 @@ impl Render for AgentiumApp {
                             .pb_1()
                             .gap_1()
                             .child(self.render_sidebar_tab_button(
-                                "Inbox",
-                                SidebarTab::Inbox,
-                                inbox_entries.badge(cx),
-                                cx,
-                            ))
-                            .child(self.render_sidebar_tab_button(
                                 "Repositories",
                                 SidebarTab::Repositories,
-                                None,
                                 cx,
                             ))
-                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, None, cx)),
+                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, cx)),
                     )
                     .child(match self.sidebar_tab {
-                        SidebarTab::Inbox => self.render_inbox(inbox_entries, cx),
                         SidebarTab::Repositories => div()
                             .id("arena-list")
                             .flex_1()
@@ -8956,6 +9101,9 @@ impl Render for AgentiumApp {
                         )
                         .with_priority(1)
                     }))
+                    .when_some(self.agent_activity, |element, (item_id, position)| {
+                        element.child(self.render_agent_activity_popover(item_id, position, cx))
+                    })
                     .children(self.badge_menu.as_ref().map(|(menu, position, _)| {
                         deferred(
                             anchored()
@@ -9411,7 +9559,7 @@ mod tests {
     // scope and make `#[test]` expand recursively.
     use super::{
         CiCheckEntry, CiFetchGenerations, CiInfo, CiStatus, FinishKey, FinishedTab,
-        InboxCompletion, InboxCompletionRow, InboxEntries, InboxPullRequest, InboxQuestionRow,
+        InboxCompletion, InboxPullRequest,
         InboxTab, InboxTodoItem, InboxTodoKind, InboxTodoList, RecordedTabState,
         age_inbox_records, apply_ci_status, dropped_todo_titles, next_inbox_id,
         parse_todo_set_request, record_finished_tabs, todo_list_index,
@@ -9856,53 +10004,6 @@ mod tests {
         assert!(last_checked.is_empty());
     }
 
-    #[gpui::test]
-    fn the_badge_puts_failures_between_permission_and_completions(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            let settings = settings::SettingsStore::test(cx);
-            cx.set_global(settings);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let row = |confirmed: bool| InboxCompletionRow {
-            id: 1,
-            is_active: false,
-            title: String::new(),
-            detail: String::new(),
-            arena_name: String::new(),
-            completed_at: chrono::Utc::now(),
-            note: None,
-            failure: None,
-            confirmed,
-            todo_count: 0,
-        };
-        cx.update(|cx| {
-            use theme::ActiveTheme as _;
-            let error = cx.theme().status().error;
-            let accent = cx.theme().colors().text_accent;
-
-            let mut entries = InboxEntries::default();
-            assert_eq!(entries.badge(cx), None);
-            entries.completed.push(row(false));
-            assert_eq!(entries.badge(cx), Some((1, accent)));
-            entries.failed.push(row(false));
-            entries.failed.push(row(true));
-            assert_eq!(entries.badge(cx), Some((2, error)));
-            entries.questions.push(InboxQuestionRow {
-                id: 2,
-                is_active: false,
-                arena_name: String::new(),
-                resume_hint: None,
-                question: String::new(),
-                context: None,
-                options: Vec::new(),
-                recommended: None,
-                assumed: false,
-                error: None,
-            });
-            assert_eq!(entries.badge(cx), Some((3, super::inbox_decision_color())));
-        });
-    }
-
     #[test]
     fn a_todo_set_request_with_one_malformed_item_is_rejected_whole() {
         let request = serde_json::json!({
@@ -10082,6 +10183,33 @@ mod tests {
             "Claude[from: Lead (unverified)"
         );
         assert_eq!(sender_label(Some("Lead]\u{1b}x"), None), "Leadx");
+    }
+
+    #[test]
+    fn arena_agent_rows_include_idle_agents_without_title_tracking() {
+        assert_eq!(
+            super::arena_agent_icon(false, false, Some("codex")),
+            Some(ui::IconName::AiOpenAi)
+        );
+        assert_eq!(
+            super::arena_agent_icon(false, false, Some("claude")),
+            Some(ui::IconName::AiClaude)
+        );
+        assert_eq!(
+            super::arena_agent_icon(true, false, None),
+            Some(ui::IconName::AiOpenAi)
+        );
+        assert_eq!(
+            super::arena_agent_icon(false, true, Some("cargo")),
+            Some(ui::IconName::AiClaude)
+        );
+    }
+
+    #[test]
+    fn arena_agent_rows_exclude_shells_and_other_running_processes() {
+        for process in [None, Some("zsh"), Some("cargo"), Some("node")] {
+            assert_eq!(super::arena_agent_icon(false, false, process), None);
+        }
     }
 
     #[test]

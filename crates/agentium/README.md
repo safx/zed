@@ -100,7 +100,7 @@ Add the following to your Claude Code `settings.json`:
 }
 ```
 
-The `permission-request` hook stays running until the permission is answered, so it can be answered from the Inbox (Allow / Always allow / Deny) while Claude Code shows its own dialog in the terminal; whichever answer comes first wins. Its `timeout` must be long: when Claude Code cancels the hook (600 seconds by default), the Inbox can no longer answer and only the terminal dialog remains.
+The `permission-request` hook stays running until the permission is answered, so it can be answered from the agent row’s status popover (Allow / Always allow / Deny) while Claude Code shows its own dialog in the terminal; whichever answer comes first wins. Its `timeout` must be long: when Claude Code cancels the hook (600 seconds by default), the status popover can no longer answer and only the terminal dialog remains.
 
 Terminal tabs show dot indicators based on execution state:
 
@@ -108,13 +108,16 @@ Terminal tabs show dot indicators based on execution state:
 - **Codex terminals**: same dots, derived from the terminal title. Busy is reported once the spinner has run for 2 seconds so that the startup spin (MCP servers loading) does not count as a turn
 - **Non-Claude task terminals**: green dot while running, blue dot on success, red dot on failure
 
-Pressing any key while focused on a terminal clears its dot (and border). Selecting a terminal from the arena badge menu also clears it.
+Pressing any key while focused on a terminal clears its dot (and border). Selecting an agent row also clears its completion indicator.
 
-The arena sidebar shows pill-shaped badges:
-- Orange pill — Claude or Codex sessions awaiting a permission decision (clickable: opens a menu to jump to the specific terminal)
-- Green pill — running Claude or Codex sessions
-- Blue pill — completed Claude or Codex sessions (clickable: opens a menu to jump to the specific terminal)
-- White/black pill (theme-inverted) — terminals running a foreground command other than `claude` or `codex`, refreshed every 2 seconds
+Both Repositories and Tasks show one row per agent under its arena, using the existing tab title. Click the row to open the agent tab. Each row shows:
+
+- A teal To do badge with the number of remaining items. Clicking it opens that agent’s To do tab beside the owner tab; it does not navigate away to another sidebar.
+- The agent’s status: Idle, Running, Completed, Permission, Failed, or Decision. Click the status to view that agent’s activity and answer pending questions or permissions.
+
+There is no separate Inbox sidebar tab. Closed agent tabs with remaining To do items stay listed under their arena; clicking their To do badge attempts to restore the owner.
+
+The arena’s white/black pill (theme-inverted) remains for terminals running a foreground command other than `claude` or `codex`, refreshed every 2 seconds. Click it to choose a running process. The former orange, green, blue, and error aggregate agent badges are replaced by the individual agent rows.
 
 Terminals that previously hosted a Claude Code session are excluded from the white/black pill until that session ends. Codex terminals are excluded by process name and, once their title has shown a spinner, until Codex clears the title on exit. The `SessionEnd` hook is the canonical way to release the terminal so it can be counted as non-Claude busy when running other commands afterwards; on macOS, a caffeinate-based monitor is also used as a fallback for hard exits (SIGKILL, terminal close).
 
