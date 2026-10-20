@@ -3390,7 +3390,7 @@ impl AgentiumApp {
             .and_then(|list| list.tab.as_ref().map(|tab| tab.item.id()))
             .and_then(|item_id| inbox_todo_view::find_item_location(&self.arenas, item_id, cx))
             .map(|(_, _, item)| item);
-        let message = view.read(cx).preview(cx);
+        let processed = view.read(cx).selected_items(notes, cx);
         let todos = self.inbox_todos.clone();
         let result = todos.update(cx, |todos, cx| {
             todos.send(
@@ -3401,8 +3401,8 @@ impl AgentiumApp {
                 cx,
             )
         });
-        if result.is_ok() && let Some(message) = message {
-            view.update(cx, |view, cx| view.record_reply(message, cx));
+        if result.is_ok() {
+            view.update(cx, |view, cx| view.record_processed(processed, cx));
         }
         let error = result.err().map(|error| format!("{error:#}"));
         view.update(cx, |view, cx| view.set_error(error, cx));
@@ -7554,7 +7554,7 @@ impl AgentiumApp {
         let count = list.map_or(0, |list| list.items.len());
         let title = list
             .map(|list| list.title.clone())
-            .unwrap_or_else(|| "Reply history".into());
+            .unwrap_or_else(|| "Processed items".into());
         let closed = list.is_some_and(|list| {
             list.tab
                 .as_ref()

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use gpui::{prelude::*, *};
-use ui::{Button, Clickable as _, Color, Label, LabelCommon as _, v_flex};
+use ui::{Button, Clickable as _, Icon, IconSize, Tooltip, h_flex, v_flex};
 use workspace::item::{Item, ItemEvent};
 
 use crate::{AgentiumApp, inbox_todo_view::InboxTodoView};
@@ -63,11 +63,15 @@ impl TaskOverview {
         } else {
             text[..first_sentence_end].to_owned()
         };
-        v_flex()
+        let icon_path = if label == "Request" {
+            "icons/user-round.svg"
+        } else {
+            "icons/bot.svg"
+        };
+        let message = v_flex()
             .min_w_0()
-            .flex_shrink_0()
+            .flex_1()
             .gap_1()
-            .child(Label::new(label).color(Color::Muted))
             .child(div().text_sm().child(visible))
             .when(has_more, |column| {
                 column.child(
@@ -86,7 +90,20 @@ impl TaskOverview {
                         })
                     }),
                 )
-            })
+            });
+        h_flex()
+            .min_w_0()
+            .flex_shrink_0()
+            .items_start()
+            .gap_3()
+            .child(
+                div()
+                    .id(SharedString::from(format!("overview-icon-{item_id:?}-{label}")))
+                    .flex_shrink_0()
+                    .child(Icon::from_path(icon_path).size(IconSize::Custom(rems(1.5))))
+                    .tooltip(Tooltip::text(label)),
+            )
+            .child(message)
             .into_any_element()
     }
 }
