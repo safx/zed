@@ -7261,11 +7261,6 @@ impl AgentiumApp {
             }
         };
         let todo_ids = self.overview_todo_ids(&arena_ids, &paths, cx);
-        let total: usize = todo_ids
-            .iter()
-            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
-            .map(|list| list.items.len())
-            .sum();
         let mut content = v_flex()
             .id("task-overview")
             .size_full()
@@ -7273,13 +7268,7 @@ impl AgentiumApp {
             .p_4()
             .gap_4()
             .bg(colors.editor_background)
-            .child(Label::new("Task Overview").color(Color::Muted))
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(div().text_xl().child(title))
-                    .child(Label::new(format!("To do · {total}"))),
-            );
+            .child(div().text_xl().child(title));
         let mut linked_prs = Vec::new();
         if let task_overview::OverviewScope::Task(task_id) = overview.scope {
             if let Some(task) = self
@@ -7324,11 +7313,13 @@ impl AgentiumApp {
                     continue;
                 }
                 content = content.child(
-                    Button::new(
-                        SharedString::from(format!("overview-linked-{url}")),
-                        reference.short_label(),
-                    )
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                    div().pl_5().child(
+                        Button::new(
+                            SharedString::from(format!("overview-linked-{url}")),
+                            reference.short_label(),
+                        )
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                    ),
                 );
             }
             for pr in prs {
@@ -7345,6 +7336,7 @@ impl AgentiumApp {
                     self.render_pr_elements("overview-pr", &pr, ci, None, true, true, None, cx);
                 content = content.child(
                     v_flex()
+                        .pl_5()
                         .gap_1()
                         .child(div().text_sm().child(pr.title.clone()))
                         .child(status)
@@ -7563,21 +7555,65 @@ impl AgentiumApp {
                 })
                 .is_none()
         });
+        let metadata = list.map(|list| {
+            let location = match &list.branch {
+                Some(branch) => format!("{} · {branch}", list.arena_name),
+                None => list.arena_name.clone(),
+            };
+            let updated_at = list
+                .updated_at
+                .with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M");
+            format!("{location} · updated {updated_at}")
+        });
         let expanded = overview.expanded.contains(&todo_id);
         let overview_entity = overview_entity.clone();
+        let colors = cx.theme().colors();
         let mut section = v_flex().flex_shrink_0().min_w_0().gap_2().child(
-            Button::new(
-                SharedString::from(format!("overview-todo-{todo_id}")),
-                format!("{} To do · {count}", if expanded { "▾" } else { "▸" }),
-            )
-            .on_click(move |_, _, cx| {
-                overview_entity.update(cx, |overview, cx| {
-                    if !overview.expanded.remove(&todo_id) {
-                        overview.expanded.insert(todo_id);
-                    }
-                    cx.notify();
+            h_flex()
+                .id(SharedString::from(format!("overview-todo-{todo_id}")))
+                .min_w_0()
+                .gap_1()
+                .cursor_pointer()
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(inbox_todo_color())
+                        .bg(inbox_todo_color().opacity(0.15))
+                        .child(format!("To do · {count}")),
+                )
+                .when_some(metadata, |row, metadata| {
+                    row.child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .child(metadata),
+                    )
                 })
-            }),
+                .on_click(move |_, _, cx| {
+                    overview_entity.update(cx, |overview, cx| {
+                        if !overview.expanded.remove(&todo_id) {
+                            overview.expanded.insert(todo_id);
+                        }
+                        cx.notify();
+                    })
+                }),
         );
         if closed {
             section = section.child(
