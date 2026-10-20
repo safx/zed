@@ -100,7 +100,7 @@ Add the following to your Claude Code `settings.json`:
 }
 ```
 
-The `permission-request` hook stays running until the permission is answered, so it can be answered from the agent row’s status popover (Allow / Always allow / Deny) while Claude Code shows its own dialog in the terminal; whichever answer comes first wins. Its `timeout` must be long: when Claude Code cancels the hook (600 seconds by default), the status popover can no longer answer and only the terminal dialog remains.
+The `permission-request` hook stays running until the permission is answered, so it can be answered from the agent card’s status popover (Allow / Always allow / Deny) while Claude Code shows its own dialog in the terminal; whichever answer comes first wins. Its `timeout` must be long: when Claude Code cancels the hook (600 seconds by default), the status popover can no longer answer and only the terminal dialog remains.
 
 Terminal tabs show dot indicators based on execution state:
 
@@ -108,16 +108,21 @@ Terminal tabs show dot indicators based on execution state:
 - **Codex terminals**: same dots, derived from the terminal title. Busy is reported once the spinner has run for 2 seconds so that the startup spin (MCP servers loading) does not count as a turn
 - **Non-Claude task terminals**: green dot while running, blue dot on success, red dot on failure
 
-Pressing any key while focused on a terminal clears its dot (and border). Selecting an agent row also clears its completion indicator.
+Pressing any key while focused on a terminal clears its dot (and border). Opening an agent tab from Task Overview also clears its completion indicator.
 
-Both Repositories and Tasks show one row per agent under its arena, using the existing tab title. Click the row to open the agent tab. Each row shows:
+## Task Overview
 
-- A teal To do badge with the number of remaining items. Clicking it opens that agent’s To do tab beside the owner tab; it does not navigate away to another sidebar.
-- The agent’s status: Idle, Running, Completed, Permission, Failed, or Decision. Click the status to view that agent’s activity and answer pending questions or permissions.
+Choose **Task Overview** from the tab bar’s **+** menu. It gathers the task’s arenas, agent requests and results, To do items, and pull requests in one tab. An arena without a task gets an arena-scoped overview. Opening the same overview again activates its existing tab.
 
-There is no separate Inbox sidebar tab. Closed agent tabs with remaining To do items stay listed under their arena; clicking their To do badge attempts to restore the owner.
+The sidebar shows aggregate running, completed, permission, error, and non-agent process badges, plus a teal badge with the total pending To do items in that arena. There are no per-agent sidebar rows. Clicking a To do badge opens the task’s overview; there is no standalone To do tab or Inbox tab.
 
-The arena’s white/black pill (theme-inverted) remains for terminals running a foreground command other than `claude` or `codex`, refreshed every 2 seconds. Click it to choose a running process. The former orange, green, blue, and error aggregate agent badges are replaced by the individual agent rows.
+Each agent card links to its original tab. Request and Response initially show the first sentence (ending at `.` or `。`); Show more / Show less toggles the received text. New text starts collapsed. The status button opens its activity, including questions and permission responses. Expand **To do** to choose Done / Go / Skip, add notes, and send directly to that agent. Drafts survive switching tabs; successful replies appear in that overview’s reply history and only delivered items leave the list. Closed owners retain their items and can be restored from the overview before sending.
+
+Claude requests come from UserPromptSubmit. The Stop hook derives the result title from `last_assistant_message` without an LLM: it takes the first nonempty line, removes basic Markdown markers, and limits it to 120 characters. Codex ACP shows the latest user message and assistant response, excluding reasoning. Terminals without these sources show an unavailable message and a link to the original tab. Results and reply history are session-local.
+
+PRs include cached entries for closed arenas and manually linked task PRs. The coordinator section is a placeholder for future task-wide instructions.
+
+The white/black pill (theme-inverted) counts terminals running foreground commands other than `claude` or `codex`, refreshed every 2 seconds. Click it to choose a running process.
 
 Terminals that previously hosted a Claude Code session are excluded from the white/black pill until that session ends. Codex terminals are excluded by process name and, once their title has shown a spinner, until Codex clears the title on exit. The `SessionEnd` hook is the canonical way to release the terminal so it can be counted as non-Claude busy when running other commands afterwards; on macOS, a caffeinate-based monitor is also used as a fallback for hard exits (SIGKILL, terminal close).
 

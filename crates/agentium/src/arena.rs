@@ -434,7 +434,7 @@ impl Arena {
         .detach_and_log_err(cx);
     }
 
-    fn add_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -1375,7 +1375,6 @@ impl Render for Arena {
             .unwrap_or_else(div);
         let ready_pids = self.session_state.ready_shell_pids.borrow().clone();
         let permission_pids = self.session_state.permission_shell_pids.borrow().clone();
-        let owner_highlight = inbox_owner_highlight(&self.active_pane, cx);
         self.workspace
             .update(cx, |_workspace, cx| {
                 let decorator = AgentiumPaneDecorator {
@@ -1383,7 +1382,6 @@ impl Render for Arena {
                     workspace: &self.workspace,
                     ready_shell_pids: &ready_pids,
                     permission_shell_pids: &permission_pids,
-                    owner_highlight,
                 };
                 search_actions_div
                     .relative()
@@ -1667,40 +1665,15 @@ impl Render for Arena {
     }
 }
 
-/// While the active pane shows an Inbox to-do list, the tab that wrote it and
-/// the color to frame it with.
-fn inbox_owner_highlight(active_pane: &Entity<Pane>, cx: &App) -> Option<(EntityId, Hsla)> {
-    let view = active_pane
-        .read(cx)
-        .active_item()?
-        .downcast::<crate::inbox_todo_view::InboxTodoView>()?;
-    let owner = view.read(cx).owner_item_id(cx)?;
-    Some((owner, crate::inbox_todo_color()))
-}
-
 struct AgentiumPaneDecorator<'a> {
     active_pane: &'a Entity<Pane>,
     workspace: &'a WeakEntity<Workspace>,
     ready_shell_pids: &'a HashSet<u32>,
     permission_shell_pids: &'a HashSet<u32>,
-    owner_highlight: Option<(EntityId, Hsla)>,
 }
 
 impl PaneLeaderDecorator for AgentiumPaneDecorator<'_> {
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
-        // Matched against the item in front of each pane, so it follows the
-        // owner wherever it moved and never frames a closed one.
-        if let Some((owner, color)) = self.owner_highlight
-            && pane
-                .read(cx)
-                .active_item()
-                .is_some_and(|item| item.item_id() == owner)
-        {
-            return LeaderDecoration {
-                border: Some(color),
-                status_box: None,
-            };
-        }
         if let Some(view) = pane
             .read(cx)
             .active_item()
@@ -1971,6 +1944,7 @@ pub(crate) fn new_agentium_pane(
                                     |menu: ui::ContextMenu, _, _| {
                                         menu.key_context("AgentiumNewItemMenu")
                                             .context(focus_handle.clone())
+                                            .action("Task Overview", crate::NewTaskOverview.boxed_clone())
                                             .action("Claude Code", NewClaudeCode.boxed_clone())
                                             .action("Codex (ACP)", NewCodexAcp.boxed_clone())
                                             .action("Resume Codex Conversation…", ResumeCodexConversation.boxed_clone())

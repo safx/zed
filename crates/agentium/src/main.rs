@@ -392,6 +392,51 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn claude_stop_title(message: &str) -> Option<String> {
+    let line = message.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches(['#', '>', '-', '*', ' ']);
+        let line = line.replace(['`', '*'], "");
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!line.is_empty()).then_some(line)
+    })?;
+    let mut title = truncate_string(&line, 120);
+    if line.chars().count() > 120 {
+        title.push('…');
+    }
+    Some(title)
+}
+
+#[cfg(test)]
+mod claude_stop_title_tests {
+    use super::claude_stop_title;
+
+    #[test]
+    fn uses_response_without_splitting_file_names() {
+        assert_eq!(
+            claude_stop_title("\n- Added `fib_memo` to **fib.py**.\nTests pass."),
+            Some("Added fib_memo to fib.py.".into())
+        );
+    }
+
+    #[test]
+    fn skips_empty_markdown_lines() {
+        assert_eq!(
+            claude_stop_title("\n### \n> 完了しました。"),
+            Some("完了しました。".into())
+        );
+        assert_eq!(claude_stop_title(" \n***\n"), None);
+    }
+
+    #[test]
+    fn truncates_unicode_without_breaking_characters() {
+        assert_eq!(
+            claude_stop_title(&"あ".repeat(121)),
+            Some(format!("{}…", "あ".repeat(120)))
+        );
+        assert_eq!(claude_stop_title(&"あ".repeat(120)), Some("あ".repeat(120)));
+    }
+}
+
 /// Extract the plain user-authored text from a `type: "user"` entry's
 /// `message.content`. Returns `None` if there is no text to search.
 ///
@@ -2373,7 +2418,16 @@ fn main() {
                 "session_id": session_id,
                 "ancestor_pids": ancestor_pids,
             });
-            let title = json["title"].as_str()
+            let stop_title = if matches!(event, ClaudeHookEvent::Stop) {
+                json["last_assistant_message"]
+                    .as_str()
+                    .and_then(claude_stop_title)
+            } else {
+                None
+            };
+            let title = stop_title
+                .as_deref()
+                .or_else(|| json["title"].as_str())
                 .or_else(|| json["message"].as_str());
             if let Some(title) = title {
                 msg["title"] = serde_json::Value::String(truncate_string(title, 500));

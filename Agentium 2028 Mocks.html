@@ -1,0 +1,1129 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Agentium 2028 Mocks</title>
+<style>
+/* Layout: a fixed 1400x900 app window per direction, scaled to the stage width; one screen visible at a time. */
+:root {
+  color-scheme: dark;
+  --page: #08090a;
+  --win: #0f1012;
+  --side: #17181b;
+  --pane: #111214;
+  --tabbar: #18191c;
+  --tab: #222327;
+  --raise: #1d1e22;
+  --raise-2: #26282d;
+  --line: #2b2d32;
+  --line-soft: #202226;
+  --fg: #d8dadf;
+  --fg-dim: #9095a0;
+  --fg-faint: #5f636c;
+  --accent: #5aa2f0;
+  --accent-soft: #1d3550;
+  --green: #74c27a;
+  --green-soft: #1e3523;
+  --red: #e8695f;
+  --red-soft: #3d1f1d;
+  --orange: #e9a54c;
+  --orange-soft: #3b2c17;
+  --purple: #b48ef2;
+  --purple-soft: #2d2342;
+  --teal: #55c4b8;
+  --yellow: #dcc65e;
+  --backlog: #42a86f;
+  --ui: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", system-ui, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, "JetBrains Mono", Consolas, monospace;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { background: var(--page); color: var(--fg); font-family: var(--ui); padding-inline: 16px; padding-block: 12px 32px; }
+.i { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; vertical-align: -2px; }
+
+/* switcher */
+.switcher { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 1400px; margin: 0 auto; }
+.switcher .brand { font-weight: 600; font-size: 13px; color: var(--fg-dim); margin-right: 8px; }
+.switcher button { font: inherit; font-size: 12.5px; color: var(--fg-dim); background: var(--side); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+.switcher button:hover { color: var(--fg); border-color: var(--fg-faint); }
+.switcher button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.switcher button[aria-selected="true"] { color: var(--fg); background: var(--raise-2); border-color: var(--accent); }
+.switcher kbd { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); margin-right: 4px; }
+.caption { max-width: 1400px; margin: 8px auto 12px; font-size: 13px; color: var(--fg-dim); line-height: 1.6; }
+.caption b { color: var(--fg); font-weight: 600; }
+
+/* stage + window */
+.stage { max-width: 1400px; margin: 0 auto; overflow: hidden; }
+.win { width: 1400px; height: 900px; transform-origin: top left; background: var(--win); border: 1px solid var(--line); border-radius: 11px; overflow: hidden; display: grid; grid-template-columns: var(--sw, 240px) 1fr var(--rw, 1fr); font-size: 12px; line-height: 1.45; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
+.win > * { min-width: 0; min-height: 0; }
+
+/* sidebar */
+.side { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; overflow: hidden; }
+.lights { display: flex; gap: 8px; padding: 12px 12px 8px; }
+.lights span { width: 12px; height: 12px; border-radius: 50%; background: #ec6a5e; }
+.lights span:nth-child(2) { background: #f4bf4f; }
+.lights span:nth-child(3) { background: #61c554; }
+.seg { display: flex; margin: 0 10px 8px; background: var(--win); border-radius: 7px; padding: 2px; }
+.seg span { flex: 1; text-align: center; padding: 4px 0; border-radius: 5px; color: var(--fg-dim); font-size: 12px; }
+.seg span.on { background: var(--raise-2); color: var(--fg); font-weight: 600; }
+.seg .n { display: inline-block; min-width: 15px; padding: 0 4px; margin-left: 4px; border-radius: 8px; background: var(--orange); color: #1a1205; font-size: 10px; font-weight: 700; line-height: 15px; }
+.side-scroll { flex: 1; overflow: hidden; padding: 0 8px; display: flex; flex-direction: column; gap: 2px; }
+.grp { display: flex; align-items: center; gap: 4px; font-weight: 600; font-size: 12px; padding: 6px 4px 3px; color: var(--fg); }
+.grp .i { width: 10px; height: 10px; color: var(--fg-faint); }
+.grp .tail { margin-left: auto; font-weight: 400; color: var(--fg-faint); font-size: 11px; }
+.issue { display: flex; align-items: center; gap: 6px; padding: 2px 4px 2px 14px; font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+.issue .ik { overflow: hidden; text-overflow: ellipsis; }
+.issue .st { margin-left: auto; font-size: 10.5px; color: var(--fg-faint); flex: none; }
+.bb { width: 13px; height: 13px; border-radius: 4px; background: var(--backlog); color: #fff; font-size: 9.5px; font-weight: 700; display: inline-grid; place-items: center; flex: none; }
+.arena { padding: 5px 6px 5px 14px; border-radius: 6px; display: grid; gap: 1px; }
+.arena.sel { background: var(--raise-2); }
+.arena .nm { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12.5px; }
+.arena .sub { display: flex; align-items: center; gap: 4px; color: var(--fg-faint); font-size: 11px; white-space: nowrap; overflow: hidden; }
+.arena .sub .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.add { color: var(--green); font-family: var(--mono); font-size: 10.5px; }
+.del { color: var(--red); font-family: var(--mono); font-size: 10.5px; }
+.pill { display: inline-grid; place-items: center; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px; font-size: 9.5px; font-weight: 700; color: #0d1a10; background: var(--green); }
+.pill.blue { background: var(--accent); color: #071421; }
+.pill.orange { background: var(--orange); color: #1a1205; }
+.pill.white { background: #e8e8e8; color: #111; }
+.pills { display: inline-flex; gap: 3px; margin-left: auto; }
+.divider { display: flex; align-items: center; gap: 8px; color: var(--fg-faint); font-size: 11px; padding: 8px 4px 2px; }
+.divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.newtask { text-align: center; color: var(--fg-dim); font-size: 12px; padding: 7px; border-top: 1px solid var(--line-soft); }
+.rl { padding: 8px 12px 12px; border-top: 1px solid var(--line); display: grid; gap: 5px; font-size: 11px; color: var(--fg-dim); }
+.rl b { color: var(--fg); font-weight: 600; }
+.rl .row { display: flex; justify-content: space-between; }
+.bar { height: 4px; border-radius: 2px; background: var(--raise-2); overflow: hidden; display: flex; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+
+/* panes */
+.pane { background: var(--pane); display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--line); }
+.pane:last-child { border-right: 0; }
+.tabs { height: 30px; flex: none; display: flex; align-items: stretch; background: var(--tabbar); border-bottom: 1px solid var(--line); }
+.tab { display: flex; align-items: center; gap: 6px; padding: 0 14px; color: var(--fg-faint); font-size: 12px; border-right: 1px solid var(--line-soft); white-space: nowrap; }
+.tab.on { background: var(--pane); color: var(--fg); }
+.tab .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--orange); }
+.tabs-r { margin-left: auto; display: flex; align-items: center; gap: 10px; padding: 0 10px; color: var(--fg-faint); }
+.body { flex: 1; overflow: hidden; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.split { display: grid; grid-template-rows: auto 1fr; flex: 1; min-height: 0; }
+.vsplit { display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--line); }
+.vsplit > .pane { border-right: 0; }
+.vsplit > .pane + .pane { border-top: 1px solid var(--line); }
+
+/* terminal */
+.term { font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: #c6c9cf; white-space: pre-wrap; word-break: break-word; }
+.term .dim { color: var(--fg-faint); }
+.term .g { color: var(--green); }
+.term .r { color: var(--red); }
+.term .o { color: var(--orange); }
+.term .b { color: var(--accent); }
+.term .y { color: var(--yellow); }
+.term .hl { background: var(--raise-2); display: block; padding: 2px 6px; margin: 0 -6px; }
+.term .box { display: block; border: 1px solid var(--orange); border-radius: 4px; padding: 6px 10px; margin: 4px 0; }
+
+/* shared bits */
+.h { font-size: 11px; font-weight: 600; color: var(--fg-dim); letter-spacing: .04em; text-transform: uppercase; }
+.hj { font-size: 11.5px; font-weight: 600; color: var(--fg-dim); }
+.muted { color: var(--fg-dim); }
+.faint { color: var(--fg-faint); }
+.mono { font-family: var(--mono); font-size: 11px; }
+code { font-family: var(--mono); font-size: 10.5px; background: var(--raise-2); padding: 0 4px; border-radius: 3px; color: var(--fg); }
+.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; font-weight: 600; padding: 1px 7px; border-radius: 9px; white-space: nowrap; background: var(--raise-2); color: var(--fg-dim); }
+.chip.green { background: var(--green-soft); color: var(--green); }
+.chip.red { background: var(--red-soft); color: var(--red); }
+.chip.orange { background: var(--orange-soft); color: var(--orange); }
+.chip.blue { background: var(--accent-soft); color: var(--accent); }
+.chip.purple { background: var(--purple-soft); color: var(--purple); }
+.chip.line { background: transparent; border: 1px solid var(--line); }
+.btn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--raise); color: var(--fg); white-space: nowrap; }
+.btn:hover { border-color: var(--fg-faint); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+.btn.warn { border-color: #6a4a1e; color: var(--orange); }
+.btn.danger { border-color: #6b2c27; color: var(--red); }
+.btn kbd, .key { font-family: var(--mono); font-size: 10px; padding: 0 4px; border-radius: 3px; background: var(--win); border: 1px solid var(--line); color: var(--fg-dim); }
+.row { display: flex; align-items: center; gap: 8px; }
+.wrap { flex-wrap: wrap; }
+.grow { flex: 1; min-width: 0; }
+.card { background: var(--raise); border: 1px solid var(--line-soft); border-radius: 7px; padding: 8px 10px; display: grid; gap: 6px; }
+.card.sel { border-color: var(--accent); }
+.link { color: var(--accent); }
+.tnum { font-variant-numeric: tabular-nums; }
+.stack { height: 6px; border-radius: 3px; overflow: hidden; display: flex; background: var(--raise-2); }
+.stack i { display: block; height: 100%; }
+
+/* diff */
+.diff { font-family: var(--mono); font-size: 11px; line-height: 1.6; border: 1px solid var(--line-soft); border-radius: 6px; overflow: hidden; }
+.diff .fh { display: flex; align-items: center; gap: 8px; padding: 5px 10px; background: var(--raise); border-bottom: 1px solid var(--line-soft); font-family: var(--ui); font-size: 11.5px; }
+.diff .hk { padding: 2px 10px; color: var(--fg-faint); background: #15171b; }
+.diff .l { display: grid; grid-template-columns: 36px 14px 1fr; white-space: pre; }
+.diff .l span:first-child { color: var(--fg-faint); text-align: right; padding-right: 8px; }
+.diff .l.a { background: #15281a; }
+.diff .l.a span:nth-child(2) { color: var(--green); }
+.diff .l.d { background: #2c1717; }
+.diff .l.d span:nth-child(2) { color: var(--red); }
+.diff.out { border-color: var(--purple); }
+.diff.out .fh { background: var(--purple-soft); }
+
+/* notes under the stage, one block per screen */
+.notes { max-width: 1400px; margin: 16px auto 0; display: grid; gap: 10px; font-size: 12.5px; line-height: 1.55; color: var(--fg-dim); }
+.notes h2 { font-size: 13.5px; font-weight: 600; color: var(--fg); margin: 0; }
+.notes h3 { font-size: 12px; font-weight: 600; color: var(--fg); margin: 0; }
+.notes p { margin: 0; }
+.notes table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.notes th { text-align: left; font-weight: 600; color: var(--fg-faint); padding: 5px 8px; background: var(--raise); }
+.notes td { padding: 5px 8px; border-top: 1px solid var(--line-soft); vertical-align: top; }
+.notes td:first-child { font-family: var(--mono); font-size: 11px; color: var(--fg); white-space: nowrap; }
+.notes ul { margin: 0; padding-left: 18px; }
+.notes li { margin: 2px 0; }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-branch" viewBox="0 0 16 16"><circle cx="4" cy="3.5" r="1.6"/><circle cx="4" cy="12.5" r="1.6"/><circle cx="12" cy="5" r="1.6"/><path d="M4 5.1v5.8M12 6.6c0 3-3 3.4-6.6 4.6"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M2 4.5h4l1.4 1.5H14v6.5H2z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+  <symbol id="i-split" viewBox="0 0 16 16"><rect x="2.5" y="3" width="11" height="10" rx="1"/><path d="M8 3v10"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 16 16"><path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9"/></symbol>
+  <symbol id="i-term" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="m5 6.5 2 1.5-2 1.5M8.5 10H11"/></symbol>
+  <symbol id="i-down" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></symbol>
+  <symbol id="i-right" viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="m3.5 8.5 3 3 6-7"/></symbol>
+  <symbol id="i-circle" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.5 14 13H2zM8 6.5v3M8 11.3v.2"/></symbol>
+  <symbol id="i-laptop" viewBox="0 0 16 16"><rect x="3" y="3.5" width="10" height="7" rx="1"/><path d="M1.5 12.5h13"/></symbol>
+  <symbol id="i-box" viewBox="0 0 16 16"><path d="M8 2 14 5v6l-6 3-6-3V5zM2 5l6 3 6-3M8 8v6"/></symbol>
+  <symbol id="i-server" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="4.5" rx="1"/><rect x="2.5" y="9" width="11" height="4.5" rx="1"/><path d="M5 4.75h.1M5 11.25h.1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 2 13 4v4c0 3-2.2 5-5 6-2.8-1-5-3-5-6V4z"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M3 8h10M9.5 4.5 13 8l-3.5 3.5"/></symbol>
+</svg>
+
+<nav class="switcher" role="tablist" aria-label="方向性">
+  <span class="brand">Agentium 2028-01</span>
+  <button role="tab" data-s="1" id="tab-1"><kbd>1</kbd>Decision Inbox（旧案）</button>
+  <button role="tab" data-s="2" id="tab-2"><kbd>2</kbd>Decision Log</button>
+  <button role="tab" data-s="3" id="tab-3"><kbd>3</kbd>Intent Contract</button>
+  <button role="tab" data-s="4" id="tab-4"><kbd>4</kbd>Risk-scoped Review</button>
+  <button role="tab" data-s="5" id="tab-5"><kbd>5</kbd>Local Control Plane</button>
+  <button role="tab" data-s="6" id="tab-6"><kbd>6</kbd>Task Overview</button>
+</nav>
+<p class="caption" data-cap="1"><b>9am:</b> 夜間 14 Run のうち完了 8。Inbox は 判断待ち / 許可待ち / 失敗 / 完了 に分かれます。完了は確認するまで残り、続きを指示しても消えません。許可はコマンドを見て a / d、失敗は打ち切りか再実行を選ぶだけ。時間を使うのは判断待ちで、選択肢と影響、関わるコード、過去の判断を並べて答えると、回答は判断ログに残り Run が再開します。</p>
+<p class="caption" data-cap="2" hidden><b>課題を閉じる前:</b> BLG_AI_INTEGRATION-747 で決めたこと 5 件を、2 リポジトリ・PR 2 本をまたいで見返します。各判断は背景・決定・理由・捨てた案・影響を持つミニ ADR で、diff の ◆ や <code>agentium why</code> からその行を決めた判断に戻れます。記録は PR 説明文と Backlog コメントにあるので、Agentium を使わない人も同じ内容を読めます。</p>
+<p class="caption" data-cap="3" hidden><b>9am:</b> PM が前夜に書いた粗い課題 3 件は「曖昧 2 / 実行可 1」に仕分け済み。曖昧な 2 件に答えて実行可の 1 件を起動し、昨夕承認した plan は「基準 4/5 達成、1 本が範囲外」から確認します。</p>
+<p class="caption" data-cap="4" hidden><b>9am:</b> 38 本の PR 候補のうち要人間レビューは 5 本だけ。docs / lint は自動 merge 済みで 1 行、DB migration を含む PR だけが必須承認で止まっています。</p>
+<p class="caption" data-cap="5" hidden><b>9am:</b> 1 本は手元、4 本は build-01 のコンテナと SSH 先で 1 画面に並びます。レビュー担当エージェントが <code>tab list</code> で状況を掴んで指摘を送り、詰まりの原因が OS 側 (ポート、ロック) でもその場で分かります。</p>
+<p class="caption" data-cap="6" hidden><b>Task Overview:</b> 左ペインは従来の集約バッジ＋Todo合計だけに。タブバーの「＋」→「Task Overview」、またはTodoバッジから開き、タスク内の各エージェントの依頼・結果・TodoとPRを確認します。返信もこのタブ内で完結します。</p>
+
+<div class="stage" id="stage">
+
+<!-- ============ 1 Decision Inbox ============ -->
+<style>
+.lane { display: flex; align-items: center; gap: 6px; padding: 8px 2px 2px; font-size: 11.5px; font-weight: 600; color: var(--fg); }
+.lane .hint { margin-left: auto; font-weight: 400; font-size: 10.5px; color: var(--fg-faint); }
+.lane .cnt { font-variant-numeric: tabular-nums; color: var(--fg-dim); font-weight: 600; }
+.lane .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.irow { display: grid; gap: 3px; padding: 6px 8px; border-radius: 6px; background: var(--raise); }
+.irow.sel { background: var(--purple-soft); outline: 1px solid var(--purple); }
+.irow .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.irow .s { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--fg-faint); white-space: nowrap; overflow: hidden; }
+.irow .s .grow { overflow: hidden; text-overflow: ellipsis; }
+.sbtn { font-size: 10.5px; padding: 1px 7px; border-radius: 5px; border: 1px solid var(--line); background: var(--raise-2); color: var(--fg); white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.sbtn.ok { border-color: var(--accent); color: var(--accent); }
+.sbtn.ng { border-color: #6b2c27; color: var(--red); }
+.cmd { font-family: var(--mono); font-size: 11px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.opt { display: grid; grid-template-columns: 22px 1fr; gap: 3px 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--raise); }
+.opt.pick { border-color: var(--purple); background: var(--purple-soft); }
+.opt .k { grid-row: span 2; font-family: var(--mono); font-size: 11px; width: 20px; height: 20px; border-radius: 4px; display: grid; place-items: center; background: var(--win); border: 1px solid var(--line); color: var(--fg-dim); }
+.opt.pick .k { border-color: var(--purple); color: var(--purple); }
+.opt .ol { font-weight: 600; font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
+.opt .od { font-size: 11.5px; color: var(--fg-dim); line-height: 1.55; }
+.code { font-family: var(--mono); font-size: 11px; line-height: 1.6; border: 1px solid var(--line-soft); border-radius: 6px; overflow: hidden; }
+.code .fh { display: flex; align-items: center; gap: 8px; padding: 5px 10px; background: var(--raise); border-bottom: 1px solid var(--line-soft); font-family: var(--ui); font-size: 11.5px; }
+.code .l { display: grid; grid-template-columns: 36px 1fr; white-space: pre; }
+.code .l span:first-child { color: var(--fg-faint); text-align: right; padding-right: 10px; }
+.code .l.mark { background: var(--purple-soft); box-shadow: inset 2px 0 0 var(--purple); }
+</style>
+<section class="win" data-screen="1" style="--sw: 370px; --rw: 380px">
+  <aside class="side">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="seg"><span class="on">Inbox<span class="n">7</span></span><span>Repositories</span><span>Tasks</span></div>
+    <div class="side-scroll" style="gap: 4px">
+      <div class="card" style="background: transparent; gap: 5px">
+        <div class="row"><span class="hj">夜間 Run 14</span><span class="faint mono">22:00 – 08:40</span></div>
+        <div class="stack"><i style="width:57%;background:var(--green)"></i><i style="width:14.3%;background:var(--purple)"></i><i style="width:14.3%;background:var(--orange)"></i><i style="width:14.4%;background:var(--red)"></i></div>
+        <div class="row tnum" style="gap: 10px; font-size: 11px"><span><span style="color:var(--green)">●</span> 完了 8</span><span><span style="color:var(--purple)">●</span> 判断待ち 2</span><span><span style="color:var(--orange)">●</span> 許可待ち 2</span><span><span style="color:var(--red)">●</span> 失敗 2</span></div>
+      </div>
+
+      <div class="lane"><span class="sw" style="background: var(--purple)"></span>判断待ち <span class="cnt">2</span><span class="hint">設計の判断 · 答えは判断ログに残る</span></div>
+      <div class="irow sel">
+        <div class="t">月次集計の締め日は JST か UTC か</div>
+        <div class="s"><span class="bb">b</span><span class="grow">747 · backlog-scala · Opus 5.5</span><span class="chip red" style="font-size: 9.5px; padding: 0 6px">停止中 2h10m</span></div>
+      </div>
+      <div class="irow">
+        <div class="t">見出しのない Wiki ページの引用元をどう表示するか</div>
+        <div class="s"><span class="bb">b</span><span class="grow">746 · backlog-ai-agent · Fable 5.1</span><span class="chip orange" style="font-size: 9.5px; padding: 0 6px">仮定で続行中</span></div>
+      </div>
+
+      <div class="lane"><span class="sw" style="background: var(--orange)"></span>許可待ち <span class="cnt">2</span><span class="hint"><span class="key">a</span> 許可 <span class="key">d</span> 拒否</span></div>
+      <div class="irow">
+        <div class="row" style="gap: 6px"><span class="chip line" style="font-size: 9.5px; padding: 0 6px">Bash</span><span class="cmd grow">sbt "flyway migrate -target=2028.01.14"</span><span class="chip red" style="font-size: 9.5px; padding: 0 6px">破壊的</span></div>
+        <div class="s"><span class="grow">backlog-scala · DROP COLUMN legacy_tokens · 5h48m</span><span class="sbtn ok">許可</span><span class="sbtn ng">拒否</span><span class="sbtn">差分</span></div>
+      </div>
+      <div class="irow">
+        <div class="row" style="gap: 6px"><span class="chip line" style="font-size: 9.5px; padding: 0 6px">Bash</span><span class="cmd grow">pnpm prisma generate</span></div>
+        <div class="s"><span class="grow">backlog-ai-agent · 12m</span><span class="sbtn ok">許可</span><span class="sbtn ng">拒否</span><span class="sbtn">今後も許可</span></div>
+      </div>
+
+      <div class="lane"><span class="sw" style="background: var(--red)"></span>失敗 <span class="cnt">3</span><span class="hint">CI · Run</span></div>
+      <div class="irow">
+        <div class="row" style="gap: 6px"><span class="chip red" style="font-size: 9.5px; padding: 0 6px">Run</span><span class="t grow">r-0413 同じ assertion で 6 回失敗</span><span class="faint mono" style="font-size: 10.5px">03:43</span></div>
+        <div class="s"><span class="grow">fake timer と AbortSignal.timeout の競合</span><span class="sbtn ng">打ち切り</span><span class="sbtn">別モデルで再実行</span></div>
+      </div>
+      <div class="irow">
+        <div class="row" style="gap: 6px"><span class="chip red" style="font-size: 9.5px; padding: 0 6px">Run</span><span class="t grow">r-0409 セッションが異常終了 (exit 137)</span><span class="faint mono" style="font-size: 10.5px">02:16</span></div>
+        <div class="s"><span class="grow">document · メモリ不足の可能性</span><span class="sbtn">再開</span><span class="sbtn ng">打ち切り</span></div>
+      </div>
+      <div class="irow">
+        <div class="row" style="gap: 6px"><span class="chip red" style="font-size: 9.5px; padding: 0 6px">CI</span><span class="t grow">PR #809 lint: no-unused-vars 2 件</span><span class="faint mono" style="font-size: 10.5px">05:02</span></div>
+        <div class="s"><span class="grow">backlog-scala · 作成した Run は終了済み</span><span class="sbtn">エージェントに直させる</span></div>
+      </div>
+
+      <div class="lane"><span class="sw" style="background: var(--accent)"></span>完了 <span class="cnt">8</span><span class="hint">未確認 · 上位 3 件 · <span class="key">e</span> 確認</span></div>
+      <div class="irow" style="padding: 5px 8px">
+        <div class="row" style="gap: 6px"><span style="color: var(--accent)">✓</span><span class="t grow">v1 互換の結合テストを追加</span><span class="pill blue">817</span><span class="sbtn">確認</span></div>
+        <div class="s"><span class="grow">r-0402 · backlog-scala · 05:20</span><span class="add">+58</span><span class="del">-6</span></div>
+      </div>
+      <div class="irow" style="padding: 5px 8px">
+        <div class="row" style="gap: 6px"><span style="color: var(--accent)">✓</span><span class="t grow">GET /documents/:id/tree を実装</span><span class="pill blue">816</span><span class="sbtn">確認</span></div>
+        <div class="s"><span class="grow">r-0398 · backlog-ai-agent · 04:02</span><span class="add">+301</span><span class="del">-40</span></div>
+      </div>
+      <div class="irow" style="padding: 5px 8px; opacity: .6">
+        <div class="row" style="gap: 6px"><span style="color: var(--accent)">✓</span><span class="t grow">@mastra/client-js を 1.47 へ更新</span><span class="chip blue" style="font-size: 9.5px; padding: 0 6px">続きを指示済み · 実行中</span></div>
+        <div class="s"><span class="grow">r-0410 · mastra · 完了 03:55 → 追加指示 09:12</span></div>
+      </div>
+    </div>
+    <div class="rl"><b>Rate limits</b><div class="row"><span>session</span><span>Resets in 4h 7m</span></div><div class="bar"><i style="width:22%"></i></div><div class="row"><span>week</span><span>Resets Thu 5:00</span></div><div class="bar"><i style="width:41%"></i></div></div>
+  </aside>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on"><span class="dot" style="background: var(--purple)"></span>判断 · 747</div><div class="tab">✳︎ Claude — backlog-scala</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body" style="gap: 10px; padding: 14px 18px">
+      <div class="row"><span class="chip purple">判断待ち</span><span class="chip red">Run 停止中 · 2h10m</span><span class="faint" style="margin-left:auto; font-size: 11px">回答すると D-747-5 として記録</span></div>
+      <div style="font-size: 17px; font-weight: 600; line-height: 1.35">月次集計の締め日は JST か UTC か</div>
+      <div class="row faint" style="font-size: 11px; gap: 6px"><span class="bb">b</span>BLG_AI_INTEGRATION-747 · backlog-scala · Claude Opus 5.5 · r-0415</div>
+
+      <div style="display: grid; gap: 4px">
+        <div class="hj">エージェントが止まった理由</div>
+        <div style="font-size: 12px; line-height: 1.65; max-width: 60ch">BillingAggregator.monthly で月の境界を決める必要があるが、仕様 §4 と課題本文に締めの基準がない。日次集計 (DailyUsageJob) は JST で区切り、ai_usage.created_at は UTC で保存されている。</div>
+      </div>
+
+      <div class="hj" style="margin-top: 2px">選択肢</div>
+      <div style="display: grid; gap: 6px">
+        <div class="opt pick">
+          <span class="k">1</span>
+          <div class="ol">JST 0:00 で締める<span class="chip purple" style="font-size: 9.5px">エージェントの推奨</span></div>
+          <div class="od">日次集計と境界が揃い、請求書の数字とも一致する。集計クエリで UTC → JST の変換が 1 か所増える。</div>
+        </div>
+        <div class="opt">
+          <span class="k">2</span>
+          <div class="ol">UTC 0:00 で締める</div>
+          <div class="od">クエリは単純。日本のスペースでは月初 9 時間分が前月に入り、請求書と月次の値がずれる。</div>
+        </div>
+        <div class="opt">
+          <span class="k">3</span>
+          <div class="ol">スペースのタイムゾーン設定に従う<span class="chip line" style="font-size: 9.5px">範囲外に触れる</span></div>
+          <div class="od">海外スペースでも正しくなる。spaces.timezone の参照が増え、契約の範囲外 (spaces テーブル) の変更が要る。</div>
+        </div>
+      </div>
+
+      <div style="display: grid; gap: 4px">
+        <div class="row"><span class="hj">理由 (任意)</span><span class="faint" style="margin-left:auto; font-size: 10.5px">判断ログに「理由 · 人」として残る。空なら理由欄は出ない</span></div>
+        <div style="border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; color: var(--fg-faint); font-size: 11.5px; min-height: 46px">なぜこれを選ぶか… 例: 請求書の締めが JST のため。海外スペース対応は別課題で扱う</div>
+      </div>
+
+      <div class="row wrap" style="gap: 6px; margin-top: 2px">
+        <span class="btn primary"><kbd>⌘↵</kbd>1 で回答して再開</span>
+        <span class="btn"><kbd>p</kbd>PM に回す · @yamada</span>
+        <span class="btn"><kbd>b</kbd>Backlog で聞く</span>
+        <span class="btn"><kbd>s</kbd>保留</span>
+      </div>
+      <div class="faint" style="font-size: 10.5px; border-top: 1px solid var(--line-soft); padding-top: 8px; line-height: 1.6">回答は D-747-5 (ミニ ADR: 背景・決定・理由・捨てた案・影響) として Backlog の課題コメントに残り、r-0415 は <code>claude --resume</code> で再開します。選択肢と影響はエージェントが質問ツールで出したもので、Agentium は課題・コードの位置・過去の判断を添えています。</div>
+    </div>
+  </div>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on">判断の材料</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body" style="gap: 12px">
+      <div style="display: grid; gap: 6px">
+        <div class="row"><span class="hj">関わるコード</span><span class="faint" style="margin-left:auto; font-size: 10.5px">直前に編集したファイル</span></div>
+        <div class="code">
+          <div class="fh"><span class="mono">app/billing/BillingAggregator.scala</span></div>
+          <div class="l"><span>41</span><span>  def monthly(spaceId: SpaceId, ym: YearMonth) = {</span></div>
+          <div class="l mark"><span>42</span><span>    val start = ???  // 締めの基準待ち</span></div>
+          <div class="l"><span>43</span><span>    val end   = start.plusMonths(1)</span></div>
+          <div class="l"><span>44</span><span>    repo.sumTotalTokens(spaceId, start, end)</span></div>
+        </div>
+      </div>
+
+      <div style="display: grid; gap: 6px">
+        <div class="row"><span class="hj">過去の判断</span><span class="faint" style="margin-left:auto; font-size: 10.5px">同じ課題 · 同じディレクトリ</span></div>
+        <div class="card" style="gap: 3px; font-size: 11.5px">
+          <div class="row"><span class="mono faint">D-688-2</span><span class="chip purple" style="font-size: 9.5px">人 · matsumoto</span><span class="faint mono" style="margin-left:auto">2027-11-02</span></div>
+          <div style="font-weight: 600">日次集計 (DailyUsageJob) は JST 0:00 で区切る</div>
+          <div class="muted">理由: 管理画面の「今日の利用量」と一致させるため</div>
+        </div>
+        <div class="card" style="gap: 3px; font-size: 11.5px">
+          <div class="row"><span class="mono faint">D-747-4</span><span class="chip purple" style="font-size: 9.5px">人 · matsumoto</span><span class="faint mono" style="margin-left:auto">01-14 09:05</span></div>
+          <div style="font-weight: 600">請求は total_tokens だけで計算する</div>
+          <div class="muted">理由: 仕様 §4.2 で一本化が決定済み</div>
+        </div>
+      </div>
+
+      <div style="display: grid; gap: 6px">
+        <div class="hj">課題・仕様</div>
+        <div class="card" style="gap: 4px; font-size: 11.5px">
+          <div class="row" style="gap: 6px"><span class="bb">b</span><span>BLG_AI_INTEGRATION-747 本文と仕様 §4</span></div>
+          <div class="muted">「締め」「月次」で検索して一致 0 件。締めの基準は書かれていません。答えを仕様にも追記するよう PM に回せます。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2 Decision Log ============ -->
+<style>
+.dec { display: grid; gap: 5px; background: var(--raise); border: 1px solid var(--line-soft); border-radius: 7px; padding: 8px 10px; }
+.dec.sel { border-color: var(--accent); }
+.dec .dt { font-size: 12.5px; font-weight: 600; color: var(--fg); }
+.dk { display: grid; grid-template-columns: 52px 1fr; gap: 2px 10px; font-size: 11.5px; color: var(--fg-dim); }
+.dk > span:nth-child(odd) { color: var(--fg-faint); }
+.src { font-size: 11px; gap: 6px; }
+.diff.g .l { grid-template-columns: 16px 36px 14px 1fr; }
+.diff.g .l span:first-child { text-align: center; padding: 0; color: var(--accent); }
+.diff.g .l span:nth-child(2) { color: var(--fg-faint); text-align: right; padding-right: 8px; }
+.diff.g .l.a span:nth-child(2), .diff.g .l.d span:nth-child(2) { color: var(--fg-faint); }
+.diff.g .l.a span:nth-child(3) { color: var(--green); }
+.diff.g .l.d span:nth-child(3) { color: var(--red); }
+.diff.g .l.hot { background: #1b3226; box-shadow: inset 2px 0 0 var(--accent); }
+.diff .nr { padding: 3px 10px; font-family: var(--ui); font-size: 10.5px; color: var(--fg-faint); background: #15171b; border-top: 1px solid var(--line-soft); }
+.md { font-family: var(--mono); font-size: 10.5px; line-height: 1.6; color: var(--fg-dim); background: var(--win); border: 1px solid var(--line-soft); border-radius: 6px; padding: 7px 10px; white-space: pre-wrap; }
+.md b { color: var(--fg); font-weight: 600; }
+.adr { display: grid; gap: 6px; background: var(--raise); border: 1px solid var(--line-soft); border-radius: 7px; padding: 9px 11px; }
+.adr.sel { border-color: var(--accent); }
+.adr .dt { font-size: 13px; font-weight: 600; color: var(--fg); }
+.af { display: grid; grid-template-columns: 56px 1fr; gap: 3px 10px; font-size: 11.5px; line-height: 1.55; color: var(--fg-dim); }
+.af.by { grid-template-columns: 56px 74px 1fr; }
+.af .lb { color: var(--fg-faint); }
+.af .w { white-space: nowrap; font-size: 9.5px; font-weight: 600; border-radius: 8px; padding: 0 6px; justify-self: start; align-self: start; margin-top: 2px; }
+.af .w.a { background: var(--accent-soft); color: var(--accent); }
+.af .w.h { background: var(--purple-soft); color: var(--purple); }
+.drow { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; background: var(--raise); font-size: 11.5px; white-space: nowrap; }
+.drow .grow { overflow: hidden; text-overflow: ellipsis; color: var(--fg); }
+</style>
+<section class="win" data-screen="2" hidden style="--sw: 300px; --rw: 1fr">
+  <aside class="side">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="seg"><span>Repositories</span><span class="on">Tasks</span></div>
+    <div class="side-scroll">
+      <div class="grp"><svg class="i"><use href="#i-down"/></svg>Haiku 5.5 + Luna 5.6<span class="tail">判断 6</span></div>
+      <div class="issue"><span class="bb">b</span><span class="ik">BLG_AI_INTEGRATION-746</span><span class="st">判断 1</span></div>
+      <div class="arena sel" style="padding-left: 10px">
+        <div class="nm"><span class="bb">b</span>BLG_AI_INTEGRATION-747<span class="pills"><span class="chip blue" style="font-size: 9.5px; padding: 0 6px">判断 5</span></span></div>
+        <div class="sub"><span class="grow">集計の一本化と 429 再接続</span><span class="st">処理中</span></div>
+      </div>
+      <div class="arena">
+        <div class="nm">backlog-ai-agent<span class="pills"><span class="pill">812</span></span></div>
+        <div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">BLG_AI_INTEGRATION-747/h…</span><span class="faint">判断 2</span></div>
+      </div>
+      <div class="arena">
+        <div class="nm">backlog-scala<span class="pills"><span class="pill orange">815</span></span></div>
+        <div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">BLG_AI_INTEGRATION-747/m…</span><span class="faint">判断 1</span></div>
+      </div>
+      <div class="grp"><svg class="i"><use href="#i-down"/></svg>document API (beta)<span class="tail">判断 3</span></div>
+      <div class="issue"><span class="bb">b</span><span class="ik">BLG_AI_INTEGRATION-663</span><span class="st">処理中</span></div>
+      <div class="arena"><div class="nm">document</div><div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">develop</span><span class="add">+62</span><span class="del">-60</span></div></div>
+      <div class="grp"><svg class="i"><use href="#i-right"/></svg>Mastra update<span class="tail">判断 1</span></div>
+      <div class="divider">Unassigned</div>
+      <div class="arena"><div class="nm">zed<span class="pills"><span class="pill">1</span><span class="pill blue">1</span></span></div><div class="sub"><svg class="i"><use href="#i-branch"/></svg>agentium</div></div>
+      <div class="arena"><div class="nm">hacker_news</div></div>
+    </div>
+    <div class="newtask">+ New Task</div>
+    <div class="rl"><b>Rate limits</b><div class="row"><span>session</span><span>Resets in 4h 7m</span></div><div class="bar"><i style="width:22%"></i></div><div class="row"><span>week</span><span>Resets Thu 5:00</span></div><div class="bar"><i style="width:41%"></i></div></div>
+  </aside>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on">判断 · 747</div><div class="tab">概要</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body" style="gap: 8px">
+      <div class="row"><span class="bb">b</span><span style="font-size: 14px; font-weight: 600">BLG_AI_INTEGRATION-747 の判断</span><span class="faint tnum" style="margin-left:auto; font-size: 11px">5 件 · 2 リポジトリ · PR #812 #815</span></div>
+      <div class="faint" style="font-size: 11px">1 件 = ミニ ADR (背景 / 決定 / 理由 / 捨てた案 / 影響)。欄ごとに、書いたのが人かエージェントかを出します</div>
+      <div class="row" style="gap: 6px"><span class="chip blue">すべて 5</span><span class="chip line">人 2</span><span class="chip line">エージェント 3</span><span class="chip green" style="margin-left:auto">理由の記入 5/5</span></div>
+
+      <div class="drow"><span class="mono faint">01-13 22:40</span><span class="mono faint">D-747-1</span><span class="grow">total_tokens への移行と列の削除を別の migration に分ける</span><span class="chip blue" style="font-size: 9.5px">エージェント</span><svg class="i faint"><use href="#i-right"/></svg></div>
+
+      <div class="adr sel">
+        <div class="row"><span class="mono">D-747-2</span><span class="chip green" style="font-size: 9.5px">採用</span><span class="chip blue" style="font-size: 9.5px">エージェント · Claude Fable 5.1</span><span class="mono faint" style="margin-left:auto">01-14 02:51</span></div>
+        <div class="dt">429 では Retry-After に従う (なければ backoff)</div>
+        <div class="af">
+          <span class="lb">背景</span><span>API は 429 と一緒に Retry-After を返す。再接続は exponential backoff だけで待っていた。</span>
+          <span class="lb">決定</span><span>Retry-After の秒数だけ待つ。ヘッダがなければ backoff。</span>
+          <span class="lb">理由</span><span>backoff だけだとサーバーの指示より早く再送し、再び 429 になる。</span>
+          <span class="lb">捨てた案</span><span>exponential backoff のみ — 再び 429 になる</span>
+          <span class="lb">影響</span><span>parseRetryAfter を追加。HTTP-date 形式の値も扱う必要がある。</span>
+        </div>
+        <div class="row src"><span class="chip line">backlog-ai-agent</span><span class="link">PR #812 説明文</span><span class="mono faint">3f4e21a</span><span class="faint" style="margin-left:auto">全欄 エージェント記入</span></div>
+      </div>
+
+      <div class="drow"><span class="mono faint">01-14 04:10</span><span class="mono faint">D-747-3</span><span class="grow">再接続のテストは fake timer をやめ、MSW の遅延で検証する</span><span class="chip blue" style="font-size: 9.5px">エージェント</span><svg class="i faint"><use href="#i-right"/></svg></div>
+      <div class="drow"><span class="mono faint">01-14 09:05</span><span class="mono faint">D-747-4</span><span class="grow">請求は total_tokens だけで計算する</span><span class="chip purple" style="font-size: 9.5px">人</span><svg class="i faint"><use href="#i-right"/></svg></div>
+
+      <div class="adr">
+        <div class="row"><span class="mono">D-747-5</span><span class="chip green" style="font-size: 9.5px">採用</span><span class="chip purple" style="font-size: 9.5px">人 · matsumoto · Inbox で回答</span><span class="mono faint" style="margin-left:auto">01-14 09:20</span></div>
+        <div class="dt">月次集計の締め日は JST 0:00</div>
+        <div class="af by">
+          <span class="lb">背景</span><span class="w a">エージェント</span><span>仕様 §4 と課題本文に締めの基準がない。日次集計は JST、created_at は UTC で保存。</span>
+          <span class="lb">決定</span><span class="w h">人</span><span>選択肢 1「JST 0:00 で締める」</span>
+          <span class="lb">理由</span><span class="w h">人</span><span>請求書の締めが JST のため。海外スペース対応は別課題で扱う。</span>
+          <span class="lb">捨てた案</span><span class="w a">エージェント</span><span>UTC 0:00 — 請求書と月次の値がずれる<br>スペースのタイムゾーン設定 — 範囲外 (spaces) の変更が要る</span>
+          <span class="lb">影響</span><span class="w a">エージェント</span><span>集計クエリで UTC → JST の変換が 1 か所増える。</span>
+        </div>
+        <div class="row src"><span class="chip line">Backlog</span><span class="link">課題コメント #15</span><span class="faint" style="margin-left:auto">理由は Inbox の「理由 (任意)」欄から</span></div>
+      </div>
+
+      <div class="row" style="font-size: 11px; margin-top: auto"><span class="faint grow">エージェントの判断は PR 説明文、人の判断は Backlog コメントが正本</span><span class="btn">課題を閉じる · 判断一覧をコメント</span></div>
+    </div>
+  </div>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on">Diff · PR #812</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body">
+      <div class="row" style="font-size: 11.5px; gap: 6px; white-space: nowrap"><span class="pill">812</span><span class="muted">backlog-ai-agent → develop</span><span class="chip green">merged 01-14 09:40</span><span class="faint" style="margin-left:auto"><span style="color: var(--accent)">◆</span> 判断の記録がある行</span></div>
+      <div class="diff g">
+        <div class="fh"><span class="mono">src/stream-response.ts</span><span class="faint" style="margin-left:auto">+48 -12</span></div>
+        <div class="hk">@@ -112,6 +112,14 @@ export async function resumeStream(</div>
+        <div class="l"><span></span><span>112</span><span> </span><span>  if (res.status === 429) {</span></div>
+        <div class="l d"><span></span><span>113</span><span>-</span><span>    await sleep(backoff(attempt));</span></div>
+        <div class="l a"><span>◆</span><span>113</span><span>+</span><span>    const wait = parseRetryAfter(</span></div>
+        <div class="l a hot"><span>◆</span><span>114</span><span>+</span><span>      res.headers.get("retry-after"));</span></div>
+        <div class="l a"><span>◆</span><span>115</span><span>+</span><span>    await sleep(wait ?? backoff(attempt));</span></div>
+        <div class="l"><span></span><span>116</span><span> </span><span>    return resumeStream(req, attempt + 1);</span></div>
+        <div class="hk">@@ -140,4 +148,9 @@ function parseRetryAfter(</div>
+        <div class="l a"><span></span><span>148</span><span>+</span><span>  const seconds = Number(value);</span></div>
+        <div class="l a"><span></span><span>149</span><span>+</span><span>  if (Number.isFinite(seconds)) return seconds * 1000;</span></div>
+        <div class="l a"><span></span><span>150</span><span>+</span><span>  return Date.parse(value) - Date.now();</span></div>
+        <div class="nr">記録なし · commit c7d9e02 に Decision trailer がないため、クリックすると PR #812 の説明文を出します</div>
+      </div>
+      <div class="row" style="font-size: 11.5px; gap: 6px; padding: 6px 10px; border: 1px solid var(--accent); border-radius: 6px; margin-top: -4px"><span style="color: var(--accent)">◆</span><span class="mono faint">114 行</span><svg class="i faint"><use href="#i-arrow"/></svg><span class="mono">D-747-2</span><span class="grow" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis">429 では Retry-After に従う</span><span class="link">判断ログで見る</span></div>
+      <div class="term" style="background: var(--win); border: 1px solid var(--line-soft); border-radius: 6px; padding: 8px 10px; font-size: 11px"><span class="g">~/src/backlog/backlog-ai-agent</span> <span class="dim">❯</span> agentium why src/stream-response.ts:114
+<span class="b">blame</span>     3f4e21a · 01-14 02:58 · Claude Fable 5.1
+<span class="b">trailer</span>   Decision: D-747-2 · Refs: BLG_AI_INTEGRATION-747
+
+<span class="y">D-747-2</span>   429 では Retry-After に従う (なければ backoff)  <span class="g">採用</span>
+  理由     backoff だけだと再び 429 になる
+  捨てた案 exponential backoff のみ
+  影響     parseRetryAfter を追加
+  出典     PR #812 説明文 ## Decisions
+<span class="dim">blame → trailer → 説明文の照合だけ (LLM 不使用)</span></div>
+      <div style="display: grid; gap: 5px">
+        <div class="row"><span class="hj">PR #812 説明文の記法</span><span class="faint" style="margin-left:auto; font-size: 10.5px">エージェントが書く · Agentium が parse</span></div>
+        <div class="md"><b>## Decisions</b>
+<b>### D-747-2 429 では Retry-After に従う</b>
+- 状態: 採用 · Claude Fable 5.1 · 2028-01-14
+- 背景: API は 429 と一緒に Retry-After を返す
+- 決定: Retry-After の秒数だけ待つ。なければ backoff
+- 理由: backoff だけだと再び 429 になる
+- 捨てた案: exponential backoff のみ
+- 影響: parseRetryAfter を追加</div>
+        <div class="faint" style="font-size: 10.5px; line-height: 1.55">決定と理由は必須。欠けた項目は PR 作成時の check が「理由なし」と表示します。置き換えるときは新しい判断に <code>- 置き換え: D-747-2</code> を書き、古い方の状態を自動で「置き換え済み」にします。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 3 Intent Contract ============ -->
+<section class="win" data-screen="3" hidden style="--sw: 280px; --rw: 400px">
+  <aside class="side">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="seg"><span>Repositories</span><span class="on">Tasks</span></div>
+    <div class="side-scroll">
+      <div class="grp"><svg class="i"><use href="#i-down"/></svg>Haiku 5.5 + Luna 5.6</div>
+      <div class="card" style="margin: 2px 0 4px 10px; padding: 6px 8px; gap: 4px; background: var(--orange-soft); border-color: #5a4320">
+        <div class="row" style="font-size: 11px; font-weight: 600; color: var(--orange)"><svg class="i"><use href="#i-shield"/></svg>Ready 判定 · 08:12</div>
+        <div style="font-size: 11px">受入基準が曖昧 2 / 実行可 1</div>
+      </div>
+      <div class="issue"><span class="bb">b</span><span class="ik">BLG_AI_INTEGRATION-746</span><span class="chip orange" style="margin-left:auto; font-size: 9.5px">曖昧</span></div>
+      <div class="issue"><span class="bb">b</span><span class="ik">BLG_AI_INTEGRATION-748</span><span class="chip orange" style="margin-left:auto; font-size: 9.5px">曖昧</span></div>
+      <div class="issue"><span class="bb">b</span><span class="ik">BLG_AI_INTEGRATION-749</span><span class="chip green" style="margin-left:auto; font-size: 9.5px">実行可 · 起動</span></div>
+      <div class="grp" style="margin-top: 4px"><svg class="i"><use href="#i-down"/></svg>document API (beta)<span class="tail">契約 v3</span></div>
+      <div class="issue"><span class="bb">b</span><span class="ik">BLG_AI_INTEGRATION-663</span><span class="st">処理中</span></div>
+      <div class="arena sel"><div class="nm">backlog-ai-agent<span class="pills"><span class="pill blue">816</span></span></div><div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">BLG_AI_INTEGRATION-663…</span><span class="add">+301</span><span class="del">-40</span></div></div>
+      <div class="arena"><div class="nm">backlog-scala<span class="pills"><span class="pill blue">817</span></span></div><div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">BLG_AI_INTEGRATION-663/t…</span><span class="add">+58</span><span class="del">-6</span></div></div>
+      <div class="grp"><svg class="i"><use href="#i-right"/></svg>Mastra update</div>
+      <div class="grp"><svg class="i"><use href="#i-right"/></svg>成果進捗報告</div>
+      <div class="divider">Unassigned</div>
+      <div class="arena"><div class="nm">zed</div><div class="sub"><svg class="i"><use href="#i-branch"/></svg>agentium</div></div>
+    </div>
+    <div class="newtask">+ New Task</div>
+    <div class="rl"><b>Rate limits</b><div class="row"><span>session</span><span>Resets in 4h 7m</span></div><div class="bar"><i style="width:22%"></i></div><div class="row"><span>week</span><span>Resets Thu 5:00</span></div><div class="bar"><i style="width:41%"></i></div></div>
+  </aside>
+
+  <div class="vsplit">
+    <div class="pane" style="flex: 0 0 auto">
+      <div class="tabs"><div class="tab on">契約</div><div class="tab">概要</div><div class="tab">Run</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+      <div class="body" style="gap: 8px">
+        <div class="row"><span style="font-weight: 600; font-size: 13px">document API (beta)</span><span class="chip green">v3 承認済み · 01-13 18:20</span><span class="faint" style="margin-left:auto; font-size: 11px">予算 $12.00 · 使用 $8.40</span></div>
+        <div><div class="hj">意図</div><div style="margin-top: 2px">ドキュメントのツリー構造を 1 リクエストで取得できる API を追加し、AI アシスタントが階層を辿らずに目次を作れるようにする。</div></div>
+        <div class="hj">受入基準</div>
+        <div style="display: grid; grid-template-columns: 16px 1fr auto auto auto; gap: 4px 12px; align-items: center; font-size: 11.5px">
+          <svg class="i" style="color:var(--green)"><use href="#i-check"/></svg><span>GET /documents/:id/tree が 3 階層を返す</span><code>pnpm test api/documents</code><span class="link mono">r-0398</span><span class="faint">backlog-ai-agent</span>
+          <svg class="i" style="color:var(--green)"><use href="#i-check"/></svg><span>OpenAPI 定義と実装が一致</span><code>pnpm openapi:check</code><span class="link mono">r-0398</span><span class="faint">backlog-ai-agent</span>
+          <svg class="i" style="color:var(--green)"><use href="#i-check"/></svg><span>閲覧権限のないユーザーには 403</span><code>pnpm test authz</code><span class="link mono">r-0401</span><span class="faint">backlog-ai-agent</span>
+          <svg class="i" style="color:var(--green)"><use href="#i-check"/></svg><span>既存 v1 クライアントが壊れない</span><code>sbt it:test</code><span class="link mono">r-0402</span><span class="faint">backlog-scala</span>
+          <svg class="i" style="color:var(--fg-faint)"><use href="#i-circle"/></svg><span>1,000 ノードで p95 200ms 以内</span><span class="chip line">manual</span><span class="faint">未提出</span><span class="faint">backlog-scala</span>
+        </div>
+        <div class="row wrap" style="gap: 6px; font-size: 11px; border-top: 1px solid var(--line-soft); padding-top: 8px"><span class="hj">範囲</span><code>api/documents/**</code><code>openapi/*.yaml</code><code>test/**</code><span class="faint">禁止</span><code style="color:var(--purple)">db/migrations/**</code></div>
+      </div>
+    </div>
+    <div class="pane" style="flex: 1">
+      <div class="tabs"><div class="tab on">Review · plan 5 本</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+      <div style="flex: 1; display: grid; grid-template-columns: 1fr 210px; min-height: 0">
+        <div class="body" style="border-right: 1px solid var(--line-soft)">
+          <div class="row" style="font-size: 11.5px"><span class="chip purple">範囲外 1 ファイル</span><span class="muted">承認した計画 vs 実際</span></div>
+          <div class="diff out">
+            <div class="fh"><span class="mono">db/migrations/V2028_01_13__add_tree_index.sql</span><span class="chip purple" style="margin-left:auto">範囲外 · 契約 v3 で禁止</span></div>
+            <div class="l a"><span>1</span><span>+</span><span>CREATE INDEX idx_documents_parent</span></div>
+            <div class="l a"><span>2</span><span>+</span><span>  ON documents (parent_id, sort_order);</span></div>
+          </div>
+          <div class="diff">
+            <div class="fh"><span class="mono">api/documents/tree.ts</span><span class="faint" style="margin-left:auto">+96</span></div>
+            <div class="l a"><span>21</span><span>+</span><span>export async function getTree(id: DocumentId, depth = 3) {</span></div>
+            <div class="l a"><span>22</span><span>+</span><span>  await authorize(ctx.user, id, "read");</span></div>
+            <div class="l a"><span>23</span><span>+</span><span>  return buildTree(await repo.descendants(id, depth));</span></div>
+          </div>
+        </div>
+        <div class="body" style="gap: 6px; font-size: 11.5px">
+          <div class="row"><span class="hj">基準</span><span style="margin-left:auto; font-weight: 600">4/5 達成</span></div>
+          <div class="bar"><i style="width:80%;background:var(--green)"></i></div>
+          <div class="row"><svg class="i" style="color:var(--green)"><use href="#i-check"/></svg>3 階層を返す</div>
+          <div class="row"><svg class="i" style="color:var(--green)"><use href="#i-check"/></svg>OpenAPI 一致</div>
+          <div class="row"><svg class="i" style="color:var(--green)"><use href="#i-check"/></svg>403</div>
+          <div class="row"><svg class="i" style="color:var(--green)"><use href="#i-check"/></svg>v1 互換</div>
+          <div class="row faint"><svg class="i"><use href="#i-circle"/></svg>p95 200ms</div>
+          <div class="faint" style="font-size: 10.5px; margin-top: 6px">plan 5 本中 1 本 (r-0402) が範囲外に接触。理由: p95 を満たすため index を追加。</div>
+          <span class="btn" style="justify-self: start">範囲を広げて承認</span>
+          <span class="btn danger" style="justify-self: start">差し戻す</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on"><span class="dot"></span>Questions · 746</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body" style="gap: 12px">
+      <div class="row" style="gap: 6px"><span class="bb">b</span><span style="font-weight: 600">BLG_AI_INTEGRATION-746</span><span class="chip orange" style="margin-left:auto">受入基準が曖昧</span></div>
+      <div class="faint" style="font-size: 11px">「AI 回答の引用元を表示する」 · 起票 PM 01-13 21:40</div>
+      <div class="card" style="gap: 8px">
+        <div class="hj">Q1 · 表示する引用元の単位</div>
+        <div style="display: grid; grid-template-columns: 54px 1fr; gap: 8px; font-size: 11.5px">
+          <span class="chip blue" style="justify-self: start">Q</span><span>引用元は「ドキュメント単位」「見出し単位」のどちらで表示しますか。</span>
+          <span class="chip green" style="justify-self: start">A</span><span>見出し単位。<span class="faint">matsumoto · 01-13 22:10 · Backlog コメント</span></span>
+          <span class="chip orange" style="justify-self: start">再質問</span><span>見出しのない Wiki ページはどう扱いますか。ページ単位にフォールバックしてよいですか。</span>
+        </div>
+        <div style="border: 1px solid var(--accent); border-radius: 6px; padding: 6px 8px; color: var(--fg-faint); font-size: 11.5px">回答を入力… <span style="float: right" class="key">⌘↵</span></div>
+      </div>
+      <div class="card" style="gap: 8px">
+        <div class="hj">Q2 · 検証方法</div>
+        <div style="display: grid; grid-template-columns: 54px 1fr; gap: 8px; font-size: 11.5px">
+          <span class="chip blue" style="justify-self: start">Q</span><span>「引用が正しい」をどう検証しますか。</span>
+          <span class="chip green" style="justify-self: start">A</span><span>既存の評価セット 40 件で、引用見出しが正解に含まれる率 90% 以上。</span>
+        </div>
+        <div class="row" style="font-size: 11px"><svg class="i" style="color:var(--green)"><use href="#i-check"/></svg><span class="muted">受入基準に変換:</span><code>pnpm eval citations --min 0.9</code></div>
+      </div>
+      <div class="card" style="gap: 6px; font-size: 11.5px">
+        <div class="hj">Q3 · 範囲</div>
+        <div class="faint">未着手。Q1 の回答後に質問します。</div>
+      </div>
+      <div class="faint" style="font-size: 11px">回答は Backlog の課題コメントにも投稿され、全問の回答後に Ready を再判定します。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4 Risk-scoped Review ============ -->
+<section class="win" data-screen="4" hidden style="--sw: 300px; --rw: 400px">
+  <aside class="side">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="seg"><span>Repositories</span><span class="on">Tasks</span></div>
+    <div class="side-scroll" style="gap: 6px">
+      <div class="row" style="padding: 4px 4px 0"><span class="hj">信頼度</span><span class="faint" style="margin-left:auto; font-size: 11px">Lease 6</span></div>
+      <div style="display: grid; gap: 2px; font-size: 11px">
+        <div class="row" style="padding: 4px; gap: 6px"><span class="grow"><b>document</b> <code>docs/**</code></span><span class="faint">Claude</span><span class="chip green">自動</span></div>
+        <div class="row" style="padding: 4px; gap: 6px"><span class="grow"><b>document</b> <code>src/**</code></span><span class="faint">Claude</span><span class="chip orange">要承認</span></div>
+        <div class="row" style="padding: 4px; gap: 6px"><span class="grow"><b>backlog-ai-agent</b> <code>src/**</code></span><span class="faint">Claude</span><span class="chip orange">要承認</span></div>
+        <div class="row" style="padding: 4px; gap: 6px; background: var(--red-soft); border-radius: 4px"><span class="grow"><b>backlog-ai-agent</b> <code>src/**</code></span><span class="faint">Codex</span><span class="chip orange">要承認 ↓</span></div>
+        <div class="row" style="padding: 4px; gap: 6px"><span class="grow"><b>backlog-scala</b> <code>db/migrations/**</code></span><span class="faint">全員</span><span class="chip red"><svg class="i"><use href="#i-lock"/></svg>必須承認</span></div>
+        <div class="row" style="padding: 4px; gap: 6px"><span class="grow"><b>backlog-scala</b> <code>lint 修正</code></span><span class="faint">Codex</span><span class="chip green">自動</span></div>
+      </div>
+      <div class="card" style="background: var(--red-soft); border-color: #5a2a26; font-size: 11px; gap: 4px">
+        <div class="row" style="color: var(--red); font-weight: 600"><svg class="i"><use href="#i-warn"/></svg>降格 · 02:20</div>
+        <div>Codex @ backlog-ai-agent <code>src/**</code>: 自動 → 要承認</div>
+        <div class="muted">理由: PR #806 が merge 後に CI を破壊し revert (a91c3e0)。昇格条件: CI 緑のまま merge 10 回</div>
+      </div>
+      <div class="faint" style="font-size: 11px; padding: 0 4px">昇格 01-10: Claude @ document <code>docs/**</code> (CI 緑のまま merge 24 回)</div>
+      <div class="grp"><svg class="i"><use href="#i-down"/></svg>Haiku 5.5 + Luna 5.6</div>
+      <div class="arena sel"><div class="nm">backlog-ai-agent<span class="pills"><span class="pill blue">812</span></span></div><div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">BLG_AI_INTEGRATION-747/h…</span><span class="add">+214</span><span class="del">-88</span></div></div>
+      <div class="arena"><div class="nm">backlog-scala<span class="pills"><span class="pill orange">815</span></span></div><div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">BLG_AI_INTEGRATION-747/m…</span><span class="add">+38</span><span class="del">-12</span></div></div>
+      <div class="grp"><svg class="i"><use href="#i-right"/></svg>document API (beta)</div>
+    </div>
+    <div class="newtask">+ New Task</div>
+    <div class="rl"><b>Rate limits</b><div class="row"><span>session</span><span>Resets in 4h 7m</span></div><div class="bar"><i style="width:22%"></i></div><div class="row"><span>week</span><span>Resets Thu 5:00</span></div><div class="bar"><i style="width:41%"></i></div></div>
+  </aside>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on">Review</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body" style="gap: 8px">
+      <div class="row tnum" style="gap: 14px"><span style="font-size: 15px; font-weight: 600">要人間レビュー 5</span><span class="muted" style="font-size: 13px">/ 自動検証済み 33</span><span class="faint" style="margin-left:auto; font-size: 11px">自動 merge 済み 12 (docs / lint) ▸</span></div>
+      <div class="card" style="border-color: #5a4320; gap: 4px">
+        <div class="row"><span class="hj" style="color: var(--orange)">テスト・設定・lockfile の変更</span><span class="faint" style="margin-left:auto; font-size: 10.5px">常に表示</span></div>
+        <div class="row" style="font-size: 11.5px"><svg class="i" style="color:var(--orange)"><use href="#i-warn"/></svg><span class="mono">stream-response.test.ts</span><span class="muted">assertion 1 件削除</span><span class="faint" style="margin-left:auto">#812</span></div>
+        <div class="row" style="font-size: 11.5px"><span style="width: 12px"></span><span class="mono">.github/workflows/ci.yml</span><span class="muted">timeout 10 → 30 分</span><span class="faint" style="margin-left:auto">#810</span></div>
+        <div class="row" style="font-size: 11.5px"><span style="width: 12px"></span><span class="mono">pnpm-lock.yaml</span><span class="add">+412</span><span class="del">-380</span><span class="faint" style="margin-left:auto">#808</span></div>
+      </div>
+      <div style="display: grid; gap: 4px">
+        <div class="row tnum" style="padding: 6px 8px; border-radius: 6px; background: var(--raise); gap: 8px"><span class="chip red" style="min-width: 34px; justify-content: center">91</span><span class="pill orange">815</span><span class="grow" style="font-weight: 600">drop legacy_tokens migration</span><span class="chip green">テスト</span><span class="chip green">型</span><span class="chip orange">Codex verify 1</span><span class="chip red"><svg class="i"><use href="#i-lock"/></svg>必須</span></div>
+        <div class="row tnum" style="padding: 6px 8px; border-radius: 6px; background: var(--accent-soft); gap: 8px; outline: 1px solid var(--accent)"><span class="chip orange" style="min-width: 34px; justify-content: center">74</span><span class="pill blue">812</span><span class="grow" style="font-weight: 600">429 で Retry-After を尊重</span><span class="chip green">テスト</span><span class="chip green">型</span><span class="chip green">Codex verify</span></div>
+        <div class="row tnum" style="padding: 6px 8px; border-radius: 6px; background: var(--raise); gap: 8px"><span class="chip orange" style="min-width: 34px; justify-content: center">58</span><span class="pill blue">810</span><span class="grow">CI の並列度を変更</span><span class="chip green">テスト</span><span class="chip">型 —</span><span class="chip">verify 未</span></div>
+        <div class="row tnum" style="padding: 6px 8px; border-radius: 6px; background: var(--raise); gap: 8px"><span class="chip" style="min-width: 34px; justify-content: center">41</span><span class="pill blue">808</span><span class="grow">@mastra/client-js 1.42 → 1.47</span><span class="chip green">テスト</span><span class="chip green">型</span><span class="chip green">Codex verify</span></div>
+        <div class="row tnum" style="padding: 6px 8px; border-radius: 6px; background: var(--raise); gap: 8px"><span class="chip" style="min-width: 34px; justify-content: center">36</span><span class="pill blue">804</span><span class="grow">usage 集計の N+1 を解消</span><span class="chip green">テスト</span><span class="chip green">型</span><span class="chip green">Codex verify</span></div>
+      </div>
+      <div class="row" style="font-size: 11px"><span class="muted">#812 · 既読 62% · 未読 3 hunk</span><span class="row faint" style="margin-left:auto; gap: 4px"><i style="display:inline-block;width:10px;height:10px;background:var(--accent);border-radius:2px"></i>既読<i style="display:inline-block;width:10px;height:10px;background:var(--orange);opacity:.35;border-radius:2px;margin-left:6px"></i>未読</span></div>
+      <div style="display: grid; grid-template-columns: 6px 1fr; gap: 6px">
+        <div style="display: grid; grid-template-rows: 2fr 1fr 2fr; border-radius: 3px; overflow: hidden"><i style="background:var(--accent)"></i><i style="background:var(--accent)"></i><i style="background:var(--orange);opacity:.35"></i></div>
+        <div class="diff" style="min-width: 0">
+          <div class="fh"><span class="mono">src/stream-response.ts</span><span class="chip green" style="margin-left:auto">見た 01:12</span></div>
+          <div class="l d"><span>113</span><span>-</span><span>    await sleep(backoff(attempt));</span></div>
+          <div class="l a"><span>113</span><span>+</span><span>    const wait = parseRetryAfter(res.headers.get("retry-after"));</span></div>
+          <div class="fh" style="background: #2a2214"><span class="mono">src/stream-response.ts:140–188</span><span class="chip orange" style="margin-left:auto">未読</span></div>
+          <div class="l a" style="opacity: .55"><span>148</span><span>+</span><span>  const seconds = Number(value);</span></div>
+          <div class="l a" style="opacity: .55"><span>150</span><span>+</span><span>  return Date.parse(value) - Date.now();</span></div>
+        </div>
+      </div>
+      <div class="row" style="gap: 8px; border-top: 1px solid var(--line-soft); padding-top: 8px; margin-top: auto"><span class="btn primary">見て承認</span><span class="btn warn"><svg class="i"><use href="#i-warn"/></svg>見ずに承認 (警告)</span><span class="faint" style="font-size: 11px">未読 3 hunk を含みます。承認記録に human_seen: 62% と残ります。</span></div>
+    </div>
+  </div>
+
+  <div class="pane" style="position: relative">
+    <div class="tabs"><div class="tab on"><span class="dot"></span>✳︎ Claude — backlog-ai-agent</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body">
+<div class="term"><span class="g">●</span> スキーマ変更に合わせて Prisma クライアントを再生成します。
+
+<span class="box"><span class="o">Bash command</span>
+
+  pnpm prisma generate
+
+Do you want to proceed?
+<span class="b">❯ 1. Yes</span>
+  2. Yes, and don't ask again
+  3. No (esc)</span></div>
+      <div class="row"><span class="chip orange" style="outline: 1px solid var(--orange)"><svg class="i"><use href="#i-shield"/></svg>許可待ち · Bash(pnpm prisma generate)</span></div>
+      <div class="card" style="background: var(--raise-2); border-color: var(--fg-faint); box-shadow: 0 10px 30px rgba(0,0,0,.5); gap: 8px; margin-top: -4px">
+        <div class="hj">今後の扱い</div>
+        <div style="display: grid; grid-template-columns: 70px 1fr; gap: 4px 8px; font-size: 11.5px">
+          <span class="faint">パターン</span><code style="justify-self: start">Bash(pnpm prisma generate*)</code>
+          <span class="faint">arena</span><span>backlog-ai-agent のみ</span>
+          <span class="faint">agent</span><span>Claude</span>
+          <span class="faint">期限</span><span>30 日 · 失敗 1 回で失効</span>
+        </div>
+        <div class="row" style="gap: 6px"><span class="btn">今回だけ許可</span><span class="btn primary">今後も許可 (このパターン, この arena)</span></div>
+        <div class="faint" style="font-size: 10.5px">Lease として記録し settings.json は書き換えません。同じパターンの過去実績: 12 回、失敗 0。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 5 Local Control Plane ============ -->
+<section class="win" data-screen="5" hidden style="--sw: 300px; --rw: 440px">
+  <aside class="side">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="seg"><span class="on">Repositories</span><span>Tasks</span></div>
+    <div class="side-scroll" style="gap: 6px">
+      <div class="card" style="background: transparent; gap: 5px">
+        <div class="row"><span class="hj">スロット</span><span class="tnum" style="margin-left:auto; font-size: 11.5px">実行中 3/4 · レート制限残 30%</span></div>
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px"><i style="height:6px;border-radius:2px;background:var(--green)"></i><i style="height:6px;border-radius:2px;background:var(--green)"></i><i style="height:6px;border-radius:2px;background:var(--green)"></i><i style="height:6px;border-radius:2px;background:var(--raise-2)"></i></div>
+        <div class="bar"><i style="width:30%;background:var(--orange)"></i></div>
+      </div>
+      <div style="font-size: 11px; display: grid; gap: 3px; padding: 0 4px">
+        <div class="hj">待ち行列 2</div>
+        <div class="row faint"><span class="bb">b</span>BLG_AI_INTEGRATION-749 · Codex<span style="margin-left:auto">slot 待ち</span></div>
+        <div class="row faint"><span class="bb">b</span>BLG_AI_INTEGRATION-663 review<span style="margin-left:auto">rate 待ち</span></div>
+      </div>
+      <div class="divider" style="padding-top: 4px">Arenas 5</div>
+      <div class="arena sel">
+        <div class="nm">backlog-ai-agent<span class="pills"><span class="pill">1</span><span class="pill white">1</span></span></div>
+        <div class="sub"><svg class="i"><use href="#i-laptop"/></svg><span class="grow">local · BLG_AI_INTEGRATION-747/h…</span></div>
+        <div class="row" style="gap: 6px; font-size: 10px" ><span class="faint mono" style="width: 70px">CPU 34%</span><div class="bar grow"><i style="width:34%;background:var(--green)"></i></div><span class="faint mono">2.1G</span></div>
+      </div>
+      <div class="arena">
+        <div class="nm">backlog-scala<span class="pills"><span class="pill orange">!</span></span></div>
+        <div class="sub"><svg class="i"><use href="#i-box"/></svg><span class="grow">container build-01/scala-2</span></div>
+        <div class="row" style="gap: 6px; font-size: 10px"><span class="faint mono" style="width: 70px">CPU 92%</span><div class="bar grow"><i style="width:92%;background:var(--red)"></i></div><span class="faint mono">7.8G</span></div>
+      </div>
+      <div class="arena">
+        <div class="nm">backlog-scala</div>
+        <div class="sub"><svg class="i"><use href="#i-box"/></svg><span class="grow">container build-01/scala-3</span></div>
+        <div class="row" style="gap: 6px; font-size: 10px"><span class="faint mono" style="width: 70px">CPU 51%</span><div class="bar grow"><i style="width:51%;background:var(--orange)"></i></div><span class="faint mono">5.2G</span></div>
+      </div>
+      <div class="arena">
+        <div class="nm">document</div>
+        <div class="sub"><svg class="i"><use href="#i-server"/></svg><span class="grow">ssh:build-01 · develop</span><span class="add">+62</span><span class="del">-60</span></div>
+        <div class="row" style="gap: 6px; font-size: 10px"><span class="faint mono" style="width: 70px">CPU 8%</span><div class="bar grow"><i style="width:8%;background:var(--green)"></i></div><span class="faint mono">0.6G</span></div>
+      </div>
+      <div class="arena">
+        <div class="nm">mastra</div>
+        <div class="sub"><svg class="i"><use href="#i-box"/></svg><span class="grow">container build-01/node-1</span></div>
+        <div class="row" style="gap: 6px; font-size: 10px"><span class="faint mono" style="width: 70px">CPU 3%</span><div class="bar grow"><i style="width:3%;background:var(--green)"></i></div><span class="faint mono">0.4G</span></div>
+      </div>
+      <div class="faint" style="font-size: 11px; padding: 4px">+ リモート端末を arena に追加</div>
+    </div>
+    <div class="rl"><b>Rate limits</b><div class="row"><span>session</span><span>Resets in 1h 52m</span></div><div class="bar"><i style="width:70%;background:var(--orange)"></i></div><div class="row"><span>week</span><span>Resets Thu 5:00</span></div><div class="bar"><i style="width:48%"></i></div></div>
+  </aside>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on">監査ログ</div><div class="tab">権限</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body">
+      <div class="card" style="font-size: 11.5px; gap: 4px">
+        <div class="row"><span class="hj">権限</span><span class="faint" style="margin-left:auto; font-size: 11px">送信元は session id で検証</span></div>
+        <div class="row" style="gap: 6px"><span class="chip blue">reviewer</span><svg class="i"><use href="#i-arrow"/></svg><span class="chip">implementer</span><span class="muted">send-message, task info を許可 · 同一 task 内のみ</span></div>
+        <div class="row" style="gap: 6px"><span class="chip">document</span><svg class="i"><use href="#i-arrow"/></svg><span class="chip">backlog-scala</span><span class="muted">arena 越境は拒否</span></div>
+      </div>
+      <div class="row" style="gap: 6px"><span class="chip blue">すべて 128</span><span class="chip line">拒否 3</span><span class="chip line">arena 越境 2</span><span class="chip line">重複 1</span></div>
+      <div style="overflow-x: auto; border: 1px solid var(--line-soft); border-radius: 6px">
+        <table style="width: 100%; border-collapse: collapse; font-size: 11.5px" class="tnum">
+          <thead><tr style="text-align: left; color: var(--fg-faint); background: var(--raise)"><th style="padding: 6px 10px; font-weight: 600">時刻</th><th style="font-weight: 600">送信元</th><th style="font-weight: 600">宛先</th><th style="font-weight: 600">動詞</th><th style="font-weight: 600; padding-right: 10px">結果</th></tr></thead>
+          <tbody class="mono" style="font-size: 10.5px">
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">09:14:02</td><td>reviewer (Codex)</td><td>backlog-ai-agent/Claude</td><td>send-message</td><td><span class="chip green">配送</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">09:13:47</td><td>reviewer (Codex)</td><td>agentium</td><td>tab list</td><td><span class="chip green">ok</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">09:13:45</td><td>reviewer (Codex)</td><td>agentium</td><td>task info</td><td><span class="chip green">ok</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft); background: var(--red-soft)"><td style="padding: 5px 10px">09:08:31</td><td>document/Claude</td><td>backlog-scala/Codex</td><td>send-message</td><td><span class="chip red">拒否 · 越境</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">09:02:10</td><td>backlog-ai-agent/Claude</td><td>reviewer (Codex)</td><td>send-message</td><td><span class="chip">保留 · busy</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">09:02:10</td><td>backlog-ai-agent/Claude</td><td>reviewer (Codex)</td><td>send-message</td><td><span class="chip">重複 · 冪等キー</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">08:55:44</td><td>scala-2/Claude</td><td>agentium</td><td>port claim 3000</td><td><span class="chip orange">競合</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">08:41:19</td><td>unknown pid 81213</td><td>backlog-ai-agent/Claude</td><td>send-message</td><td><span class="chip red">拒否 · 未検証</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">08:30:02</td><td>scheduler</td><td>scala-3/Claude</td><td>run start</td><td><span class="chip green">slot 3/4</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">08:12:55</td><td>document/Claude</td><td>agentium</td><td>task info</td><td><span class="chip green">ok</span></td></tr>
+            <tr style="border-top: 1px solid var(--line-soft)"><td style="padding: 5px 10px">07:58:20</td><td>mastra/Codex</td><td>agentium</td><td>tab send-message</td><td><span class="chip red">拒否 · 権限なし</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="pane">
+    <div class="tabs"><div class="tab on"><span class="dot"></span>資源</div><div class="tab"><svg class="i"><use href="#i-term"/></svg>zsh</div><div class="tabs-r"><svg class="i"><use href="#i-plus"/></svg><svg class="i"><use href="#i-split"/></svg><svg class="i"><use href="#i-expand"/></svg></div></div>
+    <div class="body">
+      <div class="card" style="border-color: #5a2a26; gap: 4px">
+        <div class="row" style="color: var(--red); font-weight: 600"><svg class="i"><use href="#i-warn"/></svg>port 3000 を 2 つのエージェントが取り合い</div>
+        <div class="muted" style="font-size: 11.5px">arena backlog-scala · scala-2/Claude (pid 4410, sbt run) と scala-3/Claude (pid 5127, sbt run)</div>
+        <div class="row" style="gap: 6px"><span class="btn">scala-3 に 3001 を割り当て</span><span class="btn">pid 5127 を停止</span></div>
+      </div>
+      <div class="card" style="border-color: #5a4320; gap: 4px">
+        <div class="row" style="color: var(--orange); font-weight: 600"><svg class="i"><use href="#i-lock"/></svg><code>target/</code> ロック待ち 4m12s</div>
+        <div class="mono faint">Blocking waiting for file lock on build directory</div>
+        <div class="muted" style="font-size: 11.5px">zed · cargo test が cargo clippy (別タブ) の終了待ち</div>
+      </div>
+      <div class="card" style="gap: 4px">
+        <div class="row" style="font-weight: 600"><svg class="i"><use href="#i-box"/></svg><code>.pnpm-store</code> 18.4 GB · git 未 ignore</div>
+        <div class="muted" style="font-size: 11.5px">mastra · 未追跡 214,033 ファイルで diff 更新が遅延 · build-01 ディスク残 9%</div>
+      </div>
+      <div class="term" style="background: var(--win); border: 1px solid var(--line-soft); border-radius: 6px; padding: 8px 10px; font-size: 10.5px; line-height: 1.5"><span class="g">reviewer@build-01</span> <span class="dim">❯</span> agentium tab list --json --v 2
+{
+  <span class="b">"version"</span>: 2,
+  <span class="b">"slots"</span>: { "running": 3, "max": 4, "rate_remaining": 0.30 },
+  <span class="b">"tabs"</span>: [
+    { "session": "7f3a9c", "arena": "backlog-ai-agent",
+      "location": "local", "agent": "claude",
+      "model": "opus-5.5", "state": "waiting_permission" },
+    { "session": "c7d9e1", "arena": "backlog-scala",
+      "location": "container:build-01/scala-2",
+      "agent": "claude", "state": "running",
+      "ports": [3000], "cpu": 0.92 },
+    { "session": "e02b44", "arena": "document",
+      "location": "ssh:build-01", "agent": "codex",
+      "state": "idle" }
+  ]
+}
+<span class="dim">exit 0</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 6 Todo list ============ -->
+<style>
+.trow { display: grid; gap: 3px; padding: 6px 8px; border-radius: 6px; background: var(--raise); }
+.trow.sel { background: #173330; outline: 1px solid var(--teal); }
+.trow .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trow .s { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--fg-faint); white-space: nowrap; overflow: hidden; }
+.trow .s .grow { overflow: hidden; text-overflow: ellipsis; }
+.prog { display: inline-flex; gap: 2px; }
+.prog i { width: 8px; height: 4px; border-radius: 1px; background: var(--raise-2); }
+.prog i.on { background: var(--teal); }
+.tgrp { display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; color: var(--fg-dim); margin-top: 4px; }
+.tgrp .hint { margin-left: auto; font-weight: 400; font-size: 10.5px; color: var(--fg-faint); }
+.titem { display: grid; grid-template-columns: 22px 1fr auto; gap: 3px 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--raise); align-items: start; }
+.titem.picked { border-color: var(--teal); background: #142a28; }
+.titem.skipped { opacity: .55; }
+.titem .k { grid-row: span 2; font-family: var(--mono); font-size: 11px; width: 20px; height: 20px; border-radius: 4px; display: grid; place-items: center; background: var(--win); border: 1px solid var(--line); color: var(--fg-dim); }
+.titem.picked .k { border-color: var(--teal); color: var(--teal); }
+.titem .tl { font-weight: 600; font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
+.titem .td { grid-column: 2; font-size: 11.5px; color: var(--fg-dim); line-height: 1.55; }
+.titem .acts { grid-row: span 2; display: flex; gap: 4px; }
+.titem .note { grid-column: 2 / span 2; border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-size: 11px; color: var(--fg); background: var(--win); }
+.tog { font-size: 10.5px; padding: 2px 8px; border-radius: 5px; border: 1px solid var(--line); background: var(--raise-2); color: var(--fg-dim); white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.tog.on { border-color: var(--teal); background: var(--teal); color: #06201d; font-weight: 600; }
+.tog.off { border-color: #6b2c27; color: var(--red); background: var(--red-soft); font-weight: 600; }
+.chip.teal { background: #173330; color: var(--teal); }
+.outbox { font-family: var(--mono); font-size: 10.5px; line-height: 1.6; color: var(--fg-dim); background: var(--win); border: 1px solid var(--line-soft); border-radius: 6px; padding: 7px 10px; white-space: pre-wrap; }
+.outbox b { color: var(--teal); font-weight: 600; }
+</style>
+<style>
+.task-inbox { --sw: 300px; --rw: 300px; }
+.task-inbox button, .task-inbox textarea { font: inherit; }
+.task-inbox button { cursor: pointer; text-align: left; }
+.task-inbox button:focus-visible, .task-inbox textarea:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+.task-inbox button:disabled { cursor: default; opacity: .45; }
+.task-inbox .body, .task-inbox .side-scroll { overflow-y: auto; }
+.task-inbox .body { padding: 18px; gap: 14px; font-size: 13px; }
+.task-inbox .side-scroll { padding: 12px; gap: 10px; }
+.task-tree-group { padding: 8px 0 18px; }
+.task-tree-title { font-size: 16px; font-weight: 650; margin: 0 0 12px; }
+.task-tree-issue { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--fg-dim); margin-bottom: 16px; }
+.task-tree-repo { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; margin-bottom: 9px; }
+.task-tree-meta { display:flex; gap:6px; align-items:center; color:var(--fg-dim); font-size:12px; margin:8px 0; }
+.agent-row { width:100%; display:grid; grid-template-columns:16px minmax(0,1fr) auto 58px; align-items:center; gap:7px; background:transparent; color:var(--fg); border:1px solid transparent; border-radius:5px; padding:8px 6px; }
+.agent-row:hover { background:var(--raise); }
+.agent-row[aria-current="true"] { background:var(--accent-soft); border-color:#355979; }
+.agent-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.agent-state { font-size:12px; text-align:right; color:var(--fg-dim); }
+.agent-state.running { color:var(--accent); }
+.agent-state.permission { color:var(--orange); }
+.agent-badge { background:#55b6ab; color:#071c19; border-radius:12px; min-width:23px; text-align:center; padding:1px 6px; font-size:11px; font-weight:650; }
+.repo-badge { margin-left:auto; background:var(--raise-2); color:var(--fg-dim); border-radius:10px; font-size:11px; padding:1px 7px; }
+.agent-tree { margin-left:14px; }
+.task-inbox .context-label { color: var(--teal); font-size: 12px; font-weight: 600; }
+.task-inbox h2 { margin: 0; font-size: 20px; line-height: 1.4; }
+.task-inbox h3 { margin: 0 0 7px; font-size: 13px; }
+.task-inbox p { margin: 0; line-height: 1.65; }
+.task-context { border-left: 2px solid var(--teal); padding-left: 12px; display: grid; gap: 6px; }
+.task-result { background: var(--raise); border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: grid; gap: 7px; }
+.task-item { padding: 10px 0; border-bottom: 1px solid var(--line-soft); display: grid; gap: 6px; }
+.task-item .row { align-items: flex-start; }
+.task-item small { color: var(--fg-dim); font-size: 12px; line-height: 1.5; }
+.task-inbox .tog { font-size: 12px; padding: 4px 8px; }
+.task-inbox textarea { width: 100%; resize: vertical; min-height: 54px; padding: 9px; color: var(--fg); background: var(--win); border: 1px solid var(--line); border-radius: 6px; }
+.task-reply { margin-top: auto; border-top: 1px solid var(--line); padding-top: 12px; display: grid; gap: 8px; }
+.task-inbox .tabs { height: 38px; }
+.task-inbox button.tab { background: transparent; border-top: 0; border-left: 0; border-bottom: 0; }
+.task-inbox button.tab.on { color: var(--teal); background: var(--pane); }
+.task-evidence { white-space: pre-wrap; line-height: 1.8; }
+.task-history { border-left: 2px solid var(--teal); padding: 0 0 14px 12px; margin-bottom: 12px; }
+</style>
+<style>
+.task-inbox .pane { min-width:0; }
+.task-inbox .task-tree-title { font-size:13px; margin:0; }
+.task-inbox .task-tree-group { border-bottom:1px solid var(--line-soft); padding:10px 0; }
+.task-inbox .task-tree-issue { margin:8px 0; }
+.task-inbox .task-tree-meta { margin:6px 0; }
+.task-inbox .pill { border:0; cursor:pointer; }
+.task-inbox .pill.teal { background:var(--teal); color:#06201d; }
+.task-inbox .pill.red { background:var(--red); }
+.task-inbox .task-select { width:100%; color:var(--fg); border:0; background:transparent; padding:6px; border-radius:5px; }
+.task-inbox .task-select[aria-current=true] { background:var(--raise-2); }
+.overview-agent { border:1px solid var(--line); border-radius:9px; padding:14px; display:grid; gap:12px; }
+.overview-agent.selected { border-color:var(--teal); }
+.overview-agent .agent-context { display:grid; grid-template-columns:64px 1fr; gap:8px; font-size:12px; line-height:1.6; }
+.overview-agent .task-reply { margin-top:0; }
+.overview-agent summary { cursor:pointer; font-size:12px; color:var(--teal); }
+.overview-agent .task-item { padding:9px 0; }
+.overview-agent .task-item .row { flex-wrap:wrap; }
+.overview-agent .task-item b { flex-basis:100%; }
+.overview-agent textarea { min-height:45px; }
+.overview-pr { padding:12px; border:1px solid var(--line); border-radius:8px; display:grid; gap:8px; }
+.overview-add { position:relative; display:flex; }
+.overview-menu { position:absolute; right:0; top:38px; width:200px; padding:6px; background:var(--raise-2); border:1px solid var(--line); border-radius:6px; z-index:5; box-shadow:0 8px 24px #0008; }
+.overview-menu button { width:100%; padding:9px; color:var(--fg); border:0; background:transparent; }
+.coordinator { border:1px dashed var(--line); padding:12px; border-radius:8px; display:grid; gap:8px; color:var(--fg-dim); }
+</style>
+<section class="win task-inbox" data-screen="6" hidden>
+  <aside class="side">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="seg"><span>Repositories</span><span class="on">Tasks</span></div>
+    <div class="side-scroll" id="task-list"></div>
+    <div class="rl"><span>緑：実行中　青：完了　橙：許可待ち<br>赤：失敗　白：プロセス　青緑：Todo合計</span><button class="btn" id="reset-inbox">モックを最初から試す</button></div>
+  </aside>
+  <div class="pane">
+    <div class="tabs" id="overview-tabs"></div>
+    <div class="body" id="task-detail"></div>
+  </div>
+  <div class="pane">
+    <div style="padding:12px 14px;border-bottom:1px solid var(--line)"><div class="context-label">Task Overview · 関連資料</div><div id="evidence-task" style="margin-top:5px"></div></div>
+    <div class="tabs" aria-label="エージェントの資料"><button class="tab on" data-evidence="changes">変更</button><button class="tab" data-evidence="conversation">会話</button><button class="tab" data-evidence="history">返信履歴</button></div>
+    <div class="body" id="task-evidence"></div>
+  </div>
+</section>
+
+</div>
+
+<section class="notes" data-note="2" hidden>
+  <h2><code>agentium why</code> と判断の保存先 — 実現可能性メモ <span class="faint" style="font-weight: 400; font-size: 11.5px">2026-10-12 · 実測は Claude Code 2.1.296 / Codex 0.162.1</span></h2>
+  <p>結論: 上の <code>why</code> 出力は、blame と commit trailer と PR 説明文の照合だけで出せます (LLM 不使用はそのまま成立)。唯一の弱点は「判断を書く側」がエージェントで、強制手段が無いことです。hunk 単位の追跡 (後続編集・rebase で行がずれる問題) は blame に任せられるので、Decision Log に寄せたことで最も重い部品が不要になりました。</p>
+
+  <div class="card" style="gap: 6px">
+    <h3>各行の出所</h3>
+    <table>
+      <thead><tr><th>行</th><th>出所</th><th>状態</th></tr></thead>
+      <tbody>
+        <tr><td>blame 3f4e21a · 01-14 02:58 · Claude Fable 5.1</td><td><code>git blame -w -M -C</code> で commit と時刻。モデル名は Claude Code が既定で付ける <code>Co-Authored-By: Claude …</code> trailer から取る</td><td><span class="chip green">仕様どおり</span> Codex が同種の trailer を付けるかは未確認</td></tr>
+        <tr><td>trailer Decision: D-747-2 · Refs: …</td><td><code>git interpret-trailers --parse</code>。書くのはエージェント (CLAUDE.md / AGENTS.md の指示)。Agentium は PostToolUse で <code>git commit</code> を観測できるので (実測: payload に command と cwd)、trailer の無い commit に「記録なし」チップを出せる</td><td><span class="chip orange">要運用</span> 強制はできず、「記録なし」フォールバックが前提</td></tr>
+        <tr><td>PR #812 … merged 01-14 09:40</td><td>pr.json の session ↔ PR (既存) と bee / gh の PR 情報</td><td><span class="chip green">既存</span></td></tr>
+        <tr><td>D-747-2 の本文 (背景 / 決定 / 理由 / 捨てた案 / 影響)</td><td>PR 説明文の <code>## Decisions</code> の下の <code>### D-747-2 題名</code> 見出しと、<code>- 理由:</code> などの固定ラベルの子項目を parse (ミニ ADR 記法、右ペインの例)。決定と理由が欠けた項目は PR 作成時の check が「理由なし」と表示</td><td><span class="chip green">記法決定</span> 2026-10-15</td></tr>
+        <tr><td>関連 D-747-3 (同じ PR)</td><td>同じ説明文の他の項目</td><td><span class="chip green">自明</span></td></tr>
+        <tr><td>人の判断 D-747-4 / 5</td><td>Inbox の回答を Agentium が Backlog の課題コメントに投稿し、コメント id を保持する</td><td><span class="chip blue">方向 1 が前提</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card" style="gap: 6px">
+    <h3>判断はどこに保存するか</h3>
+    <ul>
+      <li><b>正は 3 か所で、どれも Agentium 無しで読める。</b> commit trailer (ポインタだけ)、PR 説明文の <code>## Decisions</code> (エージェントの判断)、Backlog 課題コメント (人の判断と、課題を閉じるときの一覧)。</li>
+      <li><b>Agentium のローカル (<code>data_dir</code>) に置くのは 3 つだけ。</b> ID の採番、Backlog に投稿する前の outbox、bee / gh の ETag キャッシュ。すべて上の 3 か所から再構築できる。</li>
+      <li><b>ID の採番だけは中央が要る。</b> 2 リポジトリと並列エージェントが同時に D-747-2 を取り得るので、<code>agentium decision new --issue 747</code> (方向 5 の CLI) で採番するか、ID に短い suffix を付ける。</li>
+      <li><b>hunk 単位の台帳は任意の拡張。</b> proof (どのコマンドで検証したか) を足したくなったときだけ、hook の実データを使う。Edit の PostToolUse には hunk ヘッダそのもの (<code>structuredPatch</code>) と <code>prompt_id</code> / <code>tool_use_id</code> が入り、失敗コマンドは PostToolUseFailure の <code>error: "Exit code 3\n…"</code> で exit code が取れる (実測)。transcript は <code>cleanupPeriodDays</code> (既定 30 日) で消えるので参照しない。</li>
+    </ul>
+  </div>
+
+  <div class="card" style="gap: 6px">
+    <h3>落とし穴</h3>
+    <ul>
+      <li><b>squash merge。</b> GitHub は既定で全 commit メッセージを連結するので trailer は残る。Backlog の squash 挙動は未確認。消えても blame → squash commit → PR 説明文のフォールバックで引ける。</li>
+      <li><b>フォーマッタの commit が blame を奪う。</b> <code>git blame -w -M -C</code> と <code>--ignore-revs-file</code> で逃がす。</li>
+      <li><b>判断ごとに commit を分ける運用が崩れると、1 commit に判断が 2 つ以上乗る。</b> trailer は複数行書けるので <code>Decision:</code> を複数付ける形を許す。</li>
+      <li><b>Codex は hooks が既定で有効になった (公式 docs)。</b> ただし非 managed の command hook は <code>/hooks</code> で信頼する手順が要り、repo 配下の hooks.json だけ置いた <code>codex exec</code> は 180 秒経っても動かなかった。payload の中身は未検証。</li>
+    </ul>
+  </div>
+</section>
+
+<section class="notes" data-note="6" hidden>
+<h2>タスクを作業の入口にする</h2>
+<p>左ペインはタスク・Arenaの所属と集約状態を示します。エージェントの行やTodo本文は置かず、従来の実行中・完了・許可待ち・失敗・プロセスのバッジに、未処理Todoの合計を追加します。</p>
+<div class="card"><h3>確認できる操作</h3><ul>
+<li>タブバーの＋からTask Overviewを開く。閉じた後も同じ入口から再表示できます。</li>
+<li>Todo合計をクリックすると、対象タスクのOverviewを開きます。独立したTodoタブはありません。</li>
+<li>OverviewではArenaごとに各エージェントの依頼・結果・Todoを表示します。返信先と内容を確認して送信すると、該当エージェントの残件と左ペインの合計が減ります。</li>
+<li>変更・会話・返信履歴、PRの確認と、元のエージェントタブへの移動を試せます。操作はすべてモック内だけで反映されます。</li>
+<li>タスクやタブを切り替えても返信の下書きを保持します。コーディネーター欄は将来案で、送信できません。</li>
+</ul></div>
+</section>
+
+<script>
+(function () {
+  var stage = document.getElementById("stage");
+  var wins = Array.prototype.slice.call(document.querySelectorAll(".win"));
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".switcher button"));
+  var caps = Array.prototype.slice.call(document.querySelectorAll(".caption"));
+  var notes = Array.prototype.slice.call(document.querySelectorAll(".notes"));
+  function fit() {
+    var scale = Math.min(1, stage.clientWidth / 1400);
+    wins.forEach(function (w) { w.style.transform = "scale(" + scale + ")"; });
+    stage.style.height = (900 * scale + 2) + "px";
+  }
+  function show(n) {
+    n = String(n);
+    wins.forEach(function (w) { w.hidden = w.dataset.screen !== n; });
+    caps.forEach(function (c) { c.hidden = c.dataset.cap !== n; });
+    notes.forEach(function (c) { c.hidden = c.dataset.note !== n; });
+    tabs.forEach(function (b) { b.setAttribute("aria-selected", b.dataset.s === n ? "true" : "false"); });
+    try { localStorage.setItem("agentium-mock-screen", n); } catch (e) {}
+  }
+  tabs.forEach(function (b) { b.addEventListener("click", function () { show(b.dataset.s); }); });
+  document.addEventListener("keydown", function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    if (/^[1-6]$/.test(e.key)) show(e.key);
+  });
+  var saved = null;
+  try { saved = localStorage.getItem("agentium-mock-screen"); } catch (e) {}
+  show(["#tasks", "#inbox", "#overview"].includes(location.hash) ? "6" : (/^[1-6]$/.test(saved || "") ? saved : "6"));
+  fit();
+  window.addEventListener("resize", fit);
+})();
+</script>
+
+
+
+<script>
+(function () {
+  const root = document.querySelector('.task-inbox');
+  const initial = [
+    {id:'failed', title:'Task Overviewの失敗状態の表示を追加', repo:'zed', branch:'experiment/codex-acp-tabs', agent:'Claude', time:'09:12', request:'エラーで停止したエージェントをTask Overviewから見つけ、再開や打ち切りを選べるようにする。', result:'失敗状態の表示を実装。clippyとテストは成功。実際の画面での表示確認は未実施です。', changes:'今回の変更 · a1b2c3d\n\n・停止したエージェントを失敗状態の表示に表示\n・Runの失敗とPRのCI失敗を区別\n・再開／打ち切りの操作を追加\n\n検証\n✓ clippy 成功\n✓ 既存テスト 成功\n○ 画面表示は未確認', conversation:'あなたの依頼\nエラーで止まったタブが見つけにくいので、Task Overviewに失敗状態の表示を追加してください。\n\nClaude · 09:12\n実装とテストが完了しました。表示の確認と設定変更をお願いします。追加テストとPR作成は次の作業として提案しています。', items:[
+      {id:'visual',type:'human',title:'失敗状態の表示を画面で確認',description:'エラーで停止したタブが表示され、再開と打ち切りを選べるか確認する。'},
+      {id:'hook',type:'human',title:'許可待ちのタイムアウト設定を変更',description:'~/.claude/settings.json の PermissionRequest hook を86400秒にする。'},
+      {id:'tests',type:'agent',title:'GPUIテストを追加',description:'再起動後の紐づけと、完了・確認済み・期限切れの状態を検証する。'},
+      {id:'acp',type:'agent',title:'ACPの許可要求にTask Overviewから回答',description:'現在は元のタブを開く操作まで。Task Overview内で回答できるようにする。'},
+      {id:'pr',type:'agent',title:'pushしてPRを作成',description:'未pushのコミットを送信し、レビューを依頼する。外部への操作を含みます。'}]},
+    {id:'billing', title:'月次集計の締め日をJSTに統一', repo:'backlog-scala', branch:'BLG_AI_INTEGRATION-747/monthly', agent:'Codex', time:'08:40', request:'月次の利用量を請求書と一致させるため、JST 0:00を月の境界にする。', result:'集計クエリを修正し、単体テストは成功。請求書のサンプルとの突き合わせが残っています。', changes:'今回の変更 · BLG_AI_INTEGRATION-747\n\nBillingAggregator.scala\n・JSTの月初をUTCへ変換して検索\n・翌月の月初を終了境界として使用\n\n検証\n✓ 単体テスト 成功\n○ 請求書サンプルとの照合は未実施', conversation:'あなたの判断\n請求書の締めがJSTのため、月次集計もJST 0:00で区切ってください。\n\nCodex · 08:40\n修正と単体テストが完了しました。請求書との照合をお願いします。月末の境界値テストを追加できます。', items:[
+      {id:'invoice',type:'human',title:'請求書サンプルと集計値を照合',description:'前月と当月の境界にある利用量を確認する。'},
+      {id:'boundary',type:'agent',title:'月末の境界値テストを追加',description:'UTCでは前月、JSTでは翌月になるデータを検証する。'}]},
+    {id:'document',title:'document APIの権限テストを追加',repo:'document',branch:'BLG_AI_INTEGRATION-663/authz',agent:'Codex',time:'09:18',request:'閲覧権限のないユーザーに403が返ることを検証する。',result:'権限別のテストを実行中。現在、あなたへの確認事項はありません。',running:true,changes:'作業中\n\n権限なし・閲覧可のケースを追加しています。\n検証結果はまだ届いていません。',conversation:'あなたの依頼\n閲覧権限のテストを追加してください。\n\nCodex · 09:18\nテストを追加して実行しています。',items:[]}
+  ];
+  initial[0].group='status'; initial[0].label='失敗状態の表示の実装';
+  initial[0].title='エージェントの状態表示を改善';
+  initial[1].group='billing'; initial[1].label='月次集計の実装';
+  initial[2].group='document'; initial[2].label='権限テストの追加';
+  initial.push({id:'review',group:'status',label:'状態遷移のレビュー',title:'エージェントの状態表示を改善',repo:'zed',branch:'experiment/codex-acp-tabs',agent:'Codex',running:true,time:'09:20',request:'実装担当の変更を確認し、状態遷移や再起動時の不整合を調べる。',result:'状態遷移をレビュー中です。表示順について確認をお願いします。',changes:'レビュー中\n\n実装担当の変更を確認しています。最終結果は未提出です。',conversation:'Codex · 09:20\n再起動時の状態復元を確認しています。表示順の意図も確認してください。',items:[{id:'order',type:'human',title:'状態の表示順を確認',description:'許可待ち・失敗・完了の優先順を確認する。'}]});
+  initial.push({id:'verify',group:'status',label:'動作検証',title:'エージェントの状態表示を改善',repo:'zed',branch:'experiment/codex-acp-tabs',agent:'Claude',permission:true,time:'09:22',request:'アプリを起動して、エージェントの状態表示を検証する。',result:'アプリを起動する許可を待っています。画面検証はまだ実施していません。',changes:'検証前\n\nアプリの起動待ちです。',conversation:'Claude · 09:22\n画面の検証のためアプリを起動してよいですか。',items:[]});
+  const groups=[{id:'status',title:'エージェントの状態表示を改善',issue:'Agentium · 状態表示',repo:'zed',branch:'experiment/codex-acp-tabs',arena:'agentium',pr:'#123'},{id:'document',title:'documentの実装',issue:'BLG_AI_INTEGRATION-663',repo:'document',branch:'develop',arena:'authz',pr:'#816'},{id:'billing',title:'月次集計の締め日をJSTに統一',issue:'BLG_AI_INTEGRATION-747',repo:'backlog-scala',branch:'monthly',arena:'billing',pr:'#815'}];
+  let tasks, selected, groupId='status', evidence='changes', activeTab='overview', overviewOpen=true, menuOpen=false;
+  const escape = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const task = () => tasks.find(t => t.id === selected);
+  const pending = t => t.items.filter(i => !i.status);
+  const group = () => groups.find(g=>g.id===groupId);
+  const agents = () => tasks.filter(t=>t.group===groupId);
+  const state = t => t.permission?'許可待ち':t.failed?'失敗':t.running?'実行中':'完了';
+  function reset(){tasks=JSON.parse(JSON.stringify(initial));tasks.forEach(t=>{t.draft={};t.note='';t.history=[];});selected='failed';groupId='status';evidence='changes';activeTab='overview';overviewOpen=true;menuOpen=false;render();}
+  function openOverview(id){groupId=id;selected=tasks.find(t=>t.group===id).id;overviewOpen=true;activeTab='overview';menuOpen=false;render();}
+  function renderList(){
+    root.querySelector('#task-list').innerHTML=groups.map(g=>{
+      const members=tasks.filter(t=>t.group===g.id), count=members.reduce((sum,t)=>sum+pending(t).length,0);
+      const badge=(count,color,label)=>count?`<button class="pill ${color}" data-badge="${g.id}" data-state="${label}" title="${label} ${count}" aria-label="${escape(g.title)}：${label} ${count}">${count}</button>`:'';
+      return `<section class="task-tree-group"><button class="task-select" data-group="${g.id}" aria-current="${g.id===groupId}"><div class="task-tree-title">${escape(g.title)}</div></button><div class="task-tree-issue"><span class="bb">b</span>${escape(g.issue)}<span style="margin-left:auto">処理中</span></div><div class="arena ${g.id===groupId?'sel':''}"><div class="nm">${escape(g.repo)}<span class="pills">${badge(members.filter(t=>t.running).length,'','実行中')}${badge(members.filter(t=>!t.running&&!t.permission&&!t.failed).length,'blue','完了')}${badge(members.filter(t=>t.permission).length,'orange','許可待ち')}${badge(members.filter(t=>t.failed).length,'red','失敗')}${badge(g.id==='status'?1:0,'white','プロセス')}${count?`<button class="pill teal" data-overview="${g.id}" title="Todo合計 ${count} · Task Overviewを開く" aria-label="Todo合計 ${count}">${count}</button>`:''}</span></div><div class="sub"><svg class="i"><use href="#i-branch"/></svg><span class="grow">${escape(g.branch)}</span></div><div class="sub"><svg class="i"><use href="#i-folder"/></svg><span class="grow">${escape(g.arena)}</span><span style="color:var(--green)">${g.pr}</span></div></div></section>`;
+    }).join('');
+  }
+  function renderTabs(){root.querySelector('#overview-tabs').innerHTML=`<button class="tab ${activeTab==='terminal'?'on':''}" data-tab="terminal">${escape(task().agent)} · ${escape(task().label)}</button>${overviewOpen?`<button class="tab ${activeTab==='overview'?'on':''}" data-tab="overview">Task Overview</button><button class="tab" id="close-overview" aria-label="Task Overviewを閉じる">×</button>`:''}<div class="tabs-r"><div class="overview-add"><button class="btn" id="add-tab" aria-label="タブを追加" aria-expanded="${menuOpen}">＋</button>${menuOpen?'<div class="overview-menu"><button id="add-overview">Task Overview</button></div>':''}</div></div>`;}
+  function itemMarkup(t){return pending(t).map(i=>`<div class="task-item"><div class="row"><b class="grow">${escape(i.title)}</b><span class="chip line">${i.type==='human'?'あなたの作業':'提案'}</span>${(i.type==='human'?[['done','完了を報告']]:[['go','依頼する'],['skip','見送る']]).map(([choice,label])=>`<button class="tog ${t.draft[i.id]===choice?'on':''}" data-agent="${t.id}" data-item="${i.id}" data-choice="${choice}" aria-pressed="${t.draft[i.id]===choice}">${label}</button>`).join('')}</div><small>${escape(i.description)}</small></div>`).join('')||'<p class="muted">未処理のTodoはありません。</p>';}
+  function render(){
+    renderList();renderTabs();const g=group();
+    if(activeTab==='terminal'){
+      root.querySelector('#task-detail').innerHTML=`<span class="context-label">${escape(g.title)} / ${escape(g.arena)}</span><h2>${escape(task().agent)} · ${escape(task().label)}</h2><div class="term">${escape(task().conversation)}</div><div class="task-result"><p>元のエージェントタブ · モック</p><p class="muted">タブバーの＋からTask Overviewを開けます。</p></div>`;
+    }else{
+      root.querySelector('#task-detail').innerHTML=`<div class="row"><span class="context-label grow">Task Overview</span><span class="chip teal">Todo ${agents().reduce((sum,t)=>sum+pending(t).length,0)}件</span></div><h2>${escape(g.title)}</h2><p class="muted">${escape(g.issue)} · ${agents().length}エージェント</p><div class="overview-pr"><div class="row"><h3 class="grow">Pull requests</h3><span class="chip green">CI 成功</span></div><button class="btn" id="view-pr">${g.pr} · ${escape(g.title)} ↗</button><small class="muted">${escape(g.repo)} · レビュー待ち · +214 −88</small></div><div class="row"><h3 class="grow">${escape(g.arena)} <span class="muted">/ ${escape(g.repo)}</span></h3><span class="muted">${escape(g.branch)}</span></div>${agents().map(t=>`<article class="overview-agent ${t.id===selected?'selected':''}" data-card="${t.id}"><div class="row"><b class="grow">${t.agent==='Claude'?'✳':'◇'} ${escape(t.label)}</b><span class="chip ${t.permission?'orange':t.running?'green':'blue'}">${state(t)}</span><button class="btn" data-terminal="${t.id}" title="元のエージェントタブを開く">${t.agent} ↗</button></div><div class="agent-context"><span class="muted">依頼</span><span>${escape(t.request)}</span><span class="muted">結果</span><span>${escape(t.result)}</span></div>${t.permission?`<div class="row"><button class="btn primary" data-allow="${t.id}">今回の起動を許可</button><button class="btn" data-deny="${t.id}">拒否</button></div>`:''}<div class="row"><button class="btn" data-agent="${t.id}" data-evidence="changes">変更</button><button class="btn" data-agent="${t.id}" data-evidence="conversation">会話</button><button class="btn" data-agent="${t.id}" data-evidence="history">返信履歴 ${t.history.length}</button><span class="grow"></span><span class="agent-badge">Todo ${pending(t).length}</span></div><details class="agent-todos" ${Object.keys(t.draft).length||t.note?'open':''}><summary>Todo ${pending(t).length}件を確認・返信</summary><div>${itemMarkup(t)}</div><details ${Object.keys(t.draft).length||t.note?'open':''}><summary>選択したTodoを返信・追加の指示</summary><div class="task-reply"><label for="note-${t.id}">返信先：${escape(t.label)} · ${t.agent}</label><textarea id="note-${t.id}" data-note-agent="${t.id}" placeholder="補足の指示（任意）">${escape(t.note)}</textarea><small class="muted">選択は下書きです。返信するとこのエージェントに届きます。</small><button class="btn primary" data-send="${t.id}" ${!Object.keys(t.draft).length&&!t.note.trim()?'disabled':''}>${Object.keys(t.draft).length}件の選択と指示を返信</button></div></details></details>${t.history.length?'<small role="status" style="color:var(--teal)">返信を受信しました · モック</small>':''}</article>`).join('')}<div class="coordinator"><div class="row"><b>コーディネーターへの指示</b><span class="chip line">将来</span></div><p>タスク全体の残件を整理し、エージェントへの作業配分を依頼する場所。</p><textarea disabled aria-label="将来のコーディネーター指示欄" placeholder="例：残件を整理して、次の作業を振り分けて"></textarea></div>`;
+    }
+    renderEvidence();
+  }
+  function renderEvidence(){const t=task();root.querySelectorAll("[data-card]").forEach(card=>card.classList.toggle("selected",card.dataset.card===selected));root.querySelector('#evidence-task').textContent=t.label+' · '+t.agent;root.querySelectorAll('[aria-label="エージェントの資料"] [data-evidence]').forEach(b=>b.classList.toggle('on',b.dataset.evidence===evidence));root.querySelector('#task-evidence').innerHTML=evidence==='history'?(t.history.length?t.history.map(h=>`<div class="task-history"><h3>送信済み · ${t.agent} · モック</h3><div class="task-evidence">${escape(h)}</div></div>`).join(''):'<p class="muted">まだ返信していません。</p>'):`<h3>${evidence==='changes'?'変更と検証':'会話'}</h3><div class="task-evidence">${escape(t[evidence])}</div>`;}
+  root.addEventListener('input',e=>{const id=e.target.dataset.noteAgent;if(!id)return;const t=tasks.find(t=>t.id===id);t.note=e.target.value;root.querySelector(`[data-send="${id}"]`).disabled=!Object.keys(t.draft).length&&!t.note.trim();});
+  root.addEventListener('click',e=>{
+    const b=e.target.closest('button');if(!b)return;
+    if(b.id==='reset-inbox'){reset();return;}
+    if(b.id==='add-tab'){menuOpen=!menuOpen;renderTabs();return;}
+    if(b.id==='add-overview'||b.dataset.overview){openOverview(b.dataset.overview||groupId);return;}
+    if(b.id==='close-overview'){overviewOpen=false;activeTab='terminal';render();return;}
+    if(b.dataset.tab){activeTab=b.dataset.tab;render();return;}
+    if(b.dataset.group){groupId=b.dataset.group;selected=agents()[0].id;render();return;}
+    if(b.dataset.badge){openOverview(b.dataset.badge);const target=agents().find(t=>state(t)===b.dataset.state);if(target){selected=target.id;render();root.querySelector(`[data-card="${selected}"]`)?.scrollIntoView({block:'nearest'});}else if(b.dataset.state==='プロセス'){root.querySelector('#evidence-task').textContent='実行中プロセス';root.querySelector('#task-evidence').innerHTML='<h3>cargo test</h3><p class="muted">agentium · 実行中 · モック</p>';}return;}
+    if(b.dataset.terminal){selected=b.dataset.terminal;activeTab='terminal';render();return;}
+    if(b.id==='view-pr'){root.querySelector('#evidence-task').textContent=group().pr+' · '+group().repo;root.querySelector('#task-evidence').innerHTML=`<h3>${escape(group().title)}</h3><span class="chip green">CI 成功</span><p>レビュー待ち</p><p>このタスクのエージェントが作成した変更をまとめたPRです。</p><div class="task-evidence">+214 −88\nチェック：テスト成功・Lint成功\n\nPR詳細のプレビュー · モック</div>`;return;}
+    if(b.dataset.agent)selected=b.dataset.agent;
+    if(b.dataset.evidence){evidence=b.dataset.evidence;renderEvidence();return;}
+    if(b.dataset.item){const t=task();if(t.draft[b.dataset.item]===b.dataset.choice)delete t.draft[b.dataset.item];else t.draft[b.dataset.item]=b.dataset.choice;const position=root.querySelector('#task-detail').scrollTop;render();root.querySelector('#task-detail').scrollTop=position;return;}
+    if(b.dataset.allow||b.dataset.deny){selected=b.dataset.allow||b.dataset.deny;const t=task();t.permission=false;t.running=Boolean(b.dataset.allow);t.result=t.running?'起動を許可しました。画面検証を実行中です。':'起動を拒否しました。検証は未実施です。';t.history.unshift(t.result);render();return;}
+    if(b.dataset.send){selected=b.dataset.send;const t=task(),lines=[];for(const i of t.items){const choice=t.draft[i.id];if(choice){i.status=choice;lines.push(({done:'完了報告',go:'依頼',skip:'見送り'})[choice]+'：'+i.title);}}if(t.note.trim())lines.push('補足：'+t.note.trim());t.history.unshift(lines.join('\n'));t.running=t.running||Object.values(t.draft).includes('go');t.draft={};t.note='';evidence='history';render();}
+  });
+  reset();
+})();
+</script>
+
+</body></html>

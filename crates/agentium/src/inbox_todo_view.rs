@@ -6,7 +6,7 @@ use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Subscription, Task, Window, div,
+    Styled, Subscription, Task, Window, div,
     prelude::FluentBuilder as _,
 };
 use ui::{
@@ -15,7 +15,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::Pane;
-use workspace::item::{Item, ItemEvent};
+use workspace::item::ItemEvent;
 
 use crate::arena::Arena;
 use crate::{
@@ -131,106 +131,6 @@ pub(crate) fn find_item_location(
         }
     }
     None
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum DetailPane {
-    Existing(Entity<Pane>),
-    SplitLeftOf(Entity<Pane>),
-}
-
-/// A pane for the detail tab that keeps the owner tab visible beside it.
-pub(crate) fn detail_pane_for(
-    owner_pane: &Entity<Pane>,
-    panes: &[Entity<Pane>],
-    last_active: Option<&Entity<Pane>>,
-) -> DetailPane {
-    last_active
-        .filter(|pane| *pane != owner_pane && panes.contains(pane))
-        .or_else(|| panes.iter().find(|pane| *pane != owner_pane))
-        .map_or_else(
-            || DetailPane::SplitLeftOf(owner_pane.clone()),
-            |pane| DetailPane::Existing(pane.clone()),
-        )
-}
-
-/// Puts the detail tab in the owner's arena, in a pane other than the owner's,
-/// with nothing zoomed, and brings both to the front: the point of the tab
-/// is to answer while looking at the agent that asked. An existing detail tab
-/// is moved rather than recreated when it is elsewhere (another arena, or the
-/// owner's own pane after a drag).
-pub(crate) fn show_detail_beside_owner(
-    detail: &Entity<InboxTodoView>,
-    owner_arena: &Entity<Arena>,
-    owner_pane: &Entity<Pane>,
-    owner_item: &dyn workspace::ItemHandle,
-    arenas: &[Entity<Arena>],
-    window: &mut Window,
-    cx: &mut App,
-) {
-    owner_arena.update(cx, |arena, cx| {
-        if let Some(zoomed) = arena
-            .zoomed_pane
-            .take()
-            .and_then(|view| view.upgrade())
-            .and_then(|view| view.downcast::<Pane>().ok())
-        {
-            zoomed.update(cx, |pane, cx| pane.set_zoomed(false, cx));
-        }
-        cx.notify();
-    });
-
-    let detail_id = detail.entity_id();
-    let current = find_item_location(arenas, detail_id, cx);
-    let in_place = current
-        .as_ref()
-        .is_some_and(|(arena, pane, _)| arena == owner_arena && pane != owner_pane);
-    let detail_pane = if in_place {
-        current.map(|(_, pane, _)| pane)
-    } else {
-        if let Some((_, pane, _)) = current {
-            pane.update(cx, |pane, cx| {
-                pane.remove_item(detail_id, false, true, window, cx)
-            });
-        }
-        let (panes, active_pane) = {
-            let arena = owner_arena.read(cx);
-            (
-                arena.center.panes().into_iter().cloned().collect::<Vec<_>>(),
-                arena.active_pane.clone(),
-            )
-        };
-        match detail_pane_for(owner_pane, &panes, Some(&active_pane)) {
-            DetailPane::Existing(pane) => {
-                pane.update(cx, |pane, cx| {
-                    pane.add_item(Box::new(detail.clone()), true, true, None, window, cx);
-                });
-                Some(pane)
-            }
-            DetailPane::SplitLeftOf(pane) => Some(owner_arena.update(cx, |arena, cx| {
-                arena.split_pane_with_item(
-                    &pane,
-                    Box::new(detail.clone()),
-                    workspace::SplitDirection::Left,
-                    window,
-                    cx,
-                )
-            })),
-        }
-    };
-
-    owner_pane.update(cx, |pane, cx| {
-        if let Some(index) = pane.index_for_item(owner_item) {
-            pane.activate_item(index, false, false, window, cx);
-        }
-    });
-    if let Some(detail_pane) = detail_pane {
-        detail_pane.update(cx, |pane, cx| {
-            if let Some(index) = pane.index_for_item(detail) {
-                pane.activate_item(index, true, true, window, cx);
-            }
-        });
-    }
 }
 
 /// What a list records about its owner tab at `todo set`.
@@ -563,7 +463,7 @@ impl InboxTodos {
         let body = todo_answer_message(&list.items, &list.choices, notes)
             .context("choose Done, Go or Skip for at least one item")?;
         let owner = owner.context("the tab that wrote this list is not open")?;
-        deliver(owner, &with_from_line("Agentium Inbox", &body), cx)?;
+        deliver(owner, &with_from_line("Task Overview", &body), cx)?;
         if let Some(index) = self.lists.iter().position(|list| list.id == todo_id) {
             let list = &mut self.lists[index];
             list.items = todo_items_after_send(&list.items, &list.choices);
@@ -610,13 +510,13 @@ pub(crate) enum InboxTodoViewEvent {
     },
 }
 
-/// The detail tab of one to-do list: choose Done / Go / Skip per item and
-/// send the answers to the tab that wrote the list.
+/// Embedded answers for one agent in Task Overview.
 pub(crate) struct InboxTodoView {
     todos: Entity<InboxTodos>,
     todo_id: u64,
     note_editors: HashMap<String, Entity<Editor>>,
     error: Option<String>,
+    history: Vec<String>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -636,6 +536,7 @@ impl InboxTodoView {
             todo_id,
             note_editors: HashMap::new(),
             error: None,
+            history: Vec::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![subscription],
         };
@@ -653,6 +554,19 @@ impl InboxTodoView {
             .item
             .upgrade()
             .map(|item| item.item_id())
+    }
+
+    pub(crate) fn record_reply(&mut self, message: String, cx: &mut Context<Self>) {
+        self.history.push(message);
+        cx.notify();
+    }
+
+    fn render_history(&self) -> impl IntoElement {
+        v_flex().gap_2().when(!self.history.is_empty(), |column| {
+            column.child(ui::Label::new("Reply history")).children(self.history.iter().rev().map(|message| {
+                div().text_sm().child(message.clone())
+            }))
+        })
     }
 
     pub(crate) fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
@@ -769,6 +683,8 @@ impl InboxTodoView {
             }))
         });
         v_flex()
+            .flex_shrink_0()
+            .min_w_0()
             .p_2()
             .gap_1()
             .rounded_md()
@@ -839,8 +755,9 @@ impl Render for InboxTodoView {
         let Some(list) = todos.list(self.todo_id) else {
             return v_flex()
                 .id("inbox-todo")
-                .size_full()
+                .w_full()
                 .p_4()
+                .child(self.render_history())
                 .track_focus(&self.focus_handle)
                 .bg(colors.editor_background)
                 .child(
@@ -850,7 +767,6 @@ impl Render for InboxTodoView {
                 )
                 .into_any_element();
         };
-        let title = list.title.clone();
         let location = match &list.branch {
             Some(branch) => format!("{} · {branch}", list.arena_name),
             None => list.arena_name.clone(),
@@ -902,8 +818,9 @@ impl Render for InboxTodoView {
             .id("inbox-todo")
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::send_answers))
-            .size_full()
-            .overflow_y_scroll()
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
             .p_4()
             .gap_2()
             .track_focus(&self.focus_handle)
@@ -923,16 +840,13 @@ impl Render for InboxTodoView {
                     )
                     .child(
                         div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
                             .text_xs()
                             .text_color(colors.text_muted)
                             .child(format!("{location} · updated {updated_at}")),
                     ),
-            )
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
             )
             .when(!user_tasks.is_empty(), |d| {
                 d.child(group("You do", "Done when finished"))
@@ -1000,28 +914,8 @@ impl Render for InboxTodoView {
                             ),
                     ),
             )
+            .child(self.render_history())
             .into_any_element()
-    }
-}
-
-impl Item for InboxTodoView {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        match self.todos.read(cx).list(self.todo_id) {
-            Some(list) if !list.title.is_empty() => {
-                format!("To do · {}", crate::truncate_for_menu(&list.title)).into()
-            }
-            _ => "To do".into(),
-        }
-    }
-
-    fn telemetry_event_text(&self) -> Option<&'static str> {
-        None
-    }
-
-    fn to_item_events(event: &ItemEvent, f: &mut dyn FnMut(ItemEvent)) {
-        f(*event)
     }
 }
 
@@ -1030,10 +924,10 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
-        DetailPane, InboxTodoView, InboxTodoViewEvent, InboxTodos, PendingRestore,
+        InboxTodoView, InboxTodoViewEvent, InboxTodos, PendingRestore,
         RestoreObservation, RestoreOutcome, RestorePlan, SendAnswers, TodoChoice,
-        acp_restore_outcome, advance_pending_restores, carry_todo_choices, detail_pane_for,
-        find_item_location, record_restore_launch, show_detail_beside_owner,
+        acp_restore_outcome, advance_pending_restores, carry_todo_choices,
+        find_item_location, record_restore_launch,
         todo_answer_message, todo_items_after_send, todo_restore_plan,
     };
     use crate::{InboxAsker, InboxTodoList};
@@ -1218,14 +1112,6 @@ mod tests {
         let owner_id = owner.entity_id();
         let found = cx.update(|_, cx| find_item_location(&arenas, owner_id, cx).map(|(_, pane, _)| pane));
         assert_eq!(found.as_ref(), Some(&left));
-        assert_eq!(
-            detail_pane_for(&left, &[left.clone(), right.clone()], Some(&left)),
-            DetailPane::Existing(right.clone())
-        );
-        assert_eq!(
-            detail_pane_for(&left, std::slice::from_ref(&left), None),
-            DetailPane::SplitLeftOf(left.clone())
-        );
 
         // Moved: both panes stay open, the stored pane is now wrong.
         left.update_in(cx, |pane, window, cx| pane.remove_item(owner_id, false, false, window, cx));
@@ -1234,10 +1120,6 @@ mod tests {
         });
         let found = cx.update(|_, cx| find_item_location(&arenas, owner_id, cx).map(|(_, pane, _)| pane));
         assert_eq!(found.as_ref(), Some(&right));
-        assert_eq!(
-            detail_pane_for(&right, &[left.clone(), right.clone()], Some(&right)),
-            DetailPane::Existing(left.clone())
-        );
 
         // Closed while this test still holds the entity: not open any more.
         right.update_in(cx, |pane, window, cx| pane.remove_item(owner_id, false, false, window, cx));
@@ -1317,7 +1199,7 @@ mod tests {
             .expect("delivered");
         assert_eq!(
             message.borrow().as_str(),
-            "[from: Agentium Inbox]\nTo do\nDone: 1 Check the lane\nGo: 2 Add tests — Note: with the Failed lane"
+            "[from: Task Overview]\nTo do\nDone: 1 Check the lane\nGo: 2 Add tests — Note: with the Failed lane"
         );
         todos.read_with(cx, |todos, _| {
             let list = todos.list(todo_id).expect("list");
@@ -1336,7 +1218,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn the_detail_tab_follows_the_list(cx: &mut TestAppContext) {
+    async fn the_embedded_todo_follows_the_list(cx: &mut TestAppContext) {
         let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
         let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
         let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
@@ -1401,7 +1283,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clearing_a_list_while_its_tab_is_open_empties_the_tab(cx: &mut TestAppContext) {
+    async fn clearing_a_list_updates_the_embedded_todo(cx: &mut TestAppContext) {
         let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
         let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
         let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
@@ -1414,94 +1296,6 @@ mod tests {
             assert!(view.preview(cx).is_none());
             assert!(view.note_editors.is_empty());
         });
-    }
-
-    fn pane_of(
-        arenas: &[Entity<Arena>],
-        item_id: gpui::EntityId,
-        cx: &mut VisualTestContext,
-    ) -> Option<(Entity<Arena>, Entity<workspace::Pane>)> {
-        cx.update(|_, cx| find_item_location(arenas, item_id, cx).map(|(arena, pane, _)| (arena, pane)))
-    }
-
-    fn show(
-        view: &Entity<InboxTodoView>,
-        arena: &Entity<Arena>,
-        owner: &Entity<TestItem>,
-        arenas: &[Entity<Arena>],
-        cx: &mut VisualTestContext,
-    ) {
-        let (_, owner_pane) = pane_of(arenas, owner.entity_id(), cx).expect("owner is open");
-        cx.update(|window, cx| {
-            show_detail_beside_owner(view, arena, &owner_pane, owner, arenas, window, cx)
-        });
-        cx.run_until_parked();
-    }
-
-    #[gpui::test]
-    async fn the_detail_tab_moves_beside_an_owner_restored_in_another_arena(
-        cx: &mut TestAppContext,
-    ) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let project = arena.read_with(cx, |arena, _| arena.project.clone());
-        let other_arena = cx.new_window_entity(|window, cx| {
-            Arena::test_empty("Other".into(), project, "/other".into(), window, cx)
-        });
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos, todo_id, window, cx));
-        // Opened while the owner was not open: it sits in the other arena.
-        let other_pane = other_arena.read_with(cx, |arena, _| arena.active_pane.clone());
-        other_pane.update_in(cx, |pane, window, cx| {
-            pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
-        });
-        let arenas = vec![arena.clone(), other_arena];
-
-        show(&view, &arena, &owner, &arenas, cx);
-        let (detail_arena, detail_pane) = pane_of(&arenas, view.entity_id(), cx).expect("detail open");
-        let (_, owner_pane) = pane_of(&arenas, owner.entity_id(), cx).expect("owner open");
-        assert_eq!(detail_arena, arena);
-        assert_ne!(detail_pane, owner_pane);
-        assert!(other_pane.read_with(cx, |pane, _| pane.index_for_item(&view).is_none()));
-    }
-
-    #[gpui::test]
-    async fn the_detail_tab_leaves_the_owners_pane(cx: &mut TestAppContext) {
-        let (arena, left, right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos, todo_id, window, cx));
-        // The user dragged the owner next to the detail, hiding one of them.
-        left.update_in(cx, |pane, window, cx| {
-            pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
-        });
-        let arenas = vec![arena.clone()];
-
-        show(&view, &arena, &owner, &arenas, cx);
-        let (_, detail_pane) = pane_of(&arenas, view.entity_id(), cx).expect("detail open");
-        assert_eq!(detail_pane, right);
-        let front = |pane: &Entity<workspace::Pane>, cx: &mut VisualTestContext| {
-            pane.read_with(cx, |pane, _| pane.active_item().map(|item| item.item_id()))
-        };
-        assert_eq!(front(&left, cx), Some(owner.entity_id()));
-        assert_eq!(front(&right, cx), Some(view.entity_id()));
-    }
-
-    #[gpui::test]
-    async fn showing_the_detail_tab_unzooms_the_arena(cx: &mut TestAppContext) {
-        let (arena, left, right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos, todo_id, window, cx));
-        right.update_in(cx, |pane, window, cx| {
-            pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
-        });
-        let arenas = vec![arena.clone()];
-        for zoomed in [&left, &right] {
-            zoomed.update(cx, |pane, cx| pane.set_zoomed(true, cx));
-            arena.update(cx, |arena, _| arena.zoomed_pane = Some(zoomed.downgrade().into()));
-
-            show(&view, &arena, &owner, &arenas, cx);
-            assert!(arena.read_with(cx, |arena, _| arena.zoomed_pane.is_none()));
-            assert!(!zoomed.read_with(cx, |pane, _| pane.is_zoomed()));
-        }
     }
 
     #[gpui::test]
