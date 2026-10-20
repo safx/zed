@@ -845,15 +845,6 @@ impl Render for InboxTodoView {
                 )
                 .into_any_element();
         };
-        let location = match &list.branch {
-            Some(branch) => format!("{} · {branch}", list.arena_name),
-            None => list.arena_name.clone(),
-        };
-        let updated_at = list
-            .updated_at
-            .with_timezone(&chrono::Local)
-            .format("%m-%d %H:%M")
-            .to_string();
         let items: Vec<(usize, InboxTodoItem, Option<TodoChoice>)> = list
             .items
             .iter()
@@ -903,29 +894,6 @@ impl Render for InboxTodoView {
             .gap_2()
             .track_focus(&self.focus_handle)
             .bg(colors.editor_background)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .px_1p5()
-                            .rounded_md()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(inbox_todo_color())
-                            .bg(inbox_todo_color().opacity(0.15))
-                            .child("To do"),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .child(format!("{location} · updated {updated_at}")),
-                    ),
-            )
             .when(!user_tasks.is_empty(), |d| {
                 d.child(group("You do", "Done when finished"))
                     .children(user_tasks)
