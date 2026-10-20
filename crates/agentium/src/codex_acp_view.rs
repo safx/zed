@@ -292,6 +292,40 @@ impl CodexAcpView {
         self.conversation.entity_id()
     }
 
+    pub(crate) fn overview_turn(&self, cx: &App) -> Option<(String, String)> {
+        use acp_thread::{AgentThreadEntry, AssistantMessageChunk};
+        let thread = self.conversation.read(cx).root_thread(cx)?;
+        let entries = thread.read(cx).entries();
+        let index = entries
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))?;
+        let AgentThreadEntry::UserMessage(message) = entries.get(index)? else {
+            return None;
+        };
+        let prompt = message.content.to_markdown(cx);
+        let result = entries
+            .iter()
+            .skip(index + 1)
+            .rev()
+            .find_map(|entry| {
+                let AgentThreadEntry::AssistantMessage(message) = entry else {
+                    return None;
+                };
+                let text = message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            })
+            .unwrap_or_default();
+        Some((prompt, result))
+    }
+
     pub(crate) fn state(&self) -> CodexAcpState {
         self.state
     }
@@ -1300,6 +1334,43 @@ mod tests {
                 .root_thread(cx)
                 .expect("connected root thread")
         })
+    }
+
+    #[gpui::test]
+    async fn overview_turn_excludes_thoughts_and_previous_turn_results(cx: &mut TestAppContext) {
+        let (project, workspace, cx) = setup(cx).await;
+        let view = fake_tab(FakeAcpAgentServer::new(), "/arena", project, &workspace, cx);
+        cx.run_until_parked();
+        let thread = thread(&view, cx);
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "First request".into(), cx);
+        });
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block("First result".into(), false, cx);
+        });
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Second request".into(), cx);
+        });
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block("Private reasoning".into(), true, cx);
+        });
+        let (prompt, result) = view
+            .read_with(cx, |view, cx| view.overview_turn(cx))
+            .expect("second turn");
+        assert!(prompt.contains("Second request"));
+        assert!(result.is_empty());
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block("Second result".into(), false, cx)
+        });
+        let (_, result) = view
+            .read_with(cx, |view, cx| view.overview_turn(cx))
+            .expect("second result");
+        assert!(result.contains("Second result"));
+        assert!(!result.contains("Private reasoning"));
+        assert!(!result.contains("First result"));
     }
 
     struct PendingServer(Arc<std::sync::atomic::AtomicBool>);

@@ -6,6 +6,7 @@ pub mod board;
 pub mod file_browser_view;
 mod git_status_view;
 mod inbox_todo_view;
+mod task_overview;
 pub mod questionnaire_view;
 mod review_view;
 mod svg_view;
@@ -99,7 +100,7 @@ pub enum PaneContentType {
     GitGraph,
 }
 
-actions!(agentium, [NewClaudeCode, NewCodexAcp, ResumeCodexConversation, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
+actions!(agentium, [NewTaskOverview, NewClaudeCode, NewCodexAcp, ResumeCodexConversation, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
 
 pub fn init_acp_host(cx: &mut App) {
     cx.set_global(agent_ui::AgentUiHost {
@@ -240,6 +241,7 @@ struct ClaudeSession {
     title_busy: bool,
     user_prompt: String,
     status_message: String,
+    result_title: Option<String>,
 }
 
 impl ClaudeSession {
@@ -1077,7 +1079,6 @@ pub struct AgentiumApp {
     next_inbox_question_id: u64,
     inbox_completions: Vec<InboxCompletion>,
     inbox_todos: Entity<inbox_todo_view::InboxTodos>,
-    inbox_todo_views: HashMap<u64, WeakEntity<inbox_todo_view::InboxTodoView>>,
     /// Lists whose closed owner tab is being brought back; the detail tab
     /// opens once the owner binds.
     pending_todo_restores: HashMap<u64, inbox_todo_view::PendingRestore>,
@@ -1388,8 +1389,6 @@ impl AgentiumApp {
         let inbox_todos = cx.new(|_| {
             inbox_todo_view::InboxTodos::new(Some(paths::data_dir().join(INBOX_TODOS_FILE)))
         });
-        // Arenas re-render too: their pane decorators show which tab owns the
-        // to-do list in front.
         let inbox_todos_subscription = cx.observe(&inbox_todos, |this, _, cx| {
             for arena in &this.arenas {
                 arena.update(cx, |_, cx| cx.notify());
@@ -1460,7 +1459,6 @@ impl AgentiumApp {
             inbox_questions,
             inbox_completions,
             inbox_todos,
-            inbox_todo_views: HashMap::new(),
             pending_todo_restores: HashMap::new(),
             todo_restore_errors: HashMap::new(),
             _inbox_todos_subscription: inbox_todos_subscription,
@@ -2485,6 +2483,7 @@ impl AgentiumApp {
                 title_busy: false,
                 user_prompt: String::new(),
                 status_message: String::new(),
+                result_title: None,
             });
         session.ancestor_pids = ancestor_pids;
         self.sync_session_derived_state();
@@ -2499,11 +2498,13 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) {
         self.drop_inbox_permissions(session_id);
+        let result_title = title.clone();
         let status_message = title.unwrap_or_else(|| "Ready".to_string());
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             session.state = ClaudeSessionState::Completed;
             session.ancestor_pids = ancestor_pids;
             session.status_message = status_message;
+            session.result_title = result_title;
         } else {
             self.claude_sessions.insert(
                 session_id.to_string(),
@@ -2513,6 +2514,7 @@ impl AgentiumApp {
                     title_busy: false,
                     user_prompt: String::new(),
                     status_message,
+                    result_title,
                 },
             );
         }
@@ -2556,6 +2558,7 @@ impl AgentiumApp {
                     title_busy: false,
                     user_prompt: String::new(),
                     status_message: title,
+                    result_title: None,
                 },
             );
         }
@@ -2578,6 +2581,7 @@ impl AgentiumApp {
             session.ancestor_pids = ancestor_pids;
             session.state = ClaudeSessionState::Running;
             session.status_message.clear();
+            session.result_title = None;
         } else {
             self.claude_sessions.insert(
                 session_id.to_string(),
@@ -2587,6 +2591,7 @@ impl AgentiumApp {
                     title_busy: false,
                     user_prompt: prompt,
                     status_message: String::new(),
+                    result_title: None,
                 },
             );
         }
@@ -2732,6 +2737,7 @@ impl AgentiumApp {
                     title_busy: false,
                     user_prompt: String::new(),
                     status_message: String::new(),
+                    result_title: None,
                 },
             );
         }
@@ -3240,9 +3246,8 @@ impl AgentiumApp {
             .update(cx, |todos, cx| todos.dismiss(todo_id, cx));
     }
 
-    /// Opens the list's detail tab beside its owner tab, or brings back the
-    /// one already open (moving it beside the owner if needed).
-    fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Restores the owner before the user sends answers from Overview.
+    fn restore_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(list) = self.inbox_todos.read(cx).list(todo_id) else {
             return;
         };
@@ -3288,64 +3293,7 @@ impl AgentiumApp {
                 }
             }
         }
-        let view = match self
-            .inbox_todo_views
-            .get(&todo_id)
-            .and_then(|view| view.upgrade())
-        {
-            Some(view) => view,
-            None => {
-                let todos = self.inbox_todos.clone();
-                let view = cx.new(|cx| {
-                    inbox_todo_view::InboxTodoView::new(todos, todo_id, window, cx)
-                });
-                cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event)
-                    .detach();
-                self.inbox_todo_views.insert(todo_id, view.downgrade());
-                view
-            }
-        };
-        let owner = self
-            .inbox_todos
-            .read(cx)
-            .list(todo_id)
-            .and_then(|list| list.tab.as_ref().map(|tab| tab.item.id()))
-            .and_then(|item_id| inbox_todo_view::find_item_location(&self.arenas, item_id, cx));
-        match owner {
-            Some((owner_arena, owner_pane, owner_item)) => {
-                if let Some(index) = self.arenas.iter().position(|arena| *arena == owner_arena) {
-                    self.switch_arena(index, window, cx);
-                }
-                inbox_todo_view::show_detail_beside_owner(
-                    &view,
-                    &owner_arena,
-                    &owner_pane,
-                    owner_item.as_ref(),
-                    &self.arenas,
-                    window,
-                    cx,
-                );
-            }
-            // No owner to sit beside: wherever it already is, else the
-            // active pane.
-            None => match inbox_todo_view::find_item_location(&self.arenas, view.entity_id(), cx) {
-                Some((arena, pane, item)) => {
-                    if let Some(index) = self.arenas.iter().position(|candidate| *candidate == arena) {
-                        self.navigate_to_item(index, &pane, item.as_ref(), window, cx);
-                    }
-                }
-                None => {
-                    let Some(arena) = self.active_arena().cloned() else {
-                        return;
-                    };
-                    let pane = arena.read(cx).active_pane.clone();
-                    pane.update(cx, |pane, cx| {
-                        pane.add_item(Box::new(view), true, true, None, window, cx);
-                    });
-                }
-            },
-        }
-        cx.notify();
+        self.open_inbox_todo(todo_id, window, cx);
     }
 
     /// Brings back the closed owner tab of a list: `claude --resume` for a
@@ -3442,6 +3390,7 @@ impl AgentiumApp {
             .and_then(|list| list.tab.as_ref().map(|tab| tab.item.id()))
             .and_then(|item_id| inbox_todo_view::find_item_location(&self.arenas, item_id, cx))
             .map(|(_, _, item)| item);
+        let message = view.read(cx).preview(cx);
         let todos = self.inbox_todos.clone();
         let result = todos.update(cx, |todos, cx| {
             todos.send(
@@ -3452,6 +3401,9 @@ impl AgentiumApp {
                 cx,
             )
         });
+        if result.is_ok() && let Some(message) = message {
+            view.update(cx, |view, cx| view.record_reply(message, cx));
+        }
         let error = result.err().map(|error| format!("{error:#}"));
         view.update(cx, |view, cx| view.set_error(error, cx));
     }
@@ -7140,204 +7092,539 @@ impl Focusable for AgentiumApp {
 }
 
 impl AgentiumApp {
-    fn render_arena_agents(
+    fn overview_todo_ids(
         &self,
-        arena_index: usize,
-        arena: &Entity<Arena>,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let colors = cx.theme().colors().clone();
-        let status_colors = cx.theme().status().clone();
-        let mut rows = Vec::new();
-        for pane in arena.read(cx).center.panes() {
-            for item in pane.read(cx).items() {
-                let asker = self.inbox_asker(item.as_ref(), cx);
-                let is_codex = item.act_as::<codex_acp_view::CodexAcpView>(cx).is_some();
-                let process_name = item
-                    .act_as::<TerminalView>(cx)
-                    .and_then(|view| view.read(cx).terminal().read(cx).foreground_process_name());
-                let has_claude_session = matches!(asker, Some(InboxAsker::ClaudeSession { .. }));
-                let Some(icon) =
-                    arena_agent_icon(is_codex, has_claude_session, process_name.as_deref())
-                else {
-                    continue;
-                };
-                let info = self.tab_info(item.as_ref(), arena, cx);
-                let item_id = item.item_id();
-                let todo = {
-                    let todos = self.inbox_todos.read(cx).lists();
-                    todo_list_index(todos, item_id, asker.as_ref())
-                        .and_then(|index| todos.get(index))
-                        .filter(|list| !list.items.is_empty())
-                        .map(|list| (list.id, list.items.len()))
-                };
-                let has_question = self.inbox_questions.iter().any(|question| {
-                    question
-                        .tab
-                        .as_ref()
-                        .is_some_and(|tab| tab.item.id() == item_id)
-                });
-                let (status, status_color) = if has_question {
-                    ("Decision", inbox_decision_color())
-                } else {
-                    match info.state {
-                        Some("permission") => ("Permission", status_colors.warning),
-                        Some("running") => ("Running", status_colors.success),
-                        Some("ready") => ("Completed", colors.text_accent),
-                        Some("error") => ("Failed", status_colors.error),
-                        _ => ("Idle", colors.text_muted),
-                    }
-                };
-                let selected = self.is_active_tab(arena, pane, item_id, cx);
-                let target_pane = pane.clone();
-                let target_item = item.clone();
-                let title = if info.title.is_empty() {
-                    if icon == IconName::AiClaude {
-                        "Claude"
-                    } else {
-                        "Codex"
-                    }
-                    .to_owned()
-                } else {
-                    info.title
-                };
-                rows.push(
-                    h_flex()
-                        .id(("arena-agent", item_id))
-                        .ml_3()
-                        .px_1()
-                        .py_1()
-                        .gap_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .when(selected, |row| row.bg(colors.element_active))
-                        .hover(|row| row.bg(colors.element_hover))
-                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_xs()
-                                .child(title.clone()),
-                        )
-                        .tooltip(Tooltip::text(title))
-                        .when_some(todo, |row, (todo_id, count)| {
-                            row.child(
-                                render_arena_pill(
-                                    ("agent-todo", item_id),
-                                    count,
-                                    inbox_todo_color(),
-                                    colors.surface_background,
-                                )
-                                .flex_shrink_0()
-                                .tooltip(Tooltip::text(format!("Open To do · {count} items")))
-                                .on_click(cx.listener(
-                                    move |this, _: &ClickEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.agent_activity = None;
-                                        this.open_inbox_todo(todo_id, window, cx);
-                                    },
-                                )),
-                            )
-                        })
-                        .child(
-                            div()
-                                .id(("agent-status", item_id))
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(status_color)
-                                .child(status)
-                                .tooltip(Tooltip::text("Show agent activity"))
-                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.agent_activity = Some((item_id, event.position()));
-                                    cx.notify();
-                                })),
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.agent_activity = None;
-                            this.navigate_to_item(
-                                arena_index,
-                                &target_pane,
-                                target_item.as_ref(),
-                                window,
-                                cx,
-                            );
-                        }))
-                        .into_any_element(),
-                );
-            }
-        }
-        for list in self.inbox_todos.read(cx).lists() {
-            let arena_state = arena.read(cx);
-            let belongs_to_arena = match &list.arena_path {
-                Some(path) => arena_state.working_directory.as_ref() == Some(path),
-                None => list.arena_name == arena_state.name,
-            };
-            if !belongs_to_arena
-                || list.items.is_empty()
-                || list.tab.as_ref().is_some_and(|tab| {
-                    inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx).is_some()
-                })
-            {
-                continue;
-            }
-            let todo_id = list.id;
-            rows.push(
-                h_flex()
-                    .id(("closed-arena-agent", todo_id))
-                    .ml_3()
-                    .px_1()
-                    .py_1()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::Terminal)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_xs()
-                            .child(list.title.clone()),
-                    )
-                    .child(
-                        render_arena_pill(
-                            ("closed-agent-todo", todo_id),
-                            list.items.len(),
-                            inbox_todo_color(),
-                            colors.surface_background,
-                        )
-                        .cursor_pointer()
-                        .tooltip(Tooltip::text("Restore agent and open To do"))
-                        .on_click(cx.listener(
-                            move |this, _: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.open_inbox_todo(todo_id, window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .child("Tab closed"),
-                    )
-                    .into_any_element(),
-            );
-        }
-        rows
+        arena_ids: &[EntityId],
+        additional_paths: &[PathBuf],
+        cx: &App,
+    ) -> Vec<u64> {
+        let arenas: Vec<_> = self
+            .arenas
+            .iter()
+            .filter(|arena| arena_ids.contains(&arena.entity_id()))
+            .collect();
+        let mut paths = additional_paths.to_vec();
+        paths.extend(
+            arenas
+                .iter()
+                .filter_map(|arena| arena.read(cx).working_directory.clone()),
+        );
+        let names: Vec<_> = arenas
+            .iter()
+            .map(|arena| arena.read(cx).name.clone())
+            .collect();
+        self.inbox_todos
+            .read(cx)
+            .lists()
+            .iter()
+            .filter(|list| {
+                let live_in_scope = list
+                    .tab
+                    .as_ref()
+                    .and_then(|tab| {
+                        inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx)
+                    })
+                    .map(|(arena, _, _)| arena_ids.contains(&arena.entity_id()));
+                task_overview::todo_matches_scope(
+                    live_in_scope,
+                    list.arena_path.as_deref(),
+                    &list.arena_name,
+                    &paths,
+                    &names,
+                )
+            })
+            .map(|list| list.id)
+            .collect()
     }
 
-    fn render_arena_row(&mut self, i: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn overview_scope(&self, arena: &Entity<Arena>, cx: &App) -> task_overview::OverviewScope {
+        arena
+            .read(cx)
+            .working_directory
+            .as_ref()
+            .and_then(|path| {
+                self.board
+                    .tasks_containing_worktree(path)
+                    .first()
+                    .map(|task| task.id)
+            })
+            .map(task_overview::OverviewScope::Task)
+            .unwrap_or(task_overview::OverviewScope::Arena(arena.entity_id()))
+    }
+
+    fn open_task_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(arena) = self.active_arena().cloned() else {
+            return;
+        };
+        let scope = arena
+            .read(cx)
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<task_overview::TaskOverview>())
+            .map(|view| view.read(cx).scope)
+            .unwrap_or_else(|| self.overview_scope(&arena, cx));
+        self.open_overview_scope(scope, window, cx);
+    }
+
+    fn open_overview_scope(
+        &mut self,
+        scope: task_overview::OverviewScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.arenas.iter().enumerate().find_map(|(index, arena)| {
+            arena.read(cx).center.panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items_of_type::<task_overview::TaskOverview>()
+                    .find(|view| view.read(cx).scope == scope)
+                    .map(|view| (index, (*pane).clone(), view))
+            })
+        });
+        if let Some((index, pane, view)) = existing {
+            self.navigate_to_item(index, &pane, &view, window, cx);
+            return;
+        }
+        let Some(arena) = self.active_arena().cloned() else {
+            return;
+        };
+        let app = cx.entity();
+        let view = cx.new(|cx| task_overview::TaskOverview::new(scope, app, cx));
+        let pane = arena.read(cx).active_pane.clone();
+        pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(view), true, true, None, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(list) = self.inbox_todos.read(cx).list(todo_id) else {
+            return;
+        };
+        let scope = list
+            .tab
+            .as_ref()
+            .and_then(|tab| inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx))
+            .map(|(arena, _, _)| self.overview_scope(&arena, cx))
+            .or_else(|| {
+                list.arena_path.as_ref().and_then(|path| {
+                    self.board
+                        .tasks_containing_worktree(path)
+                        .first()
+                        .map(|task| task_overview::OverviewScope::Task(task.id))
+                })
+            })
+            .or_else(|| {
+                self.active_arena()
+                    .map(|arena| self.overview_scope(arena, cx))
+            });
+        if let Some(scope) = scope {
+            self.open_overview_scope(scope, window, cx);
+        }
+    }
+
+    fn render_task_overview(
+        &mut self,
+        overview: &mut task_overview::TaskOverview,
+        overview_entity: Entity<task_overview::TaskOverview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let (title, paths, arena_ids) = match overview.scope {
+            task_overview::OverviewScope::Task(id) => {
+                let Some(task) = self.board.tasks.iter().find(|task| task.id == id) else {
+                    return div()
+                        .p_4()
+                        .child("This task was removed.")
+                        .into_any_element();
+                };
+                (
+                    task.title.clone(),
+                    task.worktrees.clone(),
+                    self.live_arena_entity_ids_for_task(id),
+                )
+            }
+            task_overview::OverviewScope::Arena(id) => {
+                let Some(arena) = self.arenas.iter().find(|arena| arena.entity_id() == id) else {
+                    return div()
+                        .p_4()
+                        .child("This arena is closed.")
+                        .into_any_element();
+                };
+                let arena = arena.read(cx);
+                (
+                    arena.name.clone(),
+                    arena.working_directory.clone().into_iter().collect(),
+                    vec![id],
+                )
+            }
+        };
+        let todo_ids = self.overview_todo_ids(&arena_ids, &paths, cx);
+        let total: usize = todo_ids
+            .iter()
+            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
+            .map(|list| list.items.len())
+            .sum();
+        let mut content = v_flex()
+            .id("task-overview")
+            .size_full()
+            .overflow_y_scroll()
+            .p_4()
+            .gap_4()
+            .bg(colors.editor_background)
+            .child(Label::new("Task Overview").color(Color::Muted))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(div().text_xl().child(title))
+                    .child(Label::new(format!("To do · {total}"))),
+            );
+        let mut linked_prs = Vec::new();
+        if let task_overview::OverviewScope::Task(task_id) = overview.scope {
+            if let Some(task) = self
+                .board
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .cloned()
+            {
+                for issue in &task.issues {
+                    content = content.child(self.render_issue_row(task_id, issue, &colors, cx));
+                }
+                linked_prs = task.prs;
+            }
+        }
+        let mut prs = Vec::new();
+        let mut seen_prs = HashSet::new();
+        for arena_id in &arena_ids {
+            for pr in self.pr_info.get(arena_id).into_iter().flatten() {
+                if seen_prs.insert(pr.html_url.clone()) {
+                    prs.push(pr.clone());
+                }
+            }
+        }
+        for path in &paths {
+            for pr in self
+                .pr_cache
+                .get(&path.to_string_lossy().to_string())
+                .into_iter()
+                .flatten()
+            {
+                if seen_prs.insert(pr.html_url.clone()) {
+                    prs.push(pr.clone());
+                }
+            }
+        }
+        if !prs.is_empty() || !linked_prs.is_empty() {
+            content = content.child(Label::new("Pull requests"));
+            for reference in linked_prs {
+                let url = reference.html_url();
+                if seen_prs.iter().any(|seen| seen.as_ref() == url) {
+                    continue;
+                }
+                content = content.child(
+                    Button::new(
+                        SharedString::from(format!("overview-linked-{url}")),
+                        reference.short_label(),
+                    )
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+            for pr in prs {
+                let ci = arena_ids
+                    .iter()
+                    .filter(|id| {
+                        self.pr_info.get(id).is_some_and(|prs| {
+                            prs.iter()
+                                .any(|candidate| candidate.html_url == pr.html_url)
+                        })
+                    })
+                    .find_map(|id| self.ci_status.get(&(*id, pr.number)));
+                let (status, review) =
+                    self.render_pr_elements("overview-pr", &pr, ci, None, true, true, None, cx);
+                content = content.child(
+                    v_flex()
+                        .gap_1()
+                        .child(div().text_sm().child(pr.title.clone()))
+                        .child(status)
+                        .children(review),
+                );
+            }
+        } else {
+            content = content.child(Label::new("No pull requests found.").color(Color::Muted));
+        }
+        let arenas: Vec<_> = self
+            .arenas
+            .iter()
+            .enumerate()
+            .filter(|(_, arena)| arena_ids.contains(&arena.entity_id()))
+            .map(|(index, arena)| (index, arena.clone()))
+            .collect();
+        let mut rendered_todos = HashSet::new();
+        for (arena_index, arena) in arenas {
+            let changes_arena = arena.clone();
+            content = content.child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().text_lg().child(arena.read(cx).name.clone()))
+                    .child(
+                        Button::new(("overview-changes", arena.entity_id()), "Changes").on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.switch_arena(arena_index, window, cx);
+                                changes_arena
+                                    .update(cx, |arena, cx| arena.add_diff_view(window, cx));
+                            }),
+                        ),
+                    ),
+            );
+            let panes: Vec<_> = arena.read(cx).center.panes().into_iter().cloned().collect();
+            for pane in panes {
+                let items: Vec<_> = pane.read(cx).items().cloned().collect();
+                for item in items {
+                    // act_as reads the entity, including this currently rendering overview.
+                    if item.downcast::<task_overview::TaskOverview>().is_some() {
+                        continue;
+                    }
+                    let asker = self.inbox_asker(item.as_ref(), cx);
+                    let process = item.act_as::<TerminalView>(cx).and_then(|view| {
+                        view.read(cx).terminal().read(cx).foreground_process_name()
+                    });
+                    let Some(icon) = arena_agent_icon(
+                        item.act_as::<codex_acp_view::CodexAcpView>(cx).is_some(),
+                        matches!(asker, Some(InboxAsker::ClaudeSession { .. })),
+                        process.as_deref(),
+                    ) else {
+                        continue;
+                    };
+                    let info = self.tab_info(item.as_ref(), &arena, cx);
+                    let session = match asker.as_ref() {
+                        Some(InboxAsker::ClaudeSession { session_id }) => {
+                            self.claude_sessions.get(session_id)
+                        }
+                        _ => None,
+                    };
+                    let acp_turn = item
+                        .act_as::<codex_acp_view::CodexAcpView>(cx)
+                        .and_then(|view| view.read(cx).overview_turn(cx));
+                    let prompt = acp_turn
+                        .as_ref()
+                        .map(|turn| turn.0.clone())
+                        .or_else(|| session.map(|session| session.user_prompt.clone()))
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or_else(|| {
+                            "Request not available. Open the agent tab to view the conversation."
+                                .into()
+                        });
+                    let result = acp_turn
+                        .map(|turn| turn.1)
+                        .or_else(|| session.and_then(|session| session.result_title.clone()))
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or_else(|| "No result received for this turn.".into());
+                    let item_id = item.item_id();
+                    let target_pane = pane.clone();
+                    let target_item = item.clone();
+                    let mut card = v_flex()
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .gap_2()
+                        .p_3()
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Icon::new(icon))
+                                .child(div().flex_1().min_w_0().truncate().child(
+                                    info.title.split_whitespace().collect::<Vec<_>>().join(" "),
+                                ))
+                                .child(
+                                    Button::new(
+                                        ("overview-status", item_id),
+                                        if self.inbox_questions.iter().any(|question| {
+                                            question
+                                                .tab
+                                                .as_ref()
+                                                .is_some_and(|tab| tab.item.id() == item_id)
+                                        }) {
+                                            "Decision"
+                                        } else {
+                                            match info.state {
+                                                Some("running") => "Running",
+                                                Some("ready") => "Completed",
+                                                Some("permission") => "Permission",
+                                                Some("error") => "Failed",
+                                                _ => "Idle",
+                                            }
+                                        },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, _, cx| {
+                                            this.agent_activity = Some((item_id, event.position()));
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(overview.render_message(
+                            item_id, "Request", prompt, overview_entity.clone(),
+                        ))
+                        .child(overview.render_message(
+                            item_id, "Response", result, overview_entity.clone(),
+                        ))
+                        .child(
+                            Button::new(("overview-open-agent", item_id), "Open agent tab")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.navigate_to_item(
+                                        arena_index,
+                                        &target_pane,
+                                        target_item.as_ref(),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        );
+                    let todo_id =
+                        todo_list_index(self.inbox_todos.read(cx).lists(), item_id, asker.as_ref())
+                            .and_then(|index| self.inbox_todos.read(cx).lists().get(index))
+                            .map(|list| list.id);
+                    let todo_id = todo_id.or_else(|| {
+                        overview
+                            .todo_owners
+                            .iter()
+                            .find_map(|(id, owner)| (*owner == item_id).then_some(*id))
+                    });
+                    if let Some(todo_id) = todo_id {
+                        overview.todo_owners.insert(todo_id, item_id);
+                        rendered_todos.insert(todo_id);
+                        card = card.child(self.render_overview_todo(
+                            todo_id,
+                            overview,
+                            &overview_entity,
+                            window,
+                            cx,
+                        ));
+                    } else {
+                        card =
+                            card.child(Label::new("No pending To do items.").color(Color::Muted));
+                    }
+                    content = content.child(card);
+                }
+            }
+        }
+        for todo_id in todo_ids {
+            if !rendered_todos.contains(&todo_id) {
+                content = content.child(self.render_overview_todo(
+                    todo_id,
+                    overview,
+                    &overview_entity,
+                    window,
+                    cx,
+                ));
+            }
+        }
+        content
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(Label::new("Coordinator · Coming later").color(Color::Muted))
+                    .child(
+                        Label::new(
+                            "Task-wide instructions and agent assignments will appear here.",
+                        )
+                        .color(Color::Muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_overview_todo(
+        &mut self,
+        todo_id: u64,
+        overview: &mut task_overview::TaskOverview,
+        overview_entity: &Entity<task_overview::TaskOverview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let list = self.inbox_todos.read(cx).list(todo_id);
+        let count = list.map_or(0, |list| list.items.len());
+        let title = list
+            .map(|list| list.title.clone())
+            .unwrap_or_else(|| "Reply history".into());
+        let closed = list.is_some_and(|list| {
+            list.tab
+                .as_ref()
+                .and_then(|tab| {
+                    inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx)
+                })
+                .is_none()
+        });
+        let expanded = overview.expanded.contains(&todo_id);
+        let overview_entity = overview_entity.clone();
+        let mut section = v_flex().flex_shrink_0().min_w_0().gap_2().child(
+            Button::new(
+                SharedString::from(format!("overview-todo-{todo_id}")),
+                format!("{} To do · {count}", if expanded { "▾" } else { "▸" }),
+            )
+            .on_click(move |_, _, cx| {
+                overview_entity.update(cx, |overview, cx| {
+                    if !overview.expanded.remove(&todo_id) {
+                        overview.expanded.insert(todo_id);
+                    }
+                    cx.notify();
+                })
+            }),
+        );
+        if closed {
+            section = section.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .child(title.split_whitespace().collect::<Vec<_>>().join(" ")),
+            );
+            section = section.child(
+                Button::new(
+                    SharedString::from(format!("overview-restore-{todo_id}")),
+                    "Restore agent tab",
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.restore_inbox_todo(todo_id, window, cx)
+                })),
+            );
+            if let Some(error) = self.todo_restore_errors.get(&todo_id) {
+                section = section.child(Label::new(error.clone()).color(Color::Error));
+            }
+        }
+        if expanded {
+            let view = overview
+                .todos
+                .entry(todo_id)
+                .or_insert_with(|| {
+                    let todos = self.inbox_todos.clone();
+                    let view = cx
+                        .new(|cx| inbox_todo_view::InboxTodoView::new(todos, todo_id, window, cx));
+                    cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event)
+                        .detach();
+                    view
+                })
+                .clone();
+            section = section.child(view);
+        }
+        section.into_any_element()
+    }
+
+    fn render_arena_row(&mut self, i: usize, task_id: Option<Uuid>, cx: &mut Context<Self>) -> AnyElement {
         let Some(arena_entity) = self.arenas.get(i).cloned() else {
             return div().into_any_element();
         };
-        let agent_rows = self.render_arena_agents(i, &arena_entity, cx);
+        let todo_count = self.overview_todo_ids(&[arena_entity.entity_id()], &[], cx).iter()
+            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
+            .map(|list| list.items.len()).sum::<usize>();
         let arena_entity = &arena_entity;
         let colors = cx.theme().colors();
         let active_index = self.active_arena_index;
@@ -7429,8 +7716,16 @@ impl AgentiumApp {
                                 })
                                 .child({
                                     let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
+                                    let permission_infos = self.collect_permission_terminal_infos(arena_entity, cx);
+                                    let running_infos = self.collect_running_terminal_infos(arena_entity, cx);
+                                    let ready_infos = self.collect_ready_terminal_infos(arena_entity, cx);
                                     let busy_infos = self.collect_busy_terminal_infos(arena_entity, cx);
-                                    let has_pills = !busy_infos.is_empty();
+                                    let error_infos = codex_badge_entries(arena, codex_acp_view::CodexAcpState::Error, cx);
+                                    let has_pills = !permission_infos.is_empty()
+                                        || !running_infos.is_empty()
+                                        || !ready_infos.is_empty()
+                                        || !busy_infos.is_empty()
+                                        || !error_infos.is_empty() || todo_count > 0;
                                     div()
                                         .flex()
                                         .flex_row()
@@ -7468,6 +7763,119 @@ impl AgentiumApp {
                                             d.child(
                                                 h_flex()
                                                     .gap_0p5()
+                                                    .when(todo_count > 0, |d| {
+                                                        d.child(render_arena_pill(("arena-todo-badge", arena.id), todo_count, inbox_todo_color(), colors.surface_background)
+                                                            .tooltip(Tooltip::text("Open Task Overview"))
+                                                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.switch_arena(i, window, cx);
+                                                                if let Some(task_id) = task_id {
+                                                                    this.open_overview_scope(task_overview::OverviewScope::Task(task_id), window, cx);
+                                                                } else {
+                                                                    this.open_task_overview(window, cx);
+                                                                }
+                                                            })))
+                                                    })
+                                                    .when(!permission_infos.is_empty(), |d| {
+                                                        let entries = permission_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-permission-badge", arena.id),
+                                                                entries.len(),
+                                                                status_colors.warning,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!running_infos.is_empty(), |d| {
+                                                        let entries = running_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-running-badge", arena.id),
+                                                                entries.len(),
+                                                                status_colors.success,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!ready_infos.is_empty(), |d| {
+                                                        let entries = ready_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-ready-badge", arena.id),
+                                                                entries.len(),
+                                                                colors.text_accent,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
+                                                    .when(!error_infos.is_empty(), |d| {
+                                                        let entries = error_infos.clone();
+                                                        let tooltip_entries = entries.clone();
+                                                        d.child(
+                                                            render_arena_pill(
+                                                                ("arena-acp-error-badge", arena.id),
+                                                                entries.len(),
+                                                                status_colors.error,
+                                                                colors.surface_background,
+                                                            )
+                                                            .cursor_pointer()
+                                                            .tooltip(Tooltip::element(move |_window, cx| {
+                                                                render_badge_tooltip(&tooltip_entries, cx)
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, event: &ClickEvent, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.switch_arena(i, window, cx);
+                                                                    this.deploy_badge_menu(
+                                                                        i, entries.clone(), event.position(), window, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        )
+                                                    })
                                                     .when(!busy_infos.is_empty(), |d| {
                                                         let entries = busy_infos.clone();
                                                         let tooltip_entries = entries.clone();
@@ -7603,7 +8011,7 @@ impl AgentiumApp {
                                         .child(pr_el)
                                         .children(review_el)
                                 }))
-                                .children(agent_rows)
+
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.switch_arena(i, window, cx)
@@ -7914,18 +8322,9 @@ impl AgentiumApp {
             });
         }
         for list in todo_lists {
-            let detail_view = self
-                .inbox_todo_views
-                .get(&list.id)
-                .and_then(|view| view.upgrade());
             entries.todos.push(InboxTodoRow {
                 id: list.id,
-                is_active: detail_view.is_some_and(|view| {
-                    inbox_todo_view::find_item_location(&self.arenas, view.entity_id(), cx)
-                        .is_some_and(|(arena, pane, item)| {
-                            self.is_active_tab(&arena, &pane, item.item_id(), cx)
-                        })
-                }),
+                is_active: false,
                 title: list.title.clone(),
                 arena_name: list.arena_name.clone(),
                 item_count: list.items.len(),
@@ -7934,7 +8333,7 @@ impl AgentiumApp {
                     if self.pending_todo_restores.contains_key(&list.id) {
                         Some("restoring the tab…".to_string())
                     } else {
-                        list.tab.is_none().then(|| "tab not open · click to restore".to_string())
+                        list.tab.is_none().then(|| "tab not open · restore from Task Overview".to_string())
                     }
                 }),
             });
@@ -8691,7 +9090,7 @@ impl AgentiumApp {
                 for row in &task.worktrees {
                     section = match row {
                         WorktreeRow::Live { arena_index } => section.child(
-                            div().pl_3().child(self.render_arena_row(*arena_index, cx)),
+                            div().pl_3().child(self.render_arena_row(*arena_index, Some(task_id), cx)),
                         ),
                         WorktreeRow::Closed { path } => section.child(
                             self.render_closed_worktree_row(
@@ -8734,7 +9133,7 @@ impl AgentiumApp {
                     .child(div().flex_1().h_px().bg(colors.border)),
             );
             for arena_index in unassigned {
-                section = section.child(self.render_arena_row(arena_index, cx));
+                section = section.child(self.render_arena_row(arena_index, None, cx));
             }
             list = list.child(section);
         }
@@ -8839,6 +9238,9 @@ impl AgentiumApp {
             .unwrap_or_else(|| path.display().to_string());
         let element_id = SharedString::from(format!("task-worktree-{task_id}-{}", path.display()));
         let path_for_open = path.clone();
+        let todo_count: usize = self.overview_todo_ids(&[], std::slice::from_ref(&path), cx).iter()
+            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
+            .map(|list| list.items.len()).sum();
         let path_for_menu = path;
 
         h_flex()
@@ -8859,8 +9261,15 @@ impl AgentiumApp {
                     .min_w_0()
                     .truncate()
                     .text_color(colors.text_muted)
-                    .child(name),
+                    .child(name.clone()),
             )
+            .when(todo_count > 0, |row| row.child(
+                render_arena_pill(SharedString::from(format!("closed-todo-{task_id}-{name}")), todo_count, inbox_todo_color(), colors.surface_background)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_overview_scope(task_overview::OverviewScope::Task(task_id), window, cx);
+                    }))
+            ))
             .when(missing, |d| {
                 d.child(
                     div()
@@ -8905,6 +9314,7 @@ impl Render for AgentiumApp {
 
         div()
             .key_context("Agentium")
+            .on_action(cx.listener(|this, _: &NewTaskOverview, window, cx| { this.open_task_overview(window, cx); }))
             .on_action(cx.listener(|this, action: &ActivateArena, window, cx| {
                 this.switch_arena(action.index, window, cx);
             }))
@@ -9003,7 +9413,7 @@ impl Render for AgentiumApp {
                             .flex_1()
                             .overflow_y_scroll()
                             .children(
-                                (0..self.arenas.len()).map(|i| self.render_arena_row(i, cx)),
+                                (0..self.arenas.len()).map(|i| self.render_arena_row(i, None, cx)),
                             )
                             .into_any_element(),
                         SidebarTab::Tasks => self.render_task_list(cx),
