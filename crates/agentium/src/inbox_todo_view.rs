@@ -510,13 +510,20 @@ pub(crate) enum InboxTodoViewEvent {
     },
 }
 
+pub(crate) struct ProcessedTodo {
+    item: InboxTodoItem,
+    choice: TodoChoice,
+    note: Option<String>,
+}
+
 /// Embedded answers for one agent in Task Overview.
 pub(crate) struct InboxTodoView {
     todos: Entity<InboxTodos>,
     todo_id: u64,
     note_editors: HashMap<String, Entity<Editor>>,
     error: Option<String>,
-    history: Vec<String>,
+    processed: Vec<ProcessedTodo>,
+    show_processed: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -536,7 +543,8 @@ impl InboxTodoView {
             todo_id,
             note_editors: HashMap::new(),
             error: None,
-            history: Vec::new(),
+            processed: Vec::new(),
+            show_processed: false,
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![subscription],
         };
@@ -556,17 +564,87 @@ impl InboxTodoView {
             .map(|item| item.item_id())
     }
 
-    pub(crate) fn record_reply(&mut self, message: String, cx: &mut Context<Self>) {
-        self.history.push(message);
+    pub(crate) fn selected_items(
+        &self,
+        notes: &HashMap<String, String>,
+        cx: &App,
+    ) -> Vec<ProcessedTodo> {
+        let Some(list) = self.todos.read(cx).list(self.todo_id) else {
+            return Vec::new();
+        };
+        list.items
+            .iter()
+            .filter_map(|item| {
+                let choice = *list.choices.get(&item.title)?;
+                choice.allowed_for(item.kind).then(|| ProcessedTodo {
+                    item: item.clone(),
+                    choice,
+                    note: notes
+                        .get(&item.title)
+                        .filter(|note| !note.trim().is_empty())
+                        .cloned(),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn record_processed(&mut self, items: Vec<ProcessedTodo>, cx: &mut Context<Self>) {
+        self.processed.extend(items);
         cx.notify();
     }
 
-    fn render_history(&self) -> impl IntoElement {
-        v_flex().gap_2().when(!self.history.is_empty(), |column| {
-            column.child(ui::Label::new("Reply history")).children(self.history.iter().rev().map(|message| {
-                div().text_sm().child(message.clone())
-            }))
-        })
+    fn render_processed(&self, cx: &Context<Self>) -> impl IntoElement {
+        v_flex()
+            .min_w_0()
+            .flex_shrink_0()
+            .gap_2()
+            .when(!self.processed.is_empty(), |column| {
+                column
+                    .child(
+                        Button::new(
+                            "processed-todos",
+                            format!(
+                                "{} Processed items · {}",
+                                if self.show_processed { "▾" } else { "▸" },
+                                self.processed.len()
+                            ),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_processed = !this.show_processed;
+                            cx.notify();
+                        })),
+                    )
+                    .when(self.show_processed, |column| {
+                        column.children(self.processed.iter().rev().map(|entry| {
+                            let state = match entry.choice {
+                                TodoChoice::Done => "Done",
+                                TodoChoice::Skip => "Skipped",
+                                TodoChoice::Go => "Requested",
+                            };
+                            v_flex()
+                                .min_w_0()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .p_2()
+                                .border_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .rounded_md()
+                                .child(ui::Label::new(state))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(entry.item.title.clone()),
+                                )
+                                .when_some(entry.item.detail.clone(), |row, detail| {
+                                    row.child(div().text_sm().child(detail))
+                                })
+                                .when_some(entry.note.clone(), |row, note| {
+                                    row.child(div().text_sm().child(format!("Note: {note}")))
+                                })
+                        }))
+                    })
+            })
     }
 
     pub(crate) fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
@@ -757,7 +835,7 @@ impl Render for InboxTodoView {
                 .id("inbox-todo")
                 .w_full()
                 .p_4()
-                .child(self.render_history())
+                .child(self.render_processed(cx))
                 .track_focus(&self.focus_handle)
                 .bg(colors.editor_background)
                 .child(
@@ -914,7 +992,7 @@ impl Render for InboxTodoView {
                             ),
                     ),
             )
-            .child(self.render_history())
+            .child(self.render_processed(cx))
             .into_any_element()
     }
 }
@@ -1215,6 +1293,50 @@ mod tests {
             })
             .expect("delivered");
         assert!(todos.read_with(cx, |todos, _| todos.list(todo_id).is_none()));
+    }
+
+    #[gpui::test]
+    async fn processed_items_keep_titles_choices_and_notes_after_list_removal(
+        cx: &mut TestAppContext,
+    ) {
+        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
+        let (todos, todo_id) =
+            todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
+        let view = cx
+            .new_window_entity(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
+        todos.update(cx, |todos, cx| {
+            todos.set_choice(todo_id, "Check the lane", Some(TodoChoice::Done), cx);
+            todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx);
+            todos.set_choice(todo_id, "Open a PR", Some(TodoChoice::Skip), cx);
+        });
+        let notes = HashMap::from([("Open a PR".to_string(), "Not needed".to_string())]);
+        let processed = view.read_with(cx, |view, cx| view.selected_items(&notes, cx));
+        assert_eq!(processed.len(), 3);
+        view.update(cx, |view, cx| view.record_processed(processed, cx));
+        todos.update(cx, |todos, cx| todos.clear_for(owner.entity_id(), None, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.show_processed);
+            assert_eq!(view.processed.len(), 3);
+            assert!(
+                view.processed
+                    .iter()
+                    .any(|entry| entry.item.title == "Check the lane"
+                        && entry.choice == TodoChoice::Done)
+            );
+            assert!(
+                view.processed
+                    .iter()
+                    .any(|entry| entry.item.title == "Add tests" && entry.choice == TodoChoice::Go)
+            );
+            assert!(
+                view.processed
+                    .iter()
+                    .any(|entry| entry.item.title == "Open a PR"
+                        && entry.choice == TodoChoice::Skip
+                        && entry.note.as_deref() == Some("Not needed"))
+            );
+        });
     }
 
     #[gpui::test]
