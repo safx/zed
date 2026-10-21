@@ -1598,15 +1598,7 @@ impl Item for TerminalView {
         let is_claude = self.is_claude_code_running(cx);
 
         let terminal = self.terminal().read(cx);
-        let title = if is_claude {
-            "Claude".to_string()
-        } else {
-            self.custom_title
-                .as_ref()
-                .filter(|title| !title.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| terminal.title(true))
-        };
+        let title = self.tab_content_text(0, cx);
 
         let (icon, icon_color, rerun_button) = if is_claude {
             let color = if self.is_claude_prompt_waiting(cx) {

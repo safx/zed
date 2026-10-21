@@ -120,13 +120,27 @@ Each agent card links to its original tab. Request and Response initially show t
 
 Claude requests come from UserPromptSubmit. The Stop hook derives the result title from `last_assistant_message` without an LLM: it takes the first nonempty line, removes basic Markdown markers, and limits it to 120 characters. Codex ACP shows the latest user message and assistant response, excluding reasoning. Terminals without these sources show an unavailable message and a link to the original tab. Results and processed items are session-local.
 
-PRs include cached entries for closed arenas and manually linked task PRs. The coordinator section is a placeholder for future task-wide instructions.
+PRs include cached entries for closed arenas and manually linked task PRs.
+
+### Experimental Task Coordinator
+
+Each arena in Task Overview has a **Task Coordinator · Experimental** control. Choose **Claude · Haiku** or **Codex · Luna** before enabling it. Enabling creates one dedicated `Task Coordinator` tab. Codex selects Luna from the connection’s model configuration; if the account does not offer Luna, the overview reports an error instead of silently choosing another model. Claude requires the usual Agentium hooks to be installed.
+
+The coordinator’s Overview card is labeled **Task Coordinator** and shows the latest reported model, falling back to its explicitly labeled configured provider/model until model information is available. Its routine completion notifications and sounds are suppressed; ACP error and permission notifications remain enabled.
+
+The coordinator summarizes the latest request and response of each agent in its arena. Task Overview shows the summary beside the user/bot icon; **Show original** opens the full source text. While a summary is pending or unavailable, the original text remains visible. A new turn or a newly received response invalidates the previous summary. The coordinator excludes its own messages, never edits another agent’s Todo list, and does not assign or execute implementation work.
+
+Claude’s UserPromptSubmit and Stop hooks additionally send full source text over the CLI stream socket. Existing short terminal/status titles remain unchanged. Codex source text comes from ACP messages; partial assistant responses are not summarized while a turn runs. Ordinary Codex terminal tabs, including `codex resume`, do not provide request/result capture and are not summarized by this MVP. Their running state alone is not enough to create a summary job.
+
+Agentium saves arena settings, session identifiers, source text, pending jobs, and summaries in `task_coordinators.json` in its data directory. On startup, enabled arenas reopen and their coordinators resume automatically. Disabling stops new dispatches and retains saved summaries and the tab. **Retry / reconnect** resumes pending processing; if a session cannot be restored, close its tab and use **Create new session** to keep the pending jobs while replacing the conversation. Persistence failures appear in Overview and pause dispatch.
+
+The coordinator registers structured results using `agentium coordinator summary set --job-id <id> --json '{"request_summary":"...","response_summary":"..."}'`. Jobs identify a specific source revision. Identical duplicate results are accepted; conflicting duplicates, disabled coordinators, and superseded jobs are rejected. The coordinator’s instructions are supplied with every job so a fresh session can continue without relying on conversation history.
 
 The white/black pill (theme-inverted) counts terminals running foreground commands other than `claude` or `codex`, refreshed every 2 seconds. Click it to choose a running process.
 
 Terminals that previously hosted a Claude Code session are excluded from the white/black pill until that session ends. Codex terminals are excluded by process name and, once their title has shown a spinner, until Codex clears the title on exit. The `SessionEnd` hook is the canonical way to release the terminal so it can be counted as non-Claude busy when running other commands afterwards; on macOS, a caffeinate-based monitor is also used as a fallback for hard exits (SIGKILL, terminal close).
 
-The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info for display. A "!" indicator appears if no update has been received for over 1 hour.
+The `statusLine` setting enables rate limit display in the sidebar. Claude Code periodically sends session data (including rate limit usage) via stdin to the configured command. Agentium passes it through to stdout (required by the protocol) and extracts rate limit info and the session’s model for display. A "!" indicator appears if no update has been received for over 1 hour.
 
 ## CLI
 
@@ -232,7 +246,7 @@ Claude Code hook integration. Events: `session-start`, `session-end`, `stop`, `n
 
 ### `agentium claude statusline`
 
-Claude Code statusline pass-through. Reads JSON from stdin, writes it back to stdout unchanged, and sends rate limit data to the running Agentium instance via IPC.
+Claude Code statusline pass-through. Reads JSON from stdin, writes it back to stdout unchanged, and sends rate limit data and the session’s model to the running Agentium instance via IPC. Task Overview displays the latest reported Claude model and the selected Codex ACP model for each agent. Claude model changes appear on the next statusline update.
 
 ### `agentium claude sessions`
 

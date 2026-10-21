@@ -47,6 +47,7 @@ impl TaskOverview {
         item_id: EntityId,
         label: &'static str,
         text: String,
+        summary: Option<String>,
         view: Entity<Self>,
     ) -> AnyElement {
         let text = text.trim().to_owned();
@@ -55,13 +56,14 @@ impl TaskOverview {
             .find(|(_, character)| matches!(character, '.' | '。'))
             .map(|(index, character)| index + character.len_utf8())
             .unwrap_or(text.len());
-        let has_more = !text[first_sentence_end..].trim().is_empty();
+        let has_summary = summary.is_some();
+        let has_more = has_summary || !text[first_sentence_end..].trim().is_empty();
         let key = (item_id, label);
         let expanded = self.expanded_messages.get(&key) == Some(&text);
         let visible = if expanded {
             text.clone()
         } else {
-            text[..first_sentence_end].to_owned()
+            summary.unwrap_or_else(|| text[..first_sentence_end].to_owned())
         };
         let icon_path = if label == "Request" {
             "icons/user-round.svg"
@@ -77,7 +79,7 @@ impl TaskOverview {
                 column.child(
                     Button::new(
                         SharedString::from(format!("overview-message-{item_id:?}-{label}")),
-                        if expanded { "Show less" } else { "Show more" },
+                        if expanded { "Show less" } else if has_summary { "Show original" } else { "Show more" },
                     )
                     .on_click(move |_, _, cx| {
                         view.update(cx, |overview, cx| {

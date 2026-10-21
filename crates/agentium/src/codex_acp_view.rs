@@ -97,6 +97,50 @@ pub(crate) struct CodexAcpView {
     _subscriptions: Vec<Subscription>,
 }
 
+fn current_model_name(options: Vec<acp_v2::SessionConfigOption>) -> Option<String> {
+    options.into_iter().find_map(|option| {
+        if option.category != Some(acp_v2::SessionConfigOptionCategory::Model) {
+            return None;
+        }
+        let acp_v2::SessionConfigKind::Select(select) = option.kind else {
+            return None;
+        };
+        let options: Vec<_> = match select.options {
+            acp_v2::SessionConfigSelectOptions::Ungrouped(options) => options,
+            acp_v2::SessionConfigSelectOptions::Grouped(groups) => {
+                groups.into_iter().flat_map(|group| group.options).collect()
+            }
+            _ => return None,
+        };
+        options.into_iter().find(|model| model.value == select.current_value)
+            .map(|model| model.name)
+    })
+}
+
+fn coordinator_model_option(
+    options: Vec<acp_v2::SessionConfigOption>,
+) -> Option<(acp_v2::SessionConfigId, acp_v2::SessionConfigValueId)> {
+    options.into_iter().find_map(|option| {
+        if option.category != Some(acp_v2::SessionConfigOptionCategory::Model) {
+            return None;
+        }
+        let acp_v2::SessionConfigKind::Select(select) = option.kind else {
+            return None;
+        };
+        let options: Vec<_> = match select.options {
+            acp_v2::SessionConfigSelectOptions::Ungrouped(options) => options,
+            acp_v2::SessionConfigSelectOptions::Grouped(groups) => {
+                groups.into_iter().flat_map(|group| group.options).collect()
+            }
+            _ => return None,
+        };
+        options
+            .into_iter()
+            .find(|model| model.name.to_lowercase().contains("luna"))
+            .map(|model| (option.config_id, model.value))
+    })
+}
+
 impl CodexAcpView {
     pub(crate) fn set_arena(&mut self, arena: WeakEntity<crate::arena::Arena>) {
         self.arena = arena;
@@ -290,6 +334,57 @@ impl CodexAcpView {
 
     pub(crate) fn conversation_id(&self) -> EntityId {
         self.conversation.entity_id()
+    }
+
+    pub(crate) fn suppress_completion_notifications(&mut self, cx: &mut Context<Self>) {
+        self.conversation.update(cx, |conversation, _| {
+            conversation.set_completion_notifications_enabled(false);
+        });
+    }
+
+    pub(crate) fn persistent_id(&self) -> uuid::Uuid {
+        self.saved_id
+    }
+
+    pub(crate) fn overview_turn_id(&self, cx: &App) -> Option<String> {
+        let thread = self.conversation.read(cx).root_thread(cx)?;
+        let index = thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rposition(|entry| matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)))?;
+        Some(format!("{}:{index}", thread.read(cx).session_id()))
+    }
+
+    pub(crate) fn current_model_name(&self, cx: &App) -> Option<String> {
+        let thread = self.conversation.read(cx).root_thread(cx)?;
+        let thread = thread.read(cx);
+        let configuration = thread.connection().session_config_options(thread.session_id(), cx)?;
+        current_model_name(configuration.config_options())
+    }
+
+    pub(crate) fn select_coordinator_model(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let thread = self.conversation.read(cx).root_thread(cx)?;
+        let thread = thread.read(cx);
+        let Some(configuration) = thread
+            .connection()
+            .session_config_options(thread.session_id(), cx)
+        else {
+            return Some(Task::ready(Err(anyhow::anyhow!(
+                "This Codex connection does not expose model selection"
+            ))));
+        };
+        let selection = coordinator_model_option(configuration.config_options());
+        let Some((id, value)) = selection else {
+            return Some(Task::ready(Err(anyhow::anyhow!(
+                "Luna is not available in this account's Codex model list"
+            ))));
+        };
+        let task = configuration.set_config_option(id, acp_v2::SessionConfigOptionValue::id(value), cx);
+        Some(cx.spawn(async move |_, _| task.await.map(|_| ())))
     }
 
     pub(crate) fn overview_turn(&self, cx: &App) -> Option<(String, String)> {
@@ -897,6 +992,47 @@ impl AgentServer for CodexAcpServer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overview_model_uses_current_selection_only() {
+        let model = super::acp_v2::SessionConfigOption::select(
+            "model", "Model", "second", vec![
+                super::acp_v2::SessionConfigSelectOption::new("first", "First model"),
+                super::acp_v2::SessionConfigSelectOption::new("second", "Second model"),
+            ],
+        ).category(super::acp_v2::SessionConfigOptionCategory::Model);
+        assert_eq!(super::current_model_name(vec![model.clone()]).as_deref(), Some("Second model"));
+        let mode = model.category(super::acp_v2::SessionConfigOptionCategory::Mode);
+        assert_eq!(super::current_model_name(vec![mode]), None);
+        assert_eq!(super::current_model_name(vec![]), None);
+    }
+
+    #[test]
+    fn coordinator_selects_luna_from_model_options_only() {
+        let mode = super::acp_v2::SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "other",
+            vec![super::acp_v2::SessionConfigSelectOption::new(
+                "wrong", "Luna",
+            )],
+        )
+        .category(super::acp_v2::SessionConfigOptionCategory::Mode);
+        let model = super::acp_v2::SessionConfigOption::select(
+            "model",
+            "Model",
+            "other",
+            vec![
+                super::acp_v2::SessionConfigSelectOption::new("other", "Other model"),
+                super::acp_v2::SessionConfigSelectOption::new("luna-id", "GPT-6 Luna"),
+            ],
+        )
+        .category(super::acp_v2::SessionConfigOptionCategory::Model);
+        assert!(super::coordinator_model_option(vec![mode.clone()]).is_none());
+        let (id, value) = super::coordinator_model_option(vec![mode, model]).expect("Luna selection");
+        assert_eq!(id.0.as_ref(), "model");
+        assert_eq!(value.0.as_ref(), "luna-id");
+    }
+
     use super::*;
     use agent_servers::FakeAcpAgentServer;
     use fs::FakeFs;

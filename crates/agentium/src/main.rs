@@ -46,6 +46,11 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Register Task Coordinator summaries for Task Overview
+    Coordinator {
+        #[command(subcommand)]
+        action: CoordinatorAction,
+    },
     Arena {
         #[command(subcommand)]
         action: ArenaAction,
@@ -97,6 +102,24 @@ enum Command {
         /// Timeout in seconds (default: 30)
         #[arg(long, short, default_value = "30")]
         timeout: u64,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum CoordinatorAction {
+    Summary {
+        #[command(subcommand)]
+        action: CoordinatorSummaryAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum CoordinatorSummaryAction {
+    Set {
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        json: String,
     },
 }
 
@@ -392,6 +415,16 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn coordinator_turn_message(event: &ClaudeHookEvent, input: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut message = serde_json::json!({ "type": "coordinator_claude_turn", "session_id": input["session_id"] });
+    match event {
+        ClaudeHookEvent::UserPromptSubmit => message["request"] = input["prompt"].clone(),
+        ClaudeHookEvent::Stop => message["response"] = input["last_assistant_message"].clone(),
+        _ => return None,
+    }
+    Some(message)
+}
+
 fn claude_stop_title(message: &str) -> Option<String> {
     let line = message.lines().find_map(|line| {
         let line = line.trim().trim_start_matches(['#', '>', '-', '*', ' ']);
@@ -408,6 +441,24 @@ fn claude_stop_title(message: &str) -> Option<String> {
 
 #[cfg(test)]
 mod claude_stop_title_tests {
+    #[test]
+    fn coordinator_hook_keeps_full_unicode_source() {
+        let text = "長い依頼と結果。\n".repeat(10000);
+        let input = serde_json::json!({"session_id":"session", "prompt":text, "last_assistant_message":text});
+        let request = super::coordinator_turn_message(&super::ClaudeHookEvent::UserPromptSubmit, &input).expect("request");
+        let response = super::coordinator_turn_message(&super::ClaudeHookEvent::Stop, &input).expect("response");
+        assert_eq!(request["request"], input["prompt"]);
+        assert_eq!(response["response"], input["last_assistant_message"]);
+        assert!(super::coordinator_turn_message(&super::ClaudeHookEvent::SessionStart, &input).is_none());
+    }
+
+    #[test]
+    fn coordinator_summary_command_parses() {
+        use clap::Parser as _;
+        let args = super::Args::try_parse_from(["agentium", "coordinator", "summary", "set", "--job-id", "job", "--json", "{}"]);
+        assert!(matches!(args.expect("valid CLI").command, Some(super::Command::Coordinator { .. })));
+    }
+
     use super::claude_stop_title;
 
     #[test]
@@ -719,6 +770,11 @@ fn cli_request_if_running(
                 .context(format!("cannot reach Agentium at {}", socket_path.display())));
         }
     };
+    if request["type"].as_str() == Some("coordinator_claude_turn") {
+        let timeout = Some(std::time::Duration::from_secs(3));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+    }
     stream.write_all(request.to_string().as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
@@ -1044,11 +1100,36 @@ enum IpcMessage {
     },
     TaskCommand(agentium::board::TaskCommand),
     ClaudeStatusline {
+        session_id: Option<String>,
+        model: Option<String>,
+        has_rate_limits: bool,
         five_hour_used_pct: f32,
         five_hour_resets_at: i64,
         seven_day_used_pct: f32,
         seven_day_resets_at: i64,
     },
+}
+
+fn claude_statusline_model(json: &serde_json::Value) -> Option<String> {
+    ["display_name", "id"].into_iter().find_map(|key| {
+        json["model"][key]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+    })
+}
+
+#[cfg(test)]
+mod statusline_tests {
+    #[test]
+    fn model_prefers_display_name_and_falls_back_to_id() {
+        let data = serde_json::json!({"model": {"id": "claude-model", "display_name": "Haiku"}});
+        assert_eq!(super::claude_statusline_model(&data).as_deref(), Some("Haiku"));
+        let data = serde_json::json!({"model": {"id": "claude-model", "display_name": " "}});
+        assert_eq!(super::claude_statusline_model(&data).as_deref(), Some("claude-model"));
+        assert_eq!(super::claude_statusline_model(&serde_json::json!({})), None);
+    }
 }
 
 fn try_send_path_to_running_instance(
@@ -2082,6 +2163,22 @@ fn handle_cli_request(
     }
 
     let result: anyhow::Result<serde_json::Value> = match request["type"].as_str() {
+        Some("coordinator_summary") => app.coordinator_summary(
+            request["job_id"].as_str().unwrap_or_default(), request["summary"].clone(), cx,
+        ).map(|()| serde_json::json!({"ok": true})),
+        Some("coordinator_claude_turn") => {
+            let session = request["session_id"].as_str().unwrap_or_default();
+            let prompt = request["request"].as_str().map(str::to_owned);
+            let response = request["response"].as_str().map(str::to_owned);
+            if let Some(prompt) = &prompt {
+                app.set_claude_session_prompt(session, peer_ancestor_pids.to_vec(), prompt.clone(), cx);
+            }
+            if let Some(response) = &response {
+                app.mark_claude_session_ready(session, peer_ancestor_pids.to_vec(), claude_stop_title(response), cx);
+            }
+            app.coordinator_claude_turn(session.to_owned(), prompt, response, peer_ancestor_pids, cx);
+            Ok(serde_json::json!({"ok": true}))
+        }
         Some("tab_self") => app
             .tab_self(&ancestor_pids, cx)
             .map(|tab| serde_json::json!({ "ok": true, "tab": tab })),
@@ -2311,6 +2408,9 @@ fn start_ipc_listener(
                                 let five_hour = &json["rate_limits"]["five_hour"];
                                 let seven_day = &json["rate_limits"]["seven_day"];
                                 IpcMessage::ClaudeStatusline {
+                                    session_id: json["session_id"].as_str().map(String::from),
+                                    model: claude_statusline_model(&json),
+                                    has_rate_limits: json["rate_limits"].is_object(),
                                     five_hour_used_pct: five_hour["used_percentage"]
                                         .as_f64()
                                         .unwrap_or(0.0) as f32,
@@ -2391,6 +2491,16 @@ fn main() {
             );
             return;
         }
+        Some(Command::Coordinator { action: CoordinatorAction::Summary { action: CoordinatorSummaryAction::Set { job_id, json } } }) => {
+            let result = serde_json::from_str::<serde_json::Value>(&json)
+                .map_err(anyhow::Error::from)
+                .and_then(|summary| cli_request(serde_json::json!({ "type": "coordinator_summary", "job_id": job_id, "summary": summary })));
+            match result {
+                Ok(reply) => println!("{reply}"),
+                Err(error) => { eprintln!("agentium: {error:#}"); std::process::exit(1); }
+            }
+            return;
+        }
         Some(Command::Claude {
             action: ClaudeAction::Hook { event },
         }) => {
@@ -2436,10 +2546,26 @@ fn main() {
                 msg["prompt"] = serde_json::Value::String(truncate_string(prompt, 500));
             }
 
-            let socket_path = agentium_socket_path();
-            if let Ok(socket) = UnixDatagram::unbound() {
-                if socket.connect(&socket_path).is_ok() {
-                    socket.send(msg.to_string().as_bytes()).ok();
+            let recorded = if let Some(turn) = coordinator_turn_message(&event, &json) {
+                match cli_request_if_running(turn) {
+                    Ok(reply) => reply.is_some(),
+                    Err(error) => {
+                        eprintln!("agentium: could not record coordinator source: {error:#}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if !recorded {
+                let socket_path = agentium_socket_path();
+                if let Ok(socket) = UnixDatagram::unbound() {
+                    if socket.connect(&socket_path).is_ok() {
+                        if let Err(error) = socket.send(msg.to_string().as_bytes()) {
+                            eprintln!("agentium: could not send hook event: {error:#}");
+                        }
+                    }
                 }
             }
             if is_permission_request {
@@ -2473,21 +2599,21 @@ fn main() {
                 }
             };
 
-            if let Some(rate_limits) = json.get("rate_limits") {
-                let msg = serde_json::json!({
-                    "type": "claude_statusline",
-                    "rate_limits": rate_limits,
-                });
-                let socket_path = agentium_socket_path();
-                match UnixDatagram::unbound().and_then(|socket| {
-                    socket.connect(&socket_path)?;
-                    socket.send(msg.to_string().as_bytes())?;
-                    Ok(())
-                }) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        eprintln!("agentium statusline: failed to send IPC: {err}");
-                    }
+            let msg = serde_json::json!({
+                "type": "claude_statusline",
+                "rate_limits": json.get("rate_limits"),
+                "session_id": json.get("session_id"),
+                "model": json.get("model"),
+            });
+            let socket_path = agentium_socket_path();
+            match UnixDatagram::unbound().and_then(|socket| {
+                socket.connect(&socket_path)?;
+                socket.send(msg.to_string().as_bytes())?;
+                Ok(())
+            }) {
+                Ok(()) => {}
+                Err(err) => {
+                    eprintln!("agentium statusline: failed to send IPC: {err}");
                 }
             }
             return;
@@ -3161,6 +3287,9 @@ fn main() {
                                                 .log_err();
                                         }
                                         IpcMessage::ClaudeStatusline {
+                                            session_id,
+                                            model,
+                                            has_rate_limits,
                                             five_hour_used_pct,
                                             five_hour_resets_at,
                                             seven_day_used_pct,
@@ -3168,13 +3297,18 @@ fn main() {
                                         } => {
                                             window_handle
                                                 .update(cx, |app, _window, cx| {
-                                                    app.update_rate_limits(
-                                                        five_hour_used_pct,
-                                                        five_hour_resets_at,
-                                                        seven_day_used_pct,
-                                                        seven_day_resets_at,
-                                                        cx,
-                                                    );
+                                                    if let (Some(session_id), Some(model)) = (session_id, model) {
+                                                        app.update_claude_model(session_id, model, cx);
+                                                    }
+                                                    if has_rate_limits {
+                                                        app.update_rate_limits(
+                                                            five_hour_used_pct,
+                                                            five_hour_resets_at,
+                                                            seven_day_used_pct,
+                                                            seven_day_resets_at,
+                                                            cx,
+                                                        );
+                                                    }
                                                 })
                                                 .log_err();
                                         }

@@ -7,6 +7,7 @@ pub mod file_browser_view;
 mod git_status_view;
 mod inbox_todo_view;
 mod task_overview;
+mod task_coordinator;
 pub mod questionnaire_view;
 mod review_view;
 mod svg_view;
@@ -1007,6 +1008,12 @@ struct BoardCache {
 }
 
 pub struct AgentiumApp {
+    coordinators: Entity<task_coordinator::Store>,
+    coordinator_runtime: HashMap<PathBuf, task_coordinator::Runtime>,
+    coordinator_claude_sources: HashMap<String, task_coordinator::Source>,
+    coordinator_poll: Option<Task<()>>,
+    _coordinator_subscription: Subscription,
+    _coordinator_quit_subscription: Subscription,
     codex_tabs: Entity<codex_acp_persistence::CodexAcpPersistence>,
     _codex_tabs_subscription: Subscription,
     _codex_quit_subscription: Subscription,
@@ -1024,6 +1031,7 @@ pub struct AgentiumApp {
     rename_editor: Entity<Editor>,
     renaming_arena: Option<Entity<Arena>>,
     pub(crate) claude_sessions: HashMap<String, ClaudeSession>,
+    claude_models: HashMap<String, String>,
     // Hook-less agents (Codex) tracked from their terminal title, keyed by the
     // terminal's wrapper PID. Kept apart from `claude_sessions` so Fork Session,
     // pr.json and the caffeinate monitor never see them.
@@ -1116,6 +1124,18 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let coordinators = cx.new(|_| {
+            task_coordinator::Store::new(paths::data_dir().join("task_coordinators.json"))
+        });
+        let coordinator_subscription = cx.observe(&coordinators, |_, _, cx| cx.notify());
+        let coordinator_quit_subscription = cx.on_app_quit(|this, cx| {
+            let pending = this.coordinators.update(cx, |store, _| store.finish());
+            async move {
+                if let Some(pending) = pending {
+                    pending.await;
+                }
+            }
+        });
         let codex_tabs = cx.new(|_| {
             codex_acp_persistence::CodexAcpPersistence::new(
                 paths::data_dir().join("codex_acp_tabs.json"),
@@ -1401,6 +1421,12 @@ impl AgentiumApp {
             inbox_todos.read(cx).lists(),
         );
         let mut this = Self {
+            coordinators,
+            coordinator_runtime: HashMap::new(),
+            coordinator_claude_sources: HashMap::new(),
+            coordinator_poll: None,
+            _coordinator_subscription: coordinator_subscription,
+            _coordinator_quit_subscription: coordinator_quit_subscription,
             codex_tabs,
             _codex_tabs_subscription: codex_tabs_subscription,
             _codex_quit_subscription: codex_quit_subscription,
@@ -1417,6 +1443,7 @@ impl AgentiumApp {
             rename_editor,
             renaming_arena: None,
             claude_sessions: HashMap::new(),
+            claude_models: HashMap::new(),
             title_driven_states: HashMap::new(),
             should_move_window: false,
             rate_limits: None,
@@ -1480,6 +1507,7 @@ impl AgentiumApp {
             _caffeinate_monitor_task: caffeinate_monitor_task,
         };
         this.rebuild_board_cache(cx);
+        this.start_coordinator_poll(window, cx);
         this
     }
 
@@ -1599,7 +1627,10 @@ impl AgentiumApp {
         }
         let arena = arena.read(cx);
         if let Some(directory) = arena.working_directory.clone() {
-            let tabs = arena.codex_tabs(cx);
+            let coordinator_id = self.coordinators.read(cx).get(&directory)
+                .and_then(|coordinator| coordinator.codex_id);
+            let tabs = arena.codex_tabs(cx).into_iter()
+                .filter(|tab| Some(tab.id) != coordinator_id).collect();
             self.codex_tabs
                 .update(cx, |store, cx| store.replace(directory, tabs, cx));
         }
@@ -2575,6 +2606,7 @@ impl AgentiumApp {
         prompt: String,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_coordinator_claude_turn(session_id, cx);
         self.drop_inbox_permissions(session_id);
         if let Some(session) = self.claude_sessions.get_mut(session_id) {
             session.user_prompt = prompt;
@@ -3582,7 +3614,8 @@ impl AgentiumApp {
                         .map_or(0, |view| view.read(cx).finished_turns()),
                 };
                 // ACP tabs pop up their own notification from the conversation view.
-                let notify = acp_view.is_none()
+                let notify = self.coordinator_provider_for_item(info.item.as_ref(), cx).is_none()
+                    && acp_view.is_none()
                     && !self.is_tab_in_view(&arena.downgrade(), &info.pane, item_id, cx);
                 finished.push(FinishedTab {
                     item_id,
@@ -5124,6 +5157,13 @@ impl AgentiumApp {
         if changed {
             self.sync_session_derived_state();
             self.notify_all_panes(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn update_claude_model(&mut self, session_id: String, model: String, cx: &mut Context<Self>) {
+        if self.claude_models.get(&session_id) != Some(&model) {
+            self.claude_models.insert(session_id, model);
             cx.notify();
         }
     }
@@ -7370,6 +7410,7 @@ impl AgentiumApp {
                         ),
                     ),
             );
+            content = content.child(self.render_coordinator(&arena, cx));
             let panes: Vec<_> = arena.read(cx).center.panes().into_iter().cloned().collect();
             for pane in panes {
                 let items: Vec<_> = pane.read(cx).items().cloned().collect();
@@ -7390,29 +7431,62 @@ impl AgentiumApp {
                         continue;
                     };
                     let info = self.tab_info(item.as_ref(), &arena, cx);
+                    let coordinator_provider = self.coordinator_provider_for_item(item.as_ref(), cx);
                     let session = match asker.as_ref() {
                         Some(InboxAsker::ClaudeSession { session_id }) => {
                             self.claude_sessions.get(session_id)
                         }
                         _ => None,
                     };
+                    let model = item
+                        .act_as::<codex_acp_view::CodexAcpView>(cx)
+                        .and_then(|view| view.read(cx).current_model_name(cx))
+                        .or_else(|| match asker.as_ref() {
+                            Some(InboxAsker::ClaudeSession { session_id }) => self.claude_models.get(session_id).cloned(),
+                            _ => None,
+                        });
+                    let model_label = model.map(|model| {
+                        if coordinator_provider.is_some() {
+                            format!("Coordinator · {model}")
+                        } else {
+                            model
+                        }
+                    }).or_else(|| coordinator_provider.map(|provider| match provider {
+                        task_coordinator::Provider::ClaudeHaiku => "Coordinator · Claude / Haiku (configured)".into(),
+                        task_coordinator::Provider::CodexLuna => "Coordinator · Codex / Luna (configured)".into(),
+                    }));
                     let acp_turn = item
                         .act_as::<codex_acp_view::CodexAcpView>(cx)
                         .and_then(|view| view.read(cx).overview_turn(cx));
+                    let unsupported_codex_terminal = acp_turn.is_none()
+                        && session.is_none()
+                        && process.as_deref() == Some("codex");
                     let prompt = acp_turn
                         .as_ref()
                         .map(|turn| turn.0.clone())
                         .or_else(|| session.map(|session| session.user_prompt.clone()))
                         .filter(|text| !text.is_empty())
                         .unwrap_or_else(|| {
-                            "Request not available. Open the agent tab to view the conversation."
-                                .into()
+                            if unsupported_codex_terminal {
+                                "Codex terminal requests are not collected — use a Codex ACP tab for coordinator summaries".into()
+                            } else {
+                                "Request not available. Open the agent tab to view the conversation.".into()
+                            }
                         });
                     let result = acp_turn
                         .map(|turn| turn.1)
                         .or_else(|| session.and_then(|session| session.result_title.clone()))
                         .filter(|text| !text.is_empty())
-                        .unwrap_or_else(|| "No result received for this turn.".into());
+                        .unwrap_or_else(|| {
+                            if unsupported_codex_terminal {
+                                "Codex terminal results are not collected".into()
+                            } else {
+                                "No result received for this turn.".into()
+                            }
+                        });
+                    let arena_path = arena.read(cx).working_directory.clone();
+                    let (prompt, request_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), false, prompt, cx);
+                    let (result, response_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), true, result, cx);
                     let item_id = item.item_id();
                     let target_pane = pane.clone();
                     let target_item = item.clone();
@@ -7429,7 +7503,11 @@ impl AgentiumApp {
                                 .gap_2()
                                 .child(Icon::new(icon))
                                 .child(div().flex_1().min_w_0().truncate().child(
-                                    info.title.split_whitespace().collect::<Vec<_>>().join(" "),
+                                    if coordinator_provider.is_some() {
+                                        task_coordinator::TITLE.to_string()
+                                    } else {
+                                        info.title.split_whitespace().collect::<Vec<_>>().join(" ")
+                                    },
                                 ))
                                 .child(
                                     Button::new(
@@ -7459,11 +7537,14 @@ impl AgentiumApp {
                                     )),
                                 ),
                         )
+                        .when_some(model_label, |card, label| {
+                            card.child(Label::new(label).color(Color::Muted))
+                        })
                         .child(overview.render_message(
-                            item_id, "Request", prompt, overview_entity.clone(),
+                            item_id, "Request", prompt, request_summary, overview_entity.clone(),
                         ))
                         .child(overview.render_message(
-                            item_id, "Response", result, overview_entity.clone(),
+                            item_id, "Response", result, response_summary, overview_entity.clone(),
                         ))
                         .child(
                             Button::new(("overview-open-agent", item_id), "Open agent tab")
@@ -7516,22 +7597,7 @@ impl AgentiumApp {
                 ));
             }
         }
-        content
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_1()
-                    .border_color(colors.border)
-                    .child(Label::new("Coordinator · Coming later").color(Color::Muted))
-                    .child(
-                        Label::new(
-                            "Task-wide instructions and agent assignments will appear here.",
-                        )
-                        .color(Color::Muted),
-                    ),
-            )
-            .into_any_element()
+        content.into_any_element()
     }
 
     fn render_overview_todo(
@@ -7550,9 +7616,7 @@ impl AgentiumApp {
         let closed = list.is_some_and(|list| {
             list.tab
                 .as_ref()
-                .and_then(|tab| {
-                    inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx)
-                })
+                .and_then(|tab| inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx))
                 .is_none()
         });
         let metadata = list.map(|list| {
@@ -7566,6 +7630,18 @@ impl AgentiumApp {
                 .format("%m-%d %H:%M");
             format!("{location} · updated {updated_at}")
         });
+        let (agent_name, agent_icon) = match list.and_then(|list| list.asker.as_ref()) {
+            Some(InboxAsker::ClaudeSession { .. }) => ("Claude", Some(IconName::AiClaude)),
+            Some(InboxAsker::CodexAcp { .. }) => ("Codex", Some(IconName::AiOpenAi)),
+            None => ("Agent", None),
+        };
+        let preview_items: Vec<_> = list
+            .into_iter()
+            .flat_map(|list| list.items.iter())
+            .take(2)
+            .map(|item| item.title.clone())
+            .collect();
+        let restoring = self.pending_todo_restores.contains_key(&todo_id);
         let expanded = overview.expanded.contains(&todo_id);
         let overview_entity = overview_entity.clone();
         let colors = cx.theme().colors();
@@ -7615,41 +7691,71 @@ impl AgentiumApp {
                     })
                 }),
         );
-        if closed {
-            section = section.child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .child(title.split_whitespace().collect::<Vec<_>>().join(" ")),
-            );
-            section = section.child(
-                Button::new(
-                    SharedString::from(format!("overview-restore-{todo_id}")),
-                    "Restore agent tab",
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.restore_inbox_todo(todo_id, window, cx)
-                })),
-            );
-            if let Some(error) = self.todo_restore_errors.get(&todo_id) {
-                section = section.child(Label::new(error.clone()).color(Color::Error));
-            }
-        }
         if expanded {
             let view = overview
                 .todos
                 .entry(todo_id)
                 .or_insert_with(|| {
                     let todos = self.inbox_todos.clone();
-                    let view = cx
-                        .new(|cx| inbox_todo_view::InboxTodoView::new(todos, todo_id, window, cx));
+                    let view =
+                        cx.new(|cx| inbox_todo_view::InboxTodoView::new(todos, todo_id, window, cx));
                     cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event)
                         .detach();
                     view
                 })
                 .clone();
             section = section.child(view);
+        }
+        if closed {
+            let colors = cx.theme().colors();
+            let mut card = v_flex()
+                .flex_shrink_0()
+                .min_w_0()
+                .gap_2()
+                .p_3()
+                .border_1()
+                .border_color(colors.border)
+                .rounded_md()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .when_some(agent_icon, |row, icon| row.child(Icon::new(icon)))
+                        .child(div().flex_1().child(agent_name))
+                        .child(
+                            Label::new(if restoring {
+                                "Restoring…"
+                            } else {
+                                "Not restored"
+                            })
+                            .color(Color::Muted),
+                        ),
+                )
+                .child(div().text_sm().child(title))
+                .child(Label::new("Saved To do items · agent tab is closed").color(Color::Muted))
+                .child(
+                    Button::new(
+                        SharedString::from(format!("overview-restore-{todo_id}")),
+                        "Restore agent tab",
+                    )
+                    .disabled(restoring)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restore_inbox_todo(todo_id, window, cx)
+                    })),
+                )
+                .child(section);
+            if !expanded {
+                for title in preview_items {
+                    card = card.child(div().text_sm().child(format!("• {title}")));
+                }
+                if count > 2 {
+                    card =
+                        card.child(Label::new(format!("And {} more", count - 2)).color(Color::Muted));
+                }
+            }
+            if let Some(error) = self.todo_restore_errors.get(&todo_id) {
+                card = card.child(Label::new(error.clone()).color(Color::Error));
+            }
+            return card.into_any_element();
         }
         section.into_any_element()
     }

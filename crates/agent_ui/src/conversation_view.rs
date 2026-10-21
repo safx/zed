@@ -787,6 +787,7 @@ pub struct ConversationView {
     server_state: ServerState,
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
+    completion_notifications_enabled: bool,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
@@ -1124,6 +1125,7 @@ impl ConversationView {
             ),
             initial_work_dirs,
             pending_selections: Vec::new(),
+            completion_notifications_enabled: true,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
@@ -2050,7 +2052,7 @@ impl ConversationView {
                 // Skip notifying when a queued message was just auto-sent: the agent
                 // is not actually idle and a notification here would fire just before the
                 // next turn starts.
-                if !sent_queued_message {
+                if !sent_queued_message && self.completion_notifications_enabled {
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
                     self.notify_with_sound(
                         if used_tools {
@@ -3186,6 +3188,10 @@ impl ConversationView {
             &self.code_span_resolver,
             cx,
         )
+    }
+
+    pub fn set_completion_notifications_enabled(&mut self, enabled: bool) {
+        self.completion_notifications_enabled = enabled;
     }
 
     fn notify_with_sound(
@@ -4619,6 +4625,29 @@ pub(crate) mod tests {
 
         assert!(
             cx.windows()
+                .iter()
+                .any(|window| window.downcast::<AgentNotification>().is_some())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_completion_notifications_can_be_disabled_for_background_agents(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        conversation_view.update(cx, |conversation, _| {
+            conversation.set_completion_notifications_enabled(false);
+        });
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        cx.deactivate_window();
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(
+            !cx.windows()
                 .iter()
                 .any(|window| window.downcast::<AgentNotification>().is_some())
         );
