@@ -19,6 +19,8 @@ pub(crate) struct TaskOverview {
     pub(crate) todos: HashMap<u64, Entity<InboxTodoView>>,
     pub(crate) todo_owners: HashMap<u64, EntityId>,
     pub(crate) expanded: std::collections::HashSet<u64>,
+    pub(crate) show_context: std::collections::HashSet<EntityId>,
+    pub(crate) collapsed_todos: std::collections::HashSet<u64>,
     expanded_messages: HashMap<(EntityId, &'static str), String>,
     _subscription: Subscription,
 }
@@ -36,6 +38,8 @@ impl TaskOverview {
             focus_handle: cx.focus_handle(),
             todos: HashMap::new(),
             expanded: Default::default(),
+            collapsed_todos: Default::default(),
+            show_context: Default::default(),
             todo_owners: HashMap::new(),
             expanded_messages: HashMap::new(),
             _subscription: subscription,

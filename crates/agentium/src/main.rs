@@ -70,13 +70,7 @@ enum Command {
         #[command(subcommand)]
         action: TaskAction,
     },
-    /// Agentium Inbox operations
-    Inbox {
-        #[command(subcommand)]
-        action: InboxAction,
-    },
-    /// This tab's to-do list in the Agentium Inbox: requests and proposals
-    /// for the user, handed over at the end of a turn
+    /// Task Overview questions, requests and proposals for the user
     Todo {
         #[command(subcommand)]
         action: TodoAction,
@@ -211,8 +205,8 @@ enum TabAction {
 }
 
 #[derive(clap::Subcommand)]
-enum InboxAction {
-    /// Ask the user to decide an implementation question from the Agentium Inbox.
+enum TodoAction {
+    /// Ask the user to decide an implementation question from the Task Overview.
     /// Returns immediately; end your turn afterwards. The answer arrives in this
     /// tab as a new user message.
     Ask {
@@ -233,10 +227,6 @@ enum InboxAction {
         #[arg(long, requires = "recommended")]
         assume: bool,
     },
-}
-
-#[derive(clap::Subcommand)]
-enum TodoAction {
     /// Replace this tab's whole list. Pass every item that still applies, not
     /// only new ones; the output names unanswered items that were dropped.
     Set {
@@ -984,6 +974,39 @@ fn print_todo_items(items: &[agentium::InboxTodoItem], indent: &str) {
 
 fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
     match action {
+        TodoAction::Ask {
+            question,
+            context,
+            options,
+            recommended,
+            assume,
+        } => {
+            let options: Vec<serde_json::Value> =
+                options.iter().map(|option| inbox_option_json(option)).collect();
+            if recommended == Some(0) {
+                anyhow::bail!("--recommended is 1-based");
+            }
+            let response = cli_request(serde_json::json!({
+                "type": "todo_ask",
+                "question": question,
+                "context": context,
+                "options": options,
+                "recommended": recommended.map(|number| number - 1),
+                "assume": assume,
+            }))?;
+            if assume {
+                println!(
+                    "Asked in the Task Overview (question {}). Continue with the option you assumed; if the user picks another or adds a note, the answer will arrive as a new message.",
+                    response["id"]
+                );
+            } else {
+                println!(
+                    "Asked in the Task Overview (question {}). End your turn now; the answer will arrive as a new message.",
+                    response["id"]
+                );
+            }
+            Ok(())
+        }
         TodoAction::Set {
             user_tasks,
             proposals,
@@ -1024,6 +1047,22 @@ fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
                 println!("{title} (read-only):");
                 print_todo_items(&items, "  ");
             }
+            if let Some(questions) = response["questions"].as_array() {
+                for question in questions {
+                    println!("Question #{} · {}{}: {}", question["id"],
+                        question["owner"].as_str().unwrap_or("Agent"),
+                        if question["own"].as_bool() == Some(true) { " (this tab)" } else { " (read-only)" },
+                        question["question"].as_str().unwrap_or_default());
+                    if let Some(context) = question["context"].as_str() { println!("  {context}"); }
+                    if let Some(options) = question["options"].as_array() {
+                        for (index, option) in options.iter().enumerate() {
+                            println!("  {}. {}{}", index + 1, option["label"].as_str().unwrap_or_default(),
+                                if question["recommended"].as_u64() == Some(index as u64) { " (recommended)" } else { "" });
+                        }
+                    }
+                    if question["assumed"].as_bool() == Some(true) { println!("  Continuing with the recommended option"); }
+                }
+            }
             Ok(())
         }
         TodoAction::Clear => {
@@ -1034,43 +1073,6 @@ fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
     }
 }
 
-fn run_inbox_action(action: InboxAction) -> anyhow::Result<()> {
-    match action {
-        InboxAction::Ask {
-            question,
-            context,
-            options,
-            recommended,
-            assume,
-        } => {
-            let options: Vec<serde_json::Value> =
-                options.iter().map(|option| inbox_option_json(option)).collect();
-            if recommended == Some(0) {
-                anyhow::bail!("--recommended is 1-based");
-            }
-            let response = cli_request(serde_json::json!({
-                "type": "inbox_ask",
-                "question": question,
-                "context": context,
-                "options": options,
-                "recommended": recommended.map(|number| number - 1),
-                "assume": assume,
-            }))?;
-            if assume {
-                println!(
-                    "Asked in the Agentium Inbox (question {}). Continue with the option you assumed; if the user picks another or adds a note, the answer will arrive as a new message.",
-                    response["id"]
-                );
-            } else {
-                println!(
-                    "Asked in the Agentium Inbox (question {}). End your turn now; the answer will arrive as a new message.",
-                    response["id"]
-                );
-            }
-            Ok(())
-        }
-    }
-}
 
 enum IpcMessage {
     WorkspacePath(PathBuf),
@@ -1662,14 +1664,20 @@ mod peer_pid_tests {
 
 #[cfg(test)]
 mod inbox_cli_tests {
-    use super::{Args, Command, InboxAction, TodoAction, inbox_option_json, todo_set_request};
+    use super::{Args, Command, TodoAction, inbox_option_json, todo_set_request};
     use clap::Parser as _;
+
+    #[test]
+    fn inbox_command_is_removed() {
+        assert!(Args::try_parse_from(["agentium", "inbox", "ask", "Question?"]).is_err());
+        assert!(Args::try_parse_from(["agentium", "todo", "ask", "Question?"]).is_ok());
+    }
 
     #[test]
     fn inbox_ask_options_split_label_from_description() {
         let args = Args::try_parse_from([
             "agentium",
-            "inbox",
+            "todo",
             "ask",
             "Close the month in JST or UTC?",
             "--option",
@@ -1681,12 +1689,12 @@ mod inbox_cli_tests {
             "--recommended",
             "1",
         ])
-        .expect("inbox ask arguments");
-        let Some(Command::Inbox {
-            action: InboxAction::Ask { options, recommended, .. },
+        .expect("todo ask arguments");
+        let Some(Command::Todo {
+            action: TodoAction::Ask { options, recommended, .. },
         }) = args.command
         else {
-            panic!("expected inbox ask");
+            panic!("expected todo ask");
         };
         assert_eq!(recommended, Some(1));
         assert_eq!(
@@ -1752,15 +1760,15 @@ mod inbox_cli_tests {
 
     #[test]
     fn inbox_ask_assume_requires_a_recommended_option() {
-        assert!(Args::try_parse_from(["agentium", "inbox", "ask", "Q?", "--assume"]).is_err());
+        assert!(Args::try_parse_from(["agentium", "todo", "ask", "Q?", "--assume"]).is_err());
         let args = Args::try_parse_from([
-            "agentium", "inbox", "ask", "Q?", "--option", "A", "--recommended", "1", "--assume",
+            "agentium", "todo", "ask", "Q?", "--option", "A", "--recommended", "1", "--assume",
         ])
-        .expect("inbox ask --assume arguments");
+        .expect("todo ask --assume arguments");
         assert!(matches!(
             args.command,
-            Some(Command::Inbox {
-                action: InboxAction::Ask { assume: true, .. }
+            Some(Command::Todo {
+                action: TodoAction::Ask { assume: true, .. }
             })
         ));
     }
@@ -2233,7 +2241,7 @@ fn handle_cli_request(
             })
             .map(|()| serde_json::json!({ "ok": true })),
         Some("task_list") => Ok(serde_json::json!({ "ok": true, "tasks": app.task_list() })),
-        Some("inbox_ask") => {
+        Some("todo_ask") => {
             let options = request["options"]
                 .as_array()
                 .map(|options| {
@@ -2248,7 +2256,7 @@ fn handle_cli_request(
                         .collect()
                 })
                 .unwrap_or_default();
-            app.inbox_ask(
+            app.todo_ask(
                 peer_ancestor_pids,
                 request["question"].as_str().unwrap_or_default().to_string(),
                 request["context"].as_str().map(String::from),
@@ -2726,13 +2734,6 @@ fn main() {
                 if socket.connect(&socket_path).is_ok() {
                     socket.send(msg.to_string().as_bytes()).ok();
                 }
-            }
-            return;
-        }
-        Some(Command::Inbox { action }) => {
-            if let Err(error) = run_inbox_action(action) {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
             }
             return;
         }

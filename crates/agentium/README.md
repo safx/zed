@@ -318,3 +318,11 @@ Replace the placeholder icons at `crates/agentium/resources/app-icon{,@2x}.png` 
 ```
 if command -v agentium >/dev/null 2>&1; then eval "$(command agentium completions zsh)"; fi
 ```
+
+### Questions in To do
+
+Use `agentium todo ask "Question" --option "Choice::Explanation" --recommended 1` to request a decision. Omit options for a free-text answer. `--assume` continues with the recommended option; confirming it without a note does not send a message. The former `agentium inbox` command has been removed.
+
+Task Overview puts questions before tasks and proposals in each agent’s To do section. Choose an option, add an optional note, then confirm the answer. Successful answers and skipped questions move to the collapsible processed items; delivery failures remain pending. Questions contribute to the sidebar’s To do count. Request and response are collapsed by default.
+
+`todo list` includes pending questions in the current arena. `todo set` and `todo clear` affect only tasks and proposals, never unanswered questions. Saved questions from earlier versions are retained. Answers to questions are persisted; ordinary processed task/proposal history retains its existing lifetime.
