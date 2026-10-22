@@ -452,6 +452,7 @@ pub struct TodoListReply {
     pub own: Vec<InboxTodoItem>,
     /// Other tabs of the caller's arena, by tab title.
     pub others: Vec<(String, Vec<InboxTodoItem>)>,
+    pub questions: Vec<serde_json::Value>,
 }
 
 /// Requests and proposals an agent handed to the user at the end of a turn.
@@ -529,12 +530,18 @@ struct InboxTab {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InboxQuestion {
     id: u64,
+    #[serde(default)]
+    arena_path: Option<PathBuf>,
+    #[serde(default)]
+    resolution: Option<String>,
+    #[serde(skip)]
+    selected_option: Option<usize>,
     question: String,
     context: Option<String>,
     options: Vec<InboxOption>,
     recommended: Option<usize>,
     /// The agent kept working on the recommended option instead of ending
-    /// its turn (`inbox ask --assume`).
+    /// its turn (`todo ask --assume`).
     #[serde(default)]
     assumed: bool,
     arena_name: String,
@@ -552,6 +559,45 @@ impl InboxTab {
 }
 
 impl InboxQuestion {
+    fn belongs_to(&self, item_id: EntityId, asker: Option<&InboxAsker>) -> bool {
+        self.tab.as_ref().is_some_and(|tab| tab.item.id() == item_id)
+            || asker.is_some_and(|asker| self.asker.as_ref() == Some(asker))
+    }
+
+    fn answer(&self, option_index: Option<usize>, note: &str) -> Option<(String, bool)> {
+        if self.resolution.is_some() {
+            return None;
+        }
+        let note = note.trim();
+        let mut answer = match option_index {
+            Some(index) => {
+                let option = self.options.get(index)?;
+                if note.is_empty() { option.label.clone() } else { format!("{}\nNote: {note}", option.label) }
+            }
+            None if self.options.is_empty() && !note.is_empty() => note.to_string(),
+            None => return None,
+        };
+        if let Some(assumed_index) = self.recommended.filter(|_| self.assumed) {
+            // Confirming the assumption must not start another agent turn.
+            if option_index == Some(assumed_index) && note.is_empty() {
+                return Some((answer, true));
+            }
+            if option_index == Some(assumed_index) {
+                answer.push_str("\nThis matches the option you assumed; apply the note.");
+            } else {
+                let assumed_label = self.options.get(assumed_index)?.label.as_str();
+                answer.push_str(&format!("\nYou assumed \"{assumed_label}\". Revise the work you did on that assumption."));
+            }
+        }
+        Some((answer, false))
+    }
+
+    fn resolve(&mut self, resolution: String) {
+        self.resolution = Some(resolution);
+        self.selected_option = None;
+        self.error = None;
+    }
+
     fn live_tab(&self) -> Option<(Entity<Arena>, Entity<Pane>, Box<dyn workspace::ItemHandle>)> {
         self.tab.as_ref()?.live()
     }
@@ -621,7 +667,7 @@ enum RecordedTabState {
 /// Records each tab whose finish key changed since the previous sync, replacing
 /// that tab's existing record (same item, or same asker). Tabs in
 /// `asking_items` are not recorded as completed: the asking agent ends its turn
-/// right after `inbox ask`, and that is not a finished task. They are still
+/// right after `todo ask`, and that is not a finished task. They are still
 /// remembered as seen, so answering the question does not record the stale
 /// completion. Returns each new record id with whether to pop up a notification.
 fn record_finished_tabs(
@@ -3112,7 +3158,7 @@ impl AgentiumApp {
     /// `peer_ancestor_pids`. Only the kernel-verified peer ancestry is used:
     /// the answer is later pasted into that tab, so a self-reported pid list
     /// would let any process redirect it.
-    pub fn inbox_ask(
+    pub fn todo_ask(
         &mut self,
         peer_ancestor_pids: &[u32],
         question: String,
@@ -3138,6 +3184,9 @@ impl AgentiumApp {
         self.next_inbox_question_id += 1;
         self.inbox_questions.push(InboxQuestion {
             id,
+            arena_path: arena.read(cx).working_directory.clone(),
+            resolution: None,
+            selected_option: None,
             question,
             context,
             options,
@@ -3258,7 +3307,15 @@ impl AgentiumApp {
                 })
             })
             .collect();
-        Ok(TodoListReply { own, others })
+        let questions = self.inbox_questions.iter()
+            .filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[arena.entity_id()], &[], cx))
+            .map(|question| serde_json::json!({
+                "id": question.id, "question": question.question, "context": question.context,
+                "options": question.options, "recommended": question.recommended, "assumed": question.assumed,
+                "owner": question.live_tab().map(|(_, _, item)| item.tab_content_text(0, cx).to_string()).unwrap_or_else(|| "Agent (not restored)".into()),
+                "own": question.belongs_to(item.item_id(), asker.as_ref()),
+            })).collect();
+        Ok(TodoListReply { own, others, questions })
     }
 
     pub fn todo_clear(
@@ -3591,7 +3648,7 @@ impl AgentiumApp {
         let asking_items: HashSet<EntityId> = self
             .inbox_questions
             .iter()
-            .filter(|question| !question.assumed)
+            .filter(|question| question.resolution.is_none() && !question.assumed)
             .filter_map(|question| question.tab.as_ref().map(|tab| tab.item.id()))
             .collect();
         let mut finished = Vec::new();
@@ -3924,8 +3981,10 @@ impl AgentiumApp {
     }
 
     fn dismiss_inbox_question(&mut self, question_id: u64, cx: &mut Context<Self>) {
-        self.inbox_questions
-            .retain(|question| question.id != question_id);
+        if let Some(question) = self.inbox_questions.iter_mut().find(|question| question.id == question_id && question.resolution.is_none()) {
+            question.resolve("Skipped · no answer sent".into());
+        }
+        self.inbox_note_editors.remove(&question_id);
         self.persist_inbox(cx);
         cx.notify();
     }
@@ -3963,7 +4022,7 @@ impl AgentiumApp {
         let Some(position) = self
             .inbox_questions
             .iter()
-            .position(|question| question.id == question_id)
+            .position(|question| question.id == question_id && question.resolution.is_none())
         else {
             return;
         };
@@ -3973,48 +4032,20 @@ impl AgentiumApp {
             .map(|editor| editor.read(cx).text(cx).trim().to_string())
             .unwrap_or_default();
         let question = &self.inbox_questions[position];
-        let mut answer = match option_index {
-            Some(index) => {
-                let Some(option) = question.options.get(index) else {
-                    return;
-                };
-                if note.is_empty() {
-                    option.label.clone()
-                } else {
-                    format!("{}\nNote: {note}", option.label)
-                }
-            }
-            None if question.options.is_empty() && !note.is_empty() => note.clone(),
-            None => return,
+        let Some((answer, silent)) = question.answer(option_index, &note) else {
+            return;
         };
-        let assumed_index = question.recommended.filter(|_| question.assumed);
-        if let Some(assumed_index) = assumed_index {
-            if option_index == Some(assumed_index) && note.is_empty() {
-                // The agent is already working on this answer; telling it so
-                // would only start a needless turn.
-                self.inbox_questions.remove(position);
-                self.inbox_note_editors.remove(&question_id);
-                self.persist_inbox(cx);
-                cx.notify();
-                return;
-            }
-            let assumed_label = question
-                .options
-                .get(assumed_index)
-                .map(|option| option.label.as_str())
-                .unwrap_or_default();
-            if option_index == Some(assumed_index) {
-                answer.push_str("\nThis matches the option you assumed; apply the note.");
-            } else {
-                answer.push_str(&format!(
-                    "\nYou assumed \"{assumed_label}\". Revise the work you did on that assumption."
-                ));
-            }
+        if silent {
+            self.inbox_questions[position].resolve(format!("Answered: {answer} · confirmed without notifying the agent"));
+            self.inbox_note_editors.remove(&question_id);
+            self.persist_inbox(cx);
+            cx.notify();
+            return;
         }
         let text = with_from_line(
-            "Agentium Inbox",
+            "Task Overview",
             &format!(
-                "Answer to your `agentium inbox ask` question.\nQuestion: {}\nAnswer: {answer}",
+                "Answer to your `agentium todo ask` question.\nQuestion: {}\nAnswer: {answer}",
                 question.question
             ),
         );
@@ -4024,7 +4055,7 @@ impl AgentiumApp {
         };
         match result {
             Ok(()) => {
-                self.inbox_questions.remove(position);
+                self.inbox_questions[position].resolve(format!("Answered: {answer}"));
                 self.inbox_note_editors.remove(&question_id);
                 self.persist_inbox(cx);
             }
@@ -4041,16 +4072,17 @@ impl AgentiumApp {
         let question_ids: HashSet<u64> = self
             .inbox_questions
             .iter()
+            .filter(|question| question.resolution.is_none())
             .map(|question| question.id)
             .collect();
         self.inbox_note_editors
             .retain(|question_id, _| question_ids.contains(question_id));
-        for question in &self.inbox_questions {
+        for question in self.inbox_questions.iter().filter(|question| question.resolution.is_none()) {
             let has_options = !question.options.is_empty();
             self.inbox_note_editors
                 .entry(question.id)
                 .or_insert_with(|| {
-                    cx.new(|cx| {
+                    let editor = cx.new(|cx| {
                         let mut editor = Editor::auto_height(1, 6, window, cx);
                         editor.set_placeholder_text(
                             if has_options {
@@ -4062,7 +4094,9 @@ impl AgentiumApp {
                             cx,
                         );
                         editor
-                    })
+                    });
+                    cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+                    editor
                 });
         }
     }
@@ -7490,6 +7524,8 @@ impl AgentiumApp {
                     let item_id = item.item_id();
                     let target_pane = pane.clone();
                     let target_item = item.clone();
+                    let show_context = overview.show_context.contains(&item_id);
+                    let context_view = overview_entity.clone();
                     let mut card = v_flex()
                         .flex_shrink_0()
                         .min_w_0()
@@ -7513,12 +7549,12 @@ impl AgentiumApp {
                                     Button::new(
                                         ("overview-status", item_id),
                                         if self.inbox_questions.iter().any(|question| {
-                                            question
+                                            question.resolution.is_none() && !question.assumed && question
                                                 .tab
                                                 .as_ref()
                                                 .is_some_and(|tab| tab.item.id() == item_id)
                                         }) {
-                                            "Decision"
+                                            "Awaiting answer"
                                         } else {
                                             match info.state {
                                                 Some("running") => "Running",
@@ -7540,12 +7576,14 @@ impl AgentiumApp {
                         .when_some(model_label, |card, label| {
                             card.child(Label::new(label).color(Color::Muted))
                         })
-                        .child(overview.render_message(
-                            item_id, "Request", prompt, request_summary, overview_entity.clone(),
-                        ))
-                        .child(overview.render_message(
-                            item_id, "Response", result, response_summary, overview_entity.clone(),
-                        ))
+                        .child(Button::new(("overview-context", item_id), if show_context { "▾ Request and response" } else { "▸ Request and response" })
+                            .on_click(move |_, _, cx| context_view.update(cx, |overview, cx| {
+                                if !overview.show_context.remove(&item_id) { overview.show_context.insert(item_id); }
+                                cx.notify();
+                            })))
+                        .when(show_context, |card| card
+                            .child(overview.render_message(item_id, "Request", prompt, request_summary, overview_entity.clone()))
+                            .child(overview.render_message(item_id, "Response", result, response_summary, overview_entity.clone())))
                         .child(
                             Button::new(("overview-open-agent", item_id), "Open agent tab")
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -7568,19 +7606,17 @@ impl AgentiumApp {
                             .iter()
                             .find_map(|(id, owner)| (*owner == item_id).then_some(*id))
                     });
+                    let question_ids: Vec<_> = self.inbox_questions.iter()
+                        .filter(|question| question.belongs_to(item_id, asker.as_ref()))
+                        .map(|question| question.id).collect();
                     if let Some(todo_id) = todo_id {
                         overview.todo_owners.insert(todo_id, item_id);
                         rendered_todos.insert(todo_id);
-                        card = card.child(self.render_overview_todo(
-                            todo_id,
-                            overview,
-                            &overview_entity,
-                            window,
-                            cx,
-                        ));
+                    }
+                    if let Some(section_id) = todo_id.or_else(|| question_ids.first().copied()) {
+                        card = card.child(self.render_agent_todos(section_id, &question_ids, overview, &overview_entity, window, cx));
                     } else {
-                        card =
-                            card.child(Label::new("No pending To do items.").color(Color::Muted));
+                        card = card.child(Label::new("No pending To do items.").color(Color::Muted));
                     }
                     content = content.child(card);
                 }
@@ -7597,7 +7633,73 @@ impl AgentiumApp {
                 ));
             }
         }
+        let closed_questions: Vec<_> = self.inbox_questions.iter()
+            .filter(|question| question.live_tab().is_none() && self.question_in_scope(question, &arena_ids, &paths, cx))
+            .map(|question| (question.id, question.arena_name.clone())).collect();
+        for (question_id, arena_name) in closed_questions {
+            content = content.child(v_flex().min_w_0().flex_shrink_0().gap_2().p_3().border_1().border_color(colors.border).rounded_md()
+                .child(Label::new(format!("{arena_name} · Agent not restored")))
+                .child(self.render_agent_todos(question_id, &[question_id], overview, &overview_entity, window, cx)));
+        }
         content.into_any_element()
+    }
+
+    fn question_in_scope(&self, question: &InboxQuestion, arena_ids: &[EntityId], paths: &[PathBuf], cx: &App) -> bool {
+        if let Some((arena, _, _)) = question.live_tab() {
+            return arena_ids.contains(&arena.entity_id())
+                || arena.read(cx).working_directory.as_ref().is_some_and(|path| paths.contains(path));
+        }
+        if let Some(path) = &question.arena_path {
+            return paths.contains(path) || self.arenas.iter().any(|arena| arena_ids.contains(&arena.entity_id()) && arena.read(cx).working_directory.as_ref() == Some(path));
+        }
+        let mut matching = self.arenas.iter().filter(|arena| arena.read(cx).name == question.arena_name);
+        let Some(arena) = matching.next() else { return false; };
+        matching.next().is_none() && arena_ids.contains(&arena.entity_id())
+    }
+
+    fn render_agent_todos(
+        &mut self,
+        section_id: u64,
+        question_ids: &[u64],
+        overview: &mut task_overview::TaskOverview,
+        overview_entity: &Entity<task_overview::TaskOverview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut questions: Vec<_> = self.collect_inbox_entries(cx).questions.into_iter()
+            .filter(|row| question_ids.contains(&row.id)).collect();
+        questions.sort_by_key(|row| row.assumed);
+        let count = questions.len() + self.inbox_todos.read(cx).list(section_id).map_or(0, |list| list.items.len());
+        let history: Vec<_> = self.inbox_questions.iter().filter(|question| question_ids.contains(&question.id))
+            .filter_map(|question| question.resolution.as_ref().map(|resolution| (question.question.clone(), resolution.clone()))).collect();
+        let expanded = !overview.collapsed_todos.contains(&section_id);
+        let overview_entity = overview_entity.clone();
+        let mut section = v_flex().min_w_0().flex_shrink_0().gap_2().child(
+            Button::new(SharedString::from(format!("agent-todos-{section_id}")), format!("{} To do · {count}", if expanded { "▾" } else { "▸" }))
+                .on_click(move |_, _, cx| overview_entity.update(cx, |overview, cx| {
+                    if !overview.collapsed_todos.remove(&section_id) { overview.collapsed_todos.insert(section_id); }
+                    cx.notify();
+                }))
+        );
+        if expanded {
+            let has_questions = !questions.is_empty();
+            section = section.children(questions.into_iter().map(|row| self.render_inbox_question(row, cx)));
+            let view = overview.todos.entry(section_id).or_insert_with(|| {
+                let todos = self.inbox_todos.clone();
+                let view = cx.new(|cx| inbox_todo_view::InboxTodoView::new(todos, section_id, window, cx));
+                cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event).detach();
+                view
+            }).clone();
+            view.update(cx, |view, cx| {
+                if view.question_history != history || view.pending_questions != has_questions {
+                    view.question_history = history;
+                    view.pending_questions = has_questions;
+                    cx.notify();
+                }
+            });
+            section = section.child(view);
+        }
+        section.into_any_element()
     }
 
     fn render_overview_todo(
@@ -7766,7 +7868,8 @@ impl AgentiumApp {
         };
         let todo_count = self.overview_todo_ids(&[arena_entity.entity_id()], &[], cx).iter()
             .filter_map(|id| self.inbox_todos.read(cx).list(*id))
-            .map(|list| list.items.len()).sum::<usize>();
+            .map(|list| list.items.len()).sum::<usize>()
+            + self.inbox_questions.iter().filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[arena_entity.entity_id()], &[], cx)).count();
         let arena_entity = &arena_entity;
         let colors = cx.theme().colors();
         let active_index = self.active_arena_index;
@@ -8397,7 +8500,7 @@ impl AgentiumApp {
 
     fn collect_inbox_entries(&self, cx: &App) -> InboxEntries {
         let mut entries = InboxEntries::default();
-        for question in &self.inbox_questions {
+        for question in self.inbox_questions.iter().filter(|question| question.resolution.is_none()) {
             let resume_hint = match (question.live_tab(), &question.asker) {
                 (Some(_), _) | (None, None) => None,
                 (None, Some(InboxAsker::ClaudeSession { session_id })) => Some(format!(
@@ -8912,6 +9015,8 @@ impl AgentiumApp {
         let status_colors = cx.theme().status().clone();
         let question_id = row.id;
         let has_options = !row.options.is_empty();
+        let selected = self.inbox_questions.iter().find(|question| question.id == question_id).and_then(|question| question.selected_option);
+        let has_note = self.inbox_note_editors.get(&question_id).is_some_and(|editor| !editor.read(cx).text(cx).trim().is_empty());
         let option_buttons = row
             .options
             .into_iter()
@@ -8926,7 +9031,7 @@ impl AgentiumApp {
                     .py_1()
                     .rounded_md()
                     .border_1()
-                    .border_color(if is_recommended {
+                    .border_color(if selected == Some(option_index) {
                         inbox_decision_color()
                     } else {
                         colors.border
@@ -8964,8 +9069,11 @@ impl AgentiumApp {
                                 .child(description),
                         )
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.answer_inbox_question(question_id, Some(option_index), window, cx);
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(question) = this.inbox_questions.iter_mut().find(|question| question.id == question_id) {
+                            question.selected_option = Some(option_index);
+                        }
+                        cx.notify();
                     }))
                     .into_any_element()
             })
@@ -9016,16 +9124,18 @@ impl AgentiumApp {
                         .child(editor),
                 )
             })
-            .when(!has_options, |d| {
+            .child(Label::new(if row.assumed { "Continuing with recommended option" } else { "Awaiting answer" }).color(Color::Muted))
+            .when(true, |d| {
                 d.child(
                     h_flex().justify_end().child(
                         Button::new(
                             SharedString::from(format!("inbox-question-{question_id}-send")),
-                            "Send",
+                            if row.assumed { "Confirm answer" } else { "Answer and resume" },
                         )
+                        .disabled(if has_options { selected.is_none() } else { !has_note })
                         .style(ButtonStyle::Filled)
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.answer_inbox_question(question_id, None, window, cx);
+                            this.answer_inbox_question(question_id, selected, window, cx);
                         })),
                     ),
                 )
@@ -9050,7 +9160,7 @@ impl AgentiumApp {
                 h_flex().justify_end().child(
                     Button::new(
                         SharedString::from(format!("inbox-question-{question_id}-dismiss")),
-                        "Dismiss",
+                        "Skip question",
                     )
                     .style(ButtonStyle::Subtle)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
@@ -9382,7 +9492,8 @@ impl AgentiumApp {
         let path_for_open = path.clone();
         let todo_count: usize = self.overview_todo_ids(&[], std::slice::from_ref(&path), cx).iter()
             .filter_map(|id| self.inbox_todos.read(cx).list(*id))
-            .map(|list| list.items.len()).sum();
+            .map(|list| list.items.len()).sum::<usize>()
+            + self.inbox_questions.iter().filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[], std::slice::from_ref(&path), cx)).count();
         let path_for_menu = path;
 
         h_flex()
@@ -10142,9 +10253,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_questions_remain_pending_and_resolutions_survive_restart() {
+        let legacy = serde_json::json!({
+            "id": 42, "question": "JST or UTC?", "context": null,
+            "options": [{"label": "JST", "description": null}],
+            "recommended": 0, "assumed": true, "arena_name": "billing",
+            "asker": {"kind": "claude_session", "session_id": "billing-session"}
+        });
+        let mut question: InboxQuestion = serde_json::from_value(legacy).expect("legacy question");
+        assert!(question.resolution.is_none());
+        assert!(question.arena_path.is_none());
+        assert_eq!(question.answer(None, ""), None);
+        assert_eq!(question.answer(Some(9), ""), None);
+        assert_eq!(question.answer(Some(0), " "), Some(("JST".into(), true)));
+        let (answer, silent) = question.answer(Some(0), "Use next month").expect("answer with note");
+        assert!(!silent);
+        assert!(answer.contains("Use next month"));
+        question.options.push(InboxOption { label: "UTC".into(), description: None });
+        let (answer, silent) = question.answer(Some(1), "").expect("changed answer");
+        assert!(!silent);
+        assert!(answer.contains("Revise the work"));
+        question.selected_option = Some(0);
+        question.error = Some("delivery failed".into());
+        question.resolve("Answered: JST · confirmed without notifying the agent".into());
+        assert!(question.answer(Some(0), "").is_none());
+        assert!(question.selected_option.is_none());
+        assert!(question.error.is_none());
+        let saved = serde_json::to_value(&question).expect("save resolution");
+        assert!(saved.get("selected_option").is_none());
+        let restored: InboxQuestion = serde_json::from_value(saved).expect("restore resolution");
+        assert_eq!(restored.resolution, question.resolution);
+        assert_eq!(next_inbox_id(&[restored], &[], &[]), 43);
+    }
+
+    #[test]
     fn inbox_question_persists_its_asker_but_not_its_tab() {
         let question = InboxQuestion {
             id: 3,
+            arena_path: None,
+            resolution: None,
+            selected_option: None,
             question: "JST or UTC?".to_string(),
             context: None,
             options: vec![InboxOption {

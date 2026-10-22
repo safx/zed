@@ -1,16 +1,16 @@
 ---
 name: agentium-inbox
-description: "Ask the user to decide an implementation question (spec gap, design choice between alternatives) through the Agentium Inbox with `agentium inbox ask`, then end the turn; or, at the end of a turn, hand the user your requests and proposals with `agentium todo set` instead of listing them in chat. Use when TERM_PROGRAM=agentium and you need the user's decision before continuing, or are about to list remaining items, things for the user to do, or work you propose next. Not for permission to run commands, and not for questions you can settle from the code, the spec, or past decisions."
+description: "Ask the user to decide an implementation question (spec gap, design choice between alternatives) through the Task Overview with `agentium todo ask`, then end the turn; or, at the end of a turn, hand the user your requests and proposals with `agentium todo set` instead of listing them in chat. Use when TERM_PROGRAM=agentium and you need the user's decision before continuing, or are about to list remaining items, things for the user to do, or work you propose next. Not for permission to run commands, and not for questions you can settle from the code, the spec, or past decisions."
 ---
 
-# Agentium Inbox questions
+# Task Overview questions
 
 Run only when `TERM_PROGRAM` is `agentium`. Otherwise ask in the conversation as usual.
 
 ## Ask
 
 ```bash
-agentium inbox ask "Close the monthly aggregate at JST or UTC midnight?" \
+agentium todo ask "Close the monthly aggregate at JST or UTC midnight?" \
   --context "BillingAggregator.monthly needs a month boundary; spec §4 does not define it. DailyUsageJob cuts at JST; ai_usage.created_at is stored in UTC." \
   --option "JST 0:00 :: Matches the daily job and invoices. Adds one UTC→JST conversion in the query." \
   --option "UTC 0:00 :: Simplest query. The first 9 hours of each month fall into the previous month for Japanese spaces." \
@@ -25,7 +25,7 @@ agentium inbox ask "Close the monthly aggregate at JST or UTC midnight?" \
 
 ## After asking
 
-Without `--assume`, end your turn immediately. Do not keep working on an assumed answer. The user answers from the Inbox and the answer arrives in this tab as a new message starting with `[from: Agentium Inbox]`; continue from there.
+Without `--assume`, end your turn immediately. Do not keep working on an assumed answer. The user answers from Task Overview and the answer arrives in this tab as a new message starting with `[from: Task Overview]`; continue from there.
 
 The `Answer:` line carries the chosen option label, or the user's own text when you gave no options. A following `Note:` line is a condition or correction the user attached to that option; it takes precedence over the option's description.
 
@@ -35,7 +35,7 @@ If the command fails (e.g. `caller is not running inside an Agentium terminal or
 
 # Agentium To do
 
-Use at the end of a turn, when you would otherwise list remaining items in chat: things the user must do, or work you propose and the user should pick. The agent does not wait on these; that is the difference from `inbox ask`, which you use when you cannot continue without the answer.
+Use at the end of a turn, when you would otherwise list remaining items in chat: things the user must do, or work you propose and the user should pick. The agent does not wait on these; that is the difference from `todo ask`, which you use when you cannot continue without the answer.
 
 ```bash
 agentium todo set \
@@ -48,8 +48,8 @@ agentium todo set \
 - `set` replaces this tab's whole list. Pass every item that still applies, not only the new ones. If the list is not in your context (e.g. after a compaction), run `agentium todo list` first.
 - Read the output: a `Dropped ... unanswered items` line means you left out items. If they still apply, run `todo set` again with them.
 - Aim for at most 5 items (8 is the hard limit). Leave out FYIs and known limitations; those go in your final report.
-- After a successful `set`, write only the count in chat (e.g. "4 items in the Inbox To do"), not the items.
-- If `todo set` fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), list the actual user tasks and proposals in chat and say they were not saved to the Inbox. Do not turn them into `inbox ask` questions.
+- After a successful `set`, write only the count in chat (e.g. "4 items in Task Overview To do"), not the items.
+- If `todo set` fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), list the actual user tasks and proposals in chat and say they were not saved to Task Overview. Do not turn them into `todo ask` questions.
 - Include things the user said they will do later (e.g. "I'll check the CI failure later") as user tasks, so they are not lost.
-- The user answers from the Inbox in one message starting with `[from: Agentium Inbox]` and `To do`, one line per answered item: `Done: N TITLE` (the user did it), `Go: N TITLE` (start it now), `Skip: N TITLE` (drop it; do not propose it again). A `— Note:` suffix is the user's condition and overrides the item's detail. Numbers are the positions in your list at that time; match items by title. Answered items are already removed from your list, so do not repeat them in the next `todo set`; unanswered ones are still there.
+- The user answers from Task Overview in one message starting with `[from: Task Overview]` and `To do`, one line per answered item: `Done: N TITLE` (the user did it), `Go: N TITLE` (start it now), `Skip: N TITLE` (drop it; do not propose it again). A `— Note:` suffix is the user's condition and overrides the item's detail. Numbers are the positions in your list at that time; match items by title. Answered items are already removed from your list, so do not repeat them in the next `todo set`; unanswered ones are still there.
 - `agentium todo clear` empties the list when nothing is left. Other tabs' lists in the same arena are shown by `todo list` and are read-only.

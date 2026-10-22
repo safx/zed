@@ -524,6 +524,8 @@ pub(crate) struct InboxTodoView {
     error: Option<String>,
     processed: Vec<ProcessedTodo>,
     show_processed: bool,
+    pub(crate) question_history: Vec<(String, String)>,
+    pub(crate) pending_questions: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -545,6 +547,8 @@ impl InboxTodoView {
             error: None,
             processed: Vec::new(),
             show_processed: false,
+            question_history: Vec::new(),
+            pending_questions: false,
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![subscription],
         };
@@ -598,7 +602,7 @@ impl InboxTodoView {
             .min_w_0()
             .flex_shrink_0()
             .gap_2()
-            .when(!self.processed.is_empty(), |column| {
+            .when(!self.processed.is_empty() || !self.question_history.is_empty(), |column| {
                 column
                     .child(
                         Button::new(
@@ -606,7 +610,7 @@ impl InboxTodoView {
                             format!(
                                 "{} Processed items · {}",
                                 if self.show_processed { "▾" } else { "▸" },
-                                self.processed.len()
+                                self.processed.len() + self.question_history.len()
                             ),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -615,7 +619,11 @@ impl InboxTodoView {
                         })),
                     )
                     .when(self.show_processed, |column| {
-                        column.children(self.processed.iter().rev().map(|entry| {
+                        column.children(self.question_history.iter().rev().map(|(question, resolution)| {
+                            v_flex().gap_1().p_2().border_1().border_color(cx.theme().colors().border_variant).rounded_md()
+                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(question.clone()))
+                                .child(div().text_sm().child(resolution.clone()))
+                        })).children(self.processed.iter().rev().map(|entry| {
                             let state = match entry.choice {
                                 TodoChoice::Done => "Done",
                                 TodoChoice::Skip => "Skipped",
@@ -838,11 +846,9 @@ impl Render for InboxTodoView {
                 .child(self.render_processed(cx))
                 .track_focus(&self.focus_handle)
                 .bg(colors.editor_background)
-                .child(
-                    div()
-                        .text_color(colors.text_muted)
-                        .child("Nothing left on this to-do list."),
-                )
+                .when(!self.pending_questions, |column| column.child(
+                    div().text_color(colors.text_muted).child("No pending To do items.")
+                ))
                 .into_any_element();
         };
         let items: Vec<(usize, InboxTodoItem, Option<TodoChoice>)> = list

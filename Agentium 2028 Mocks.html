@@ -208,7 +208,7 @@ code { font-family: var(--mono); font-size: 10.5px; background: var(--raise-2); 
 <p class="caption" data-cap="3" hidden><b>9am:</b> PM が前夜に書いた粗い課題 3 件は「曖昧 2 / 実行可 1」に仕分け済み。曖昧な 2 件に答えて実行可の 1 件を起動し、昨夕承認した plan は「基準 4/5 達成、1 本が範囲外」から確認します。</p>
 <p class="caption" data-cap="4" hidden><b>9am:</b> 38 本の PR 候補のうち要人間レビューは 5 本だけ。docs / lint は自動 merge 済みで 1 行、DB migration を含む PR だけが必須承認で止まっています。</p>
 <p class="caption" data-cap="5" hidden><b>9am:</b> 1 本は手元、4 本は build-01 のコンテナと SSH 先で 1 画面に並びます。レビュー担当エージェントが <code>tab list</code> で状況を掴んで指摘を送り、詰まりの原因が OS 側 (ポート、ロック) でもその場で分かります。</p>
-<p class="caption" data-cap="6" hidden><b>Task Overview:</b> 左ペインは従来の集約バッジ＋Todo合計だけに。タブバーの「＋」→「Task Overview」、またはTodoバッジから開き、タスク内の各エージェントの依頼・結果・TodoとPRを確認します。返信もこのタブ内で完結します。</p>
+<p class="caption" data-cap="6" hidden><b>Task Overview:</b> 質問・判断依頼も To do に集約。回答待ちを先頭に表示し、選択肢や自由入力でその場から回答できます。回答済みの項目は折り畳んだ履歴へ移り、左ペインの件数も減ります。</p>
 
 <div class="stage" id="stage">
 
@@ -945,6 +945,15 @@ Do you want to proceed?
 .overview-add { position:relative; display:flex; }
 .overview-menu { position:absolute; right:0; top:38px; width:200px; padding:6px; background:var(--raise-2); border:1px solid var(--line); border-radius:6px; z-index:5; box-shadow:0 8px 24px #0008; }
 .overview-menu button { width:100%; padding:9px; color:var(--fg); border:0; background:transparent; }
+.question-item { background:var(--raise); border:1px solid var(--line); border-radius:8px; padding:12px !important; margin:10px 0; display:grid; gap:10px; }
+.question-item.waiting { border-left:3px solid var(--orange); }
+.question-options { display:grid; gap:6px; }
+.task-inbox .question-option { color:var(--fg); background:var(--win); border:1px solid var(--line); border-radius:6px; padding:10px; display:grid; gap:4px; }
+.task-inbox .question-option[aria-pressed=true] { border-color:var(--teal); background:var(--raise-2); }
+.question-option small { color:var(--fg-dim); line-height:1.5; }
+.question-item label { font-size:12px; color:var(--fg-dim); }
+.completed-items { border-top:1px solid var(--line); padding-top:10px; }
+.completed-items .task-history { margin-top:10px; white-space:pre-wrap; font-size:12px; line-height:1.7; }
 .coordinator { border:1px dashed var(--line); padding:12px; border-radius:8px; display:grid; gap:8px; color:var(--fg-dim); }
 </style>
 <section class="win task-inbox" data-screen="6" hidden>
@@ -960,7 +969,7 @@ Do you want to proceed?
   </div>
   <div class="pane">
     <div style="padding:12px 14px;border-bottom:1px solid var(--line)"><div class="context-label">Task Overview · 関連資料</div><div id="evidence-task" style="margin-top:5px"></div></div>
-    <div class="tabs" aria-label="エージェントの資料"><button class="tab on" data-evidence="changes">変更</button><button class="tab" data-evidence="conversation">会話</button><button class="tab" data-evidence="history">返信履歴</button></div>
+    <div class="tabs" aria-label="エージェントの資料"><button class="tab on" data-evidence="changes">変更</button><button class="tab" data-evidence="conversation">会話</button><button class="tab" data-evidence="history">完了・スキップ済み</button></div>
     <div class="body" id="task-evidence"></div>
   </div>
 </section>
@@ -1013,8 +1022,8 @@ Do you want to proceed?
 <div class="card"><h3>確認できる操作</h3><ul>
 <li>タブバーの＋からTask Overviewを開く。閉じた後も同じ入口から再表示できます。</li>
 <li>Todo合計をクリックすると、対象タスクのOverviewを開きます。独立したTodoタブはありません。</li>
-<li>OverviewではArenaごとに各エージェントの依頼・結果・Todoを表示します。返信先と内容を確認して送信すると、該当エージェントの残件と左ペインの合計が減ります。</li>
-<li>変更・会話・返信履歴、PRの確認と、元のエージェントタブへの移動を試せます。操作はすべてモック内だけで反映されます。</li>
+<li>Overviewでは質問・判断依頼も同じTo doに表示します。質問は個別に回答でき、作業・提案はまとめて送信できます。回答後は左の件数が減り、完了・スキップ済みに移ります。依頼と結果は必要なときだけ展開します。</li>
+<li>変更・会話・完了・スキップ済み、PRの確認と、元のエージェントタブへの移動を試せます。操作はすべてモック内だけで反映されます。</li>
 <li>タスクやタブを切り替えても返信の下書きを保持します。コーディネーター欄は将来案で、送信できません。</li>
 </ul></div>
 </section>
@@ -1075,6 +1084,9 @@ Do you want to proceed?
   initial[2].group='document'; initial[2].label='権限テストの追加';
   initial.push({id:'review',group:'status',label:'状態遷移のレビュー',title:'エージェントの状態表示を改善',repo:'zed',branch:'experiment/codex-acp-tabs',agent:'Codex',running:true,time:'09:20',request:'実装担当の変更を確認し、状態遷移や再起動時の不整合を調べる。',result:'状態遷移をレビュー中です。表示順について確認をお願いします。',changes:'レビュー中\n\n実装担当の変更を確認しています。最終結果は未提出です。',conversation:'Codex · 09:20\n再起動時の状態復元を確認しています。表示順の意図も確認してください。',items:[{id:'order',type:'human',title:'状態の表示順を確認',description:'許可待ち・失敗・完了の優先順を確認する。'}]});
   initial.push({id:'verify',group:'status',label:'動作検証',title:'エージェントの状態表示を改善',repo:'zed',branch:'experiment/codex-acp-tabs',agent:'Claude',permission:true,time:'09:22',request:'アプリを起動して、エージェントの状態表示を検証する。',result:'アプリを起動する許可を待っています。画面検証はまだ実施していません。',changes:'検証前\n\nアプリの起動待ちです。',conversation:'Claude · 09:22\n画面の検証のためアプリを起動してよいですか。',items:[]});
+  initial[0].items.unshift({id:'failure-policy',type:'question',title:'失敗したエージェントは自動で再開しますか？',description:'再実行すると同じ変更を重ねる可能性があります。再開方針を決めてから実装を続けます。',options:[{label:'ユーザーが選んで再開',detail:'状態を確認してから操作できる。意図しない再実行を防げます。'},{label:'1回だけ自動で再開',detail:'一時的なエラーから早く復帰できる。副作用への対策が必要です。'}],recommended:0});
+  initial[1].items.unshift({id:'sample',type:'question',title:'照合に使う請求書サンプルを教えてください',description:'対象月とサンプルの保存場所を指定してください。',options:[]});
+  initial.find(t=>t.id==='review').items=[{id:'order',type:'question',assumed:true,title:'許可待ち → 失敗 → 完了の順で表示してよいですか？',description:'この順序でレビューを進めています。変更があれば指示してください。',options:[{label:'この順で進める',detail:'操作が必要な状態を先に表示します。'},{label:'失敗を先頭にする',detail:'停止している作業の復旧を優先します。'}],recommended:0}];
   const groups=[{id:'status',title:'エージェントの状態表示を改善',issue:'Agentium · 状態表示',repo:'zed',branch:'experiment/codex-acp-tabs',arena:'agentium',pr:'#123'},{id:'document',title:'documentの実装',issue:'BLG_AI_INTEGRATION-663',repo:'document',branch:'develop',arena:'authz',pr:'#816'},{id:'billing',title:'月次集計の締め日をJSTに統一',issue:'BLG_AI_INTEGRATION-747',repo:'backlog-scala',branch:'monthly',arena:'billing',pr:'#815'}];
   let tasks, selected, groupId='status', evidence='changes', activeTab='overview', overviewOpen=true, menuOpen=false;
   const escape = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1082,8 +1094,8 @@ Do you want to proceed?
   const pending = t => t.items.filter(i => !i.status);
   const group = () => groups.find(g=>g.id===groupId);
   const agents = () => tasks.filter(t=>t.group===groupId);
-  const state = t => t.permission?'許可待ち':t.failed?'失敗':t.running?'実行中':'完了';
-  function reset(){tasks=JSON.parse(JSON.stringify(initial));tasks.forEach(t=>{t.draft={};t.note='';t.history=[];});selected='failed';groupId='status';evidence='changes';activeTab='overview';overviewOpen=true;menuOpen=false;render();}
+  const state = t => pending(t).some(i=>i.type==='question'&&!i.assumed)?'回答待ち':t.permission?'許可待ち':t.failed?'失敗':t.running?'実行中':'完了';
+  function reset(){tasks=JSON.parse(JSON.stringify(initial));tasks.forEach(t=>{t.draft={};t.note='';t.history=[];t.answers={};});selected='failed';groupId='status';evidence='changes';activeTab='overview';overviewOpen=true;menuOpen=false;render();}
   function openOverview(id){groupId=id;selected=tasks.find(t=>t.group===id).id;overviewOpen=true;activeTab='overview';menuOpen=false;render();}
   function renderList(){
     root.querySelector('#task-list').innerHTML=groups.map(g=>{
@@ -1093,17 +1105,27 @@ Do you want to proceed?
     }).join('');
   }
   function renderTabs(){root.querySelector('#overview-tabs').innerHTML=`<button class="tab ${activeTab==='terminal'?'on':''}" data-tab="terminal">${escape(task().agent)} · ${escape(task().label)}</button>${overviewOpen?`<button class="tab ${activeTab==='overview'?'on':''}" data-tab="overview">Task Overview</button><button class="tab" id="close-overview" aria-label="Task Overviewを閉じる">×</button>`:''}<div class="tabs-r"><div class="overview-add"><button class="btn" id="add-tab" aria-label="タブを追加" aria-expanded="${menuOpen}">＋</button>${menuOpen?'<div class="overview-menu"><button id="add-overview">Task Overview</button></div>':''}</div></div>`;}
-  function itemMarkup(t){return pending(t).map(i=>`<div class="task-item"><div class="row"><b class="grow">${escape(i.title)}</b><span class="chip line">${i.type==='human'?'あなたの作業':'提案'}</span>${(i.type==='human'?[['done','完了を報告']]:[['go','依頼する'],['skip','見送る']]).map(([choice,label])=>`<button class="tog ${t.draft[i.id]===choice?'on':''}" data-agent="${t.id}" data-item="${i.id}" data-choice="${choice}" aria-pressed="${t.draft[i.id]===choice}">${label}</button>`).join('')}</div><small>${escape(i.description)}</small></div>`).join('')||'<p class="muted">未処理のTodoはありません。</p>';}
+  function questionMarkup(t,i){
+    const answer=t.answers[i.id]||{note:''};
+    return `<div class="task-item question-item ${i.assumed?'':'waiting'}"><div class="row"><span class="chip ${i.assumed?'line':'orange'}">${i.assumed?'推奨案で進行中':'回答待ち'}</span><span class="muted">判断依頼</span></div><b>${escape(i.title)}</b><p class="muted">${escape(i.description)}</p><div class="question-options">${i.options.map((o,index)=>`<button class="question-option" data-agent="${t.id}" data-question="${i.id}" data-option="${index}" aria-pressed="${answer.option===index}"><span>${escape(o.label)} ${i.recommended===index?'<span class="chip teal">推奨</span>':''}</span><small>${escape(o.detail)}</small></button>`).join('')}</div><label for="answer-${t.id}-${i.id}">${i.options.length?'補足（任意）':'回答'}</label><textarea id="answer-${t.id}-${i.id}" data-answer-agent="${t.id}" data-answer-item="${i.id}" placeholder="${i.options.length?'条件や意図を添える':'対象月と保存場所を入力'}">${escape(answer.note)}</textarea><div class="row"><small class="muted grow">${i.assumed?'推奨案の確認だけなら通知せず完了します。':escape(t.agent)+' に回答すると作業を再開します。'}</small><button class="btn primary" data-answer-send="${i.id}" data-agent="${t.id}" ${i.options.length?answer.option===undefined?'disabled':'':!answer.note.trim()?'disabled':''}>${i.assumed?'回答を確定':'回答して再開'}</button></div></div>`;
+  }
+  function itemMarkup(t){return [...pending(t)].sort((a,b)=>(a.type==='question'?a.assumed?1:0:2)-(b.type==='question'?b.assumed?1:0:2)).map(i=>i.type==='question'?questionMarkup(t,i):`<div class="task-item"><div class="row"><b class="grow">${escape(i.title)}</b><span class="chip line">${i.type==='human'?'あなたの作業':'提案'}</span>${(i.type==='human'?[['done','完了を報告']]:[['go','依頼する'],['skip','見送る']]).map(([choice,label])=>`<button class="tog ${t.draft[i.id]===choice?'on':''}" data-agent="${t.id}" data-item="${i.id}" data-choice="${choice}" aria-pressed="${t.draft[i.id]===choice}">${label}</button>`).join('')}</div><small>${escape(i.description)}</small></div>`).join('')||'<p class="muted">未処理のTo doはありません。</p>';}
   function render(){
     renderList();renderTabs();const g=group();
     if(activeTab==='terminal'){
       root.querySelector('#task-detail').innerHTML=`<span class="context-label">${escape(g.title)} / ${escape(g.arena)}</span><h2>${escape(task().agent)} · ${escape(task().label)}</h2><div class="term">${escape(task().conversation)}</div><div class="task-result"><p>元のエージェントタブ · モック</p><p class="muted">タブバーの＋からTask Overviewを開けます。</p></div>`;
     }else{
-      root.querySelector('#task-detail').innerHTML=`<div class="row"><span class="context-label grow">Task Overview</span><span class="chip teal">Todo ${agents().reduce((sum,t)=>sum+pending(t).length,0)}件</span></div><h2>${escape(g.title)}</h2><p class="muted">${escape(g.issue)} · ${agents().length}エージェント</p><div class="overview-pr"><div class="row"><h3 class="grow">Pull requests</h3><span class="chip green">CI 成功</span></div><button class="btn" id="view-pr">${g.pr} · ${escape(g.title)} ↗</button><small class="muted">${escape(g.repo)} · レビュー待ち · +214 −88</small></div><div class="row"><h3 class="grow">${escape(g.arena)} <span class="muted">/ ${escape(g.repo)}</span></h3><span class="muted">${escape(g.branch)}</span></div>${agents().map(t=>`<article class="overview-agent ${t.id===selected?'selected':''}" data-card="${t.id}"><div class="row"><b class="grow">${t.agent==='Claude'?'✳':'◇'} ${escape(t.label)}</b><span class="chip ${t.permission?'orange':t.running?'green':'blue'}">${state(t)}</span><button class="btn" data-terminal="${t.id}" title="元のエージェントタブを開く">${t.agent} ↗</button></div><div class="agent-context"><span class="muted">依頼</span><span>${escape(t.request)}</span><span class="muted">結果</span><span>${escape(t.result)}</span></div>${t.permission?`<div class="row"><button class="btn primary" data-allow="${t.id}">今回の起動を許可</button><button class="btn" data-deny="${t.id}">拒否</button></div>`:''}<div class="row"><button class="btn" data-agent="${t.id}" data-evidence="changes">変更</button><button class="btn" data-agent="${t.id}" data-evidence="conversation">会話</button><button class="btn" data-agent="${t.id}" data-evidence="history">返信履歴 ${t.history.length}</button><span class="grow"></span><span class="agent-badge">Todo ${pending(t).length}</span></div><details class="agent-todos" ${Object.keys(t.draft).length||t.note?'open':''}><summary>Todo ${pending(t).length}件を確認・返信</summary><div>${itemMarkup(t)}</div><details ${Object.keys(t.draft).length||t.note?'open':''}><summary>選択したTodoを返信・追加の指示</summary><div class="task-reply"><label for="note-${t.id}">返信先：${escape(t.label)} · ${t.agent}</label><textarea id="note-${t.id}" data-note-agent="${t.id}" placeholder="補足の指示（任意）">${escape(t.note)}</textarea><small class="muted">選択は下書きです。返信するとこのエージェントに届きます。</small><button class="btn primary" data-send="${t.id}" ${!Object.keys(t.draft).length&&!t.note.trim()?'disabled':''}>${Object.keys(t.draft).length}件の選択と指示を返信</button></div></details></details>${t.history.length?'<small role="status" style="color:var(--teal)">返信を受信しました · モック</small>':''}</article>`).join('')}<div class="coordinator"><div class="row"><b>コーディネーターへの指示</b><span class="chip line">将来</span></div><p>タスク全体の残件を整理し、エージェントへの作業配分を依頼する場所。</p><textarea disabled aria-label="将来のコーディネーター指示欄" placeholder="例：残件を整理して、次の作業を振り分けて"></textarea></div>`;
+      root.querySelector('#task-detail').innerHTML=`<h2>${escape(g.title)}</h2><p class="muted">${escape(g.issue)} · ${agents().length}エージェント</p><div class="overview-pr"><div class="row"><h3 class="grow">Pull requests</h3><span class="chip green">CI 成功</span></div><button class="btn" id="view-pr">${g.pr} · ${escape(g.title)} ↗</button><small class="muted">${escape(g.repo)} · レビュー待ち · +214 −88</small></div><div class="row"><h3 class="grow">${escape(g.arena)} <span class="muted">/ ${escape(g.repo)}</span></h3><span class="muted">${escape(g.branch)}</span></div>${agents().map(t=>`<article class="overview-agent ${t.id===selected?'selected':''}" data-card="${t.id}"><div class="row"><b class="grow">${t.agent==='Claude'?'✳':'◇'} ${escape(t.label)}</b><span class="chip ${t.permission?'orange':t.running?'green':'blue'}">${state(t)}</span><button class="btn" data-terminal="${t.id}" title="元のエージェントタブを開く">${t.agent} ↗</button></div><details><summary>依頼・結果を見る</summary><div class="agent-context"><span class="muted">依頼</span><span>${escape(t.request)}</span><span class="muted">結果</span><span>${escape(t.result)}</span></div></details>${t.permission?`<div class="row"><button class="btn primary" data-allow="${t.id}">今回の起動を許可</button><button class="btn" data-deny="${t.id}">拒否</button></div>`:''}<div class="row"><button class="btn" data-agent="${t.id}" data-evidence="changes">変更</button><button class="btn" data-agent="${t.id}" data-evidence="conversation">会話</button><button class="btn" data-agent="${t.id}" data-evidence="history">完了・スキップ済み ${t.history.length}</button><span class="grow"></span></div><details class="agent-todos" open><summary>To do · ${pending(t).length}</summary><div>${itemMarkup(t)}</div><details ${Object.keys(t.draft).length||t.note?'open':''}><summary>作業・提案の選択を送信</summary><div class="task-reply"><label for="note-${t.id}">返信先：${escape(t.label)} · ${t.agent}</label><textarea id="note-${t.id}" data-note-agent="${t.id}" placeholder="補足の指示（任意）">${escape(t.note)}</textarea><small class="muted">選択は下書きです。返信するとこのエージェントに届きます。</small><button class="btn primary" data-send="${t.id}" ${!Object.keys(t.draft).length&&!t.note.trim()?'disabled':''}>${Object.keys(t.draft).length}件の選択と指示を返信</button></div></details></details>${t.history.length?`<details class="completed-items"><summary>完了・スキップ済み · ${t.items.filter(i=>i.status).length}</summary>${t.history.map(h=>`<div class="task-history">${escape(h)}</div>`).join('')}</details><small role="status" style="color:var(--teal)">反映しました · モック</small>`:''}</article>`).join('')}`;
     }
     renderEvidence();
   }
-  function renderEvidence(){const t=task();root.querySelectorAll("[data-card]").forEach(card=>card.classList.toggle("selected",card.dataset.card===selected));root.querySelector('#evidence-task').textContent=t.label+' · '+t.agent;root.querySelectorAll('[aria-label="エージェントの資料"] [data-evidence]').forEach(b=>b.classList.toggle('on',b.dataset.evidence===evidence));root.querySelector('#task-evidence').innerHTML=evidence==='history'?(t.history.length?t.history.map(h=>`<div class="task-history"><h3>送信済み · ${t.agent} · モック</h3><div class="task-evidence">${escape(h)}</div></div>`).join(''):'<p class="muted">まだ返信していません。</p>'):`<h3>${evidence==='changes'?'変更と検証':'会話'}</h3><div class="task-evidence">${escape(t[evidence])}</div>`;}
+  function renderEvidence(){const t=task();root.querySelectorAll("[data-card]").forEach(card=>card.classList.toggle("selected",card.dataset.card===selected));root.querySelector('#evidence-task').textContent=t.label+' · '+t.agent;root.querySelectorAll('[aria-label="エージェントの資料"] [data-evidence]').forEach(b=>b.classList.toggle('on',b.dataset.evidence===evidence));root.querySelector('#task-evidence').innerHTML=evidence==='history'?(t.history.length?t.history.map(h=>`<div class="task-history"><h3>対応済み · ${t.agent} · モック</h3><div class="task-evidence">${escape(h)}</div></div>`).join(''):'<p class="muted">完了・スキップ済みの項目はありません。</p>'):`<h3>${evidence==='changes'?'変更と検証':'会話'}</h3><div class="task-evidence">${escape(t[evidence])}</div>`;}
+  root.addEventListener('input',e=>{
+    const id=e.target.dataset.answerAgent;if(!id)return;
+    const t=tasks.find(t=>t.id===id),i=t.items.find(i=>i.id===e.target.dataset.answerItem);
+    const answer=t.answers[i.id]||(t.answers[i.id]={note:''});answer.note=e.target.value;
+    root.querySelector(`[data-agent="${id}"][data-answer-send="${i.id}"]`).disabled=i.options.length?answer.option===undefined:!answer.note.trim();
+  });
   root.addEventListener('input',e=>{const id=e.target.dataset.noteAgent;if(!id)return;const t=tasks.find(t=>t.id===id);t.note=e.target.value;root.querySelector(`[data-send="${id}"]`).disabled=!Object.keys(t.draft).length&&!t.note.trim();});
   root.addEventListener('click',e=>{
     const b=e.target.closest('button');if(!b)return;
@@ -1117,6 +1139,8 @@ Do you want to proceed?
     if(b.dataset.terminal){selected=b.dataset.terminal;activeTab='terminal';render();return;}
     if(b.id==='view-pr'){root.querySelector('#evidence-task').textContent=group().pr+' · '+group().repo;root.querySelector('#task-evidence').innerHTML=`<h3>${escape(group().title)}</h3><span class="chip green">CI 成功</span><p>レビュー待ち</p><p>このタスクのエージェントが作成した変更をまとめたPRです。</p><div class="task-evidence">+214 −88\nチェック：テスト成功・Lint成功\n\nPR詳細のプレビュー · モック</div>`;return;}
     if(b.dataset.agent)selected=b.dataset.agent;
+    if(b.dataset.question){const t=task(),answer=t.answers[b.dataset.question]||(t.answers[b.dataset.question]={note:''});answer.option=Number(b.dataset.option);const scroll=root.querySelector('#task-detail').scrollTop;render();root.querySelector('#task-detail').scrollTop=scroll;return;}
+    if(b.dataset.answerSend){const t=task(),i=t.items.find(i=>i.id===b.dataset.answerSend),answer=t.answers[i.id];if(!answer)return;const text=i.options.length?i.options[answer.option]?.label:answer.note.trim();if(!text)return;i.status='answered';const silent=i.assumed&&answer.option===i.recommended&&!answer.note.trim();t.history.unshift('回答済み：'+i.title+'\n回答：'+text+(i.options.length&&answer.note.trim()?'\n補足：'+answer.note.trim():'')+(silent?'\n推奨案を確認（通知なし）':'\n'+t.agent+' に送信 · モック'));t.running=true;delete t.answers[i.id];render();return;}
     if(b.dataset.evidence){evidence=b.dataset.evidence;renderEvidence();return;}
     if(b.dataset.item){const t=task();if(t.draft[b.dataset.item]===b.dataset.choice)delete t.draft[b.dataset.item];else t.draft[b.dataset.item]=b.dataset.choice;const position=root.querySelector('#task-detail').scrollTop;render();root.querySelector('#task-detail').scrollTop=position;return;}
     if(b.dataset.allow||b.dataset.deny){selected=b.dataset.allow||b.dataset.deny;const t=task();t.permission=false;t.running=Boolean(b.dataset.allow);t.result=t.running?'起動を許可しました。画面検証を実行中です。':'起動を拒否しました。検証は未実施です。';t.history.unshift(t.result);render();return;}
