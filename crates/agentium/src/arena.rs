@@ -2109,6 +2109,11 @@ pub(crate) fn new_agentium_pane(
     cx.subscribe_in(&pane, window, Arena::handle_pane_event)
         .detach();
     cx.observe(&pane, |_, _, cx| cx.notify()).detach();
+    cx.on_focus_out(&pane.focus_handle(cx), window, |_, _, _, cx| {
+        // Sidebar focus does not activate another pane, but must clear the Overview highlight.
+        cx.emit(ArenaEvent::ActiveItemChanged);
+    })
+    .detach();
 
     pane
 }

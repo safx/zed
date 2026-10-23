@@ -1279,6 +1279,7 @@ impl AgentiumApp {
                     this._pr_poll_task = None;
                     this._ci_poll_task = None;
                 }
+                cx.notify();
             });
 
         cx.spawn(async move |this, cx| {
@@ -7533,6 +7534,12 @@ impl AgentiumApp {
                         .p_3()
                         .border_1()
                         .border_color(colors.border)
+                        .when(
+                            window.is_window_active()
+                                && self.is_active_tab(&arena, &pane, item_id, cx)
+                                && item.item_focus_handle(cx).contains_focused(window, cx),
+                            |card| card.border_2().border_color(colors.text_accent),
+                        )
                         .rounded_md()
                         .child(
                             h_flex()
