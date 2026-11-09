@@ -382,6 +382,16 @@ impl Arena {
     }
 
     pub(crate) fn add_claude_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_claude_code(window, cx).detach_and_log_err(cx);
+    }
+
+    /// Starts a fresh Claude Code tab and resolves to its item id, so a
+    /// caller can watch for the session the hooks will report for it.
+    pub(crate) fn start_claude_code(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<EntityId>> {
         let shell = Shell::WithArguments {
             program: "claude".to_string(),
             args: vec![],
@@ -407,11 +417,9 @@ impl Arena {
                     true,
                     window,
                     cx,
-                );
-            })?;
-            anyhow::Ok(())
+                )
+            })
         })
-        .detach_and_log_err(cx);
     }
 
     fn save_active_item(
@@ -789,7 +797,7 @@ impl Arena {
                 "--append-system-prompt".into(),
                 instructions,
                 "--allowedTools".into(),
-                "Bash(agentium coordinator summary set *)".into(),
+                "Bash(agentium coordinator summary set *),Bash(agentium todo add *),Bash(agentium todo assign *),Bash(agentium todo list *)".into(),
             ],
             title_override: Some(crate::task_coordinator::TITLE.into()),
         };

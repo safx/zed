@@ -1,8 +1,26 @@
 # Task Overview カラムと To do の item モデルの実装プラン
 
-Rev 6 (2026-11-09)
+Rev 8 (2026-11-09)
 
 改訂履歴:
+
+- Rev 8: 段 3 のコードレビューで決めた 5 点。(1) Arena 一覧の + は `switch_arena` の次フレームでメニューを
+  開く (ペインのメニューハンドルはレイアウト時に結び直されるため)。(2) 担当者行にカードの状態ボタン
+  (Running / Awaiting answer …、クリックで activity ポップオーバー) を移す。request / response の文脈は
+  scope 外の arena のセッションからも引く。(3) item が覚えている arena が閉じているときは「Reopen … and
+  start Claude Code」で開き直して始め、既定を変えるのは「別の arena で」のサブメニューに限る。path の
+  無い旧 item は arena 名で解決する。(4) Assign… から始めたタブは `pending_todo_assignments` で待ち、
+  3 分でフック未報告の失敗、タブが閉じれば失敗、item が閉じれば破棄。行に状態と Cancel / Dismiss を出す。
+  (5) コーディネーターの指示は `todo add --unassigned` / `assign` / `list` を許し、他セッションの item を
+  閉じたり編集したりしない。Claude 起動時の allowedTools も同じ 3 コマンドを許す (§3.1 / §3.4)。
+
+- Rev 7: 段 3 の実装で決めた 3 点。(1) Assign… メニューの「New Claude Code · <arena>」は item に arena が
+  あればその 1 件、無ければ task の Live arena ごとに並べる (これが 2 択)。選んだ arena は item の
+  `arena_path` に記憶し、タブの Claude セッションがフックで判明した時点で担当に加える
+  (`pending_todo_assignments`)。(2) 担当セッションの request / response は To do の担当者行の下に畳んで
+  出し、どの open item にも付いていないセッションだけが従来のカードを保つ。質問は To do の下の
+  「Questions」節にセッション単位で独立して出す。(3) コーディネーターの操作は Arena 一覧の行の中の
+  1 行に縮める (§3.1 / §3.4)。
 
 - Rev 6: 段 2 の実装で決めた 4 点。(1) `todo take` は担当に加えたうえで `Requested` にする (AI が自分で
   やる意思表示なので、自分で `add` した場合と同じ)。(2) task に属さない item は、その arena の path を
