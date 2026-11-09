@@ -101,7 +101,7 @@ pub enum PaneContentType {
     GitGraph,
 }
 
-actions!(agentium, [NewTaskOverview, NewClaudeCode, NewCodexAcp, ResumeCodexConversation, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
+actions!(agentium, [NewClaudeCode, NewCodexAcp, ResumeCodexConversation, NewDiffView, NewBranchDiff, NewProjectSearch, NewGitStatus, NewFileBrowser, NewGitGraph, OpenNewItemMenu, OpenSplitMenu]);
 
 pub fn init_acp_host(cx: &mut App) {
     cx.set_global(agent_ui::AgentUiHost {
@@ -223,7 +223,9 @@ pub(crate) struct ForkClaudeSession {
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
 #[action(namespace = agentium)]
-pub struct ActivateArena {
+/// Selects the task at `index` in the sidebar (cmd-1 … cmd-9) and shows its
+/// last active arena.
+pub struct ActivateTask {
     pub index: usize,
 }
 
@@ -1031,10 +1033,89 @@ pub struct CiInfo {
     pub checks: Vec<CiCheckEntry>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SidebarTab {
-    Repositories,
-    Tasks,
+const OVERVIEW_COLUMN_WIDTH: f32 = 400.0;
+
+/// What the arena rows show about the repository containing an arena.
+struct ArenaGitInfo {
+    branch: Option<String>,
+    head_sha: Option<String>,
+    head_tags: Vec<String>,
+    browser_url: Option<String>,
+    lines_added: u32,
+    lines_deleted: u32,
+}
+
+/// The branch, else the first tag at HEAD, else the short HEAD sha.
+fn git_reference_label(info: Option<&ArenaGitInfo>) -> (Option<IconName>, SharedString) {
+    let Some(info) = info else {
+        return (None, SharedString::default());
+    };
+    if let Some(branch) = &info.branch {
+        return (Some(IconName::GitBranch), branch.clone().into());
+    }
+    if let Some(tag) = info.head_tags.first() {
+        return (Some(IconName::Tag), tag.clone().into());
+    }
+    if let Some(sha) = &info.head_sha {
+        return (None, sha.chars().take(8).collect::<String>().into());
+    }
+    (None, SharedString::default())
+}
+
+/// Which task the sidebar selects once an arena becomes active. An arena
+/// shared by several tasks stays with the task already selected, so switching
+/// between the shared arena's tabs never flips the overview.
+fn resolve_selected_task(current: Option<Uuid>, tasks_with_arena: &[Uuid]) -> Option<Uuid> {
+    current
+        .filter(|selected| tasks_with_arena.contains(selected))
+        .or_else(|| tasks_with_arena.first().copied())
+}
+
+/// The arena a task returns to when selected: the one last active for it if
+/// still open, else its first open arena. `None` leaves the center as is.
+fn arena_to_open_for_task(
+    remembered: Option<EntityId>,
+    live: &[(usize, EntityId)],
+) -> Option<usize> {
+    remembered
+        .and_then(|entity_id| {
+            live.iter()
+                .find(|(_, candidate)| *candidate == entity_id)
+                .map(|(index, _)| *index)
+        })
+        .or_else(|| live.first().map(|(index, _)| *index))
+}
+
+/// Terminals in one agent state across a task's open arenas. The menu a dot
+/// opens navigates by arena index, so the entries kept are those of the
+/// first arena that has the state; `count` still covers every arena.
+#[derive(Default)]
+struct TaskStateDot {
+    count: usize,
+    first_arena: Option<usize>,
+    entries: Vec<BadgeEntryInfo>,
+}
+
+impl TaskStateDot {
+    fn add(&mut self, arena_index: usize, entries: Vec<BadgeEntryInfo>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.count += entries.len();
+        if self.first_arena.is_none() {
+            self.first_arena = Some(arena_index);
+            self.entries = entries;
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskStatusDots {
+    permission: TaskStateDot,
+    running: TaskStateDot,
+    ready: TaskStateDot,
+    error: TaskStateDot,
+    busy: TaskStateDot,
 }
 
 #[derive(Clone)]
@@ -1127,7 +1208,15 @@ pub struct AgentiumApp {
     // every cycle. Transient failures are NOT recorded here and retry naturally.
     failed_backlog_issue_keys: HashSet<String>,
     _issue_fetch_task: Option<Task<()>>,
-    sidebar_tab: SidebarTab,
+    /// The task whose overview the column beside the sidebar shows. `None`
+    /// while the active arena belongs to no task (the overview then shows
+    /// that arena) or nothing is open.
+    selected_task: Option<Uuid>,
+    /// The arena shown in the center the last time each task was selected,
+    /// so selecting a task again returns to where the user was.
+    last_active_arena: HashMap<Uuid, EntityId>,
+    overview: Entity<task_overview::TaskOverview>,
+    overview_collapsed: bool,
     agent_activity: Option<(EntityId, Point<Pixels>)>,
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
@@ -1467,6 +1556,10 @@ impl AgentiumApp {
             &inbox_completions,
             inbox_todos.read(cx).lists(),
         );
+        let overview = {
+            let app = cx.entity();
+            cx.new(|cx| task_overview::TaskOverview::new(app, cx))
+        };
         let mut this = Self {
             coordinators,
             coordinator_runtime: HashMap::new(),
@@ -1527,7 +1620,10 @@ impl AgentiumApp {
             backlog_issue_ids: HashMap::new(),
             failed_backlog_issue_keys: HashSet::new(),
             _issue_fetch_task: None,
-            sidebar_tab: SidebarTab::Repositories,
+            selected_task: None,
+            last_active_arena: HashMap::new(),
+            overview,
+            overview_collapsed: false,
             agent_activity: None,
             next_inbox_question_id,
             inbox_questions,
@@ -1663,6 +1759,7 @@ impl AgentiumApp {
             self.fetch_pr_for_arena(arena_entity.entity_id(), cx);
         }
         self.rebuild_board_cache(cx);
+        self.sync_selection_to_active_arena(cx);
         let focus = arena_entity.focus_handle(cx);
         focus.focus(window, cx);
         cx.notify();
@@ -1724,10 +1821,101 @@ impl AgentiumApp {
         Ok(())
     }
 
+    /// Tasks whose worktree rows include the live arena at `index`, in board
+    /// order. Reads the board cache so render paths can call it without
+    /// touching the filesystem.
+    fn tasks_with_live_arena(&self, index: usize) -> Vec<Uuid> {
+        self.board
+            .active_tasks()
+            .filter(|task| {
+                self.board_cache
+                    .task_worktrees
+                    .get(&task.id)
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            matches!(row, WorktreeRow::Live { arena_index } if *arena_index == index)
+                        })
+                    })
+            })
+            .map(|task| task.id)
+            .collect()
+    }
+
+    /// Points the sidebar selection and the overview column at the active
+    /// arena. An arena shared by several tasks stays with the task already
+    /// selected; otherwise the first task in board order wins.
+    fn sync_selection_to_active_arena(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active_arena_index else {
+            self.selected_task = None;
+            self.set_overview_scope(None, cx);
+            return;
+        };
+        let entity_id = self.arenas[index].entity_id();
+        let tasks = self.tasks_with_live_arena(index);
+        let task = resolve_selected_task(self.selected_task, &tasks);
+        self.selected_task = task;
+        match task {
+            Some(task_id) => {
+                self.last_active_arena.insert(task_id, entity_id);
+                self.set_overview_scope(Some(task_overview::OverviewScope::Task(task_id)), cx);
+            }
+            None => {
+                self.set_overview_scope(Some(task_overview::OverviewScope::Arena(entity_id)), cx);
+            }
+        }
+    }
+
+    fn set_overview_scope(
+        &mut self,
+        scope: Option<task_overview::OverviewScope>,
+        cx: &mut Context<Self>,
+    ) {
+        self.overview.update(cx, |overview, cx| {
+            if overview.scope != scope {
+                overview.scope = scope;
+                cx.notify();
+            }
+        });
+    }
+
+    /// Shows the task's overview and returns the center to the arena the user
+    /// last had open for it. A task with no open arena only changes the
+    /// overview.
+    fn select_task(&mut self, task_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.board.tasks.iter().any(|task| task.id == task_id) {
+            return;
+        }
+        self.selected_task = Some(task_id);
+        self.agent_activity = None;
+        let live: Vec<(usize, EntityId)> = self
+            .board_cache
+            .task_worktrees
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| match row {
+                WorktreeRow::Live { arena_index } => self
+                    .arenas
+                    .get(*arena_index)
+                    .map(|arena| (*arena_index, arena.entity_id())),
+                WorktreeRow::Closed { .. } | WorktreeRow::Missing { .. } => None,
+            })
+            .collect();
+        let remembered = self.last_active_arena.get(&task_id).copied();
+        match arena_to_open_for_task(remembered, &live) {
+            Some(index) => self.switch_arena(index, window, cx),
+            None => {
+                self.set_overview_scope(Some(task_overview::OverviewScope::Task(task_id)), cx);
+                cx.notify();
+            }
+        }
+    }
+
     fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.arenas.len() {
             self.agent_activity = None;
             self.active_arena_index = Some(index);
+            self.sync_selection_to_active_arena(cx);
             self.arenas[index].update(cx, |arena, cx| {
                 arena.activate_context(cx);
             });
@@ -1769,6 +1957,73 @@ impl AgentiumApp {
     fn active_arena(&self) -> Option<&Entity<Arena>> {
         self.active_arena_index
             .and_then(|i| self.arenas.get(i))
+    }
+
+    fn update_active_arena(
+        &mut self,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut Arena, &mut Context<Arena>),
+    ) {
+        if let Some(arena) = self.active_arena().cloned() {
+            arena.update(cx, update);
+        }
+    }
+
+    /// The innermost repository containing `working_dir`, read from the git
+    /// store already in memory.
+    fn arena_git_info(&self, working_dir: &Path, cx: &App) -> Option<ArenaGitInfo> {
+        let git_store = self.project.read(cx).git_store().read(cx);
+        git_store
+            .repositories()
+            .values()
+            .filter(|repo| working_dir.starts_with(repo.read(cx).work_directory_abs_path.as_ref()))
+            .max_by_key(|repo| repo.read(cx).work_directory_abs_path.clone())
+            .map(|repo| {
+                let repo = repo.read(cx);
+                let (lines_added, lines_deleted) =
+                    repo.cached_status().fold((0u32, 0u32), |(added, deleted), entry| {
+                        match &entry.diff_stat {
+                            Some(stat) => (added + stat.added, deleted + stat.deleted),
+                            None => (added, deleted),
+                        }
+                    });
+                ArenaGitInfo {
+                    branch: repo.branch.as_ref().map(|branch| branch.name().to_string()),
+                    head_sha: repo.head_commit.as_ref().map(|commit| commit.sha.to_string()),
+                    head_tags: repo.head_tags.iter().map(|tag| tag.to_string()).collect(),
+                    browser_url: repo
+                        .remote_origin_url
+                        .as_deref()
+                        .and_then(remote_url_to_browser_url),
+                    lines_added,
+                    lines_deleted,
+                }
+            })
+    }
+
+    /// Keeps the sidebar selection and the overview scope consistent with the
+    /// board and the open arenas after either changed. A selected task whose
+    /// arenas are all closed keeps its overview; everything else follows the
+    /// active arena.
+    fn reconcile_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self
+            .selected_task
+            .filter(|task_id| self.board.active_tasks().any(|task| task.id == *task_id));
+        self.selected_task = selected;
+        let Some(task_id) = selected else {
+            self.sync_selection_to_active_arena(cx);
+            return;
+        };
+        let selected_has_open_arena = self
+            .board_cache
+            .task_worktrees
+            .get(&task_id)
+            .is_some_and(|rows| rows.iter().any(|row| matches!(row, WorktreeRow::Live { .. })));
+        if selected_has_open_arena {
+            self.sync_selection_to_active_arena(cx);
+        } else {
+            self.set_overview_scope(Some(task_overview::OverviewScope::Task(task_id)), cx);
+        }
     }
 
     fn start_pr_polling(&mut self, cx: &mut Context<Self>) {
@@ -2469,6 +2724,7 @@ impl AgentiumApp {
         self.ci_fetch_generations.forget_arena(entity_id);
         self.pr_dirty.remove(&entity_id);
         self.last_branch_names.remove(&entity_id);
+        self.last_active_arena.retain(|_, remembered| *remembered != entity_id);
         self.arenas.remove(index);
         self.rebuild_board_cache(cx);
 
@@ -2485,6 +2741,8 @@ impl AgentiumApp {
         if self.renaming_arena.as_ref() == Some(workspace) {
             self.renaming_arena = None;
         }
+
+        self.reconcile_selection(cx);
 
         if let Some(ws) = self.active_arena().cloned() {
             ws.update(cx, |arena, cx| {
@@ -4569,6 +4827,7 @@ impl AgentiumApp {
 
     fn board_changed(&mut self, cx: &mut Context<Self>) {
         self.rebuild_board_cache(cx);
+        self.reconcile_selection(cx);
         self.persist_board(cx);
         cx.notify();
     }
@@ -4658,8 +4917,8 @@ impl AgentiumApp {
                 worktrees: worktree.into_iter().collect(),
             })
             .log_err();
-        self.sidebar_tab = SidebarTab::Tasks;
         self.board_changed(cx);
+        self.select_task(id, window, cx);
         self.start_rename_task(id, window, cx);
     }
 
@@ -7227,48 +7486,27 @@ impl AgentiumApp {
             .unwrap_or(task_overview::OverviewScope::Arena(arena.entity_id()))
     }
 
-    fn open_task_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(arena) = self.active_arena().cloned() else {
-            return;
-        };
-        let scope = arena
-            .read(cx)
-            .active_pane
-            .read(cx)
-            .active_item()
-            .and_then(|item| item.downcast::<task_overview::TaskOverview>())
-            .map(|view| view.read(cx).scope)
-            .unwrap_or_else(|| self.overview_scope(&arena, cx));
-        self.open_overview_scope(scope, window, cx);
-    }
-
-    fn open_overview_scope(
+    /// Shows the overview that contains `scope`: the task, or the arena when
+    /// it belongs to no task.
+    fn show_overview_scope(
         &mut self,
         scope: task_overview::OverviewScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.arenas.iter().enumerate().find_map(|(index, arena)| {
-            arena.read(cx).center.panes().iter().find_map(|pane| {
-                pane.read(cx)
-                    .items_of_type::<task_overview::TaskOverview>()
-                    .find(|view| view.read(cx).scope == scope)
-                    .map(|view| (index, (*pane).clone(), view))
-            })
-        });
-        if let Some((index, pane, view)) = existing {
-            self.navigate_to_item(index, &pane, &view, window, cx);
-            return;
+        match scope {
+            task_overview::OverviewScope::Task(task_id) => self.select_task(task_id, window, cx),
+            task_overview::OverviewScope::Arena(entity_id) => {
+                if let Some(index) = self
+                    .arenas
+                    .iter()
+                    .position(|arena| arena.entity_id() == entity_id)
+                {
+                    self.switch_arena(index, window, cx);
+                }
+            }
         }
-        let Some(arena) = self.active_arena().cloned() else {
-            return;
-        };
-        let app = cx.entity();
-        let view = cx.new(|cx| task_overview::TaskOverview::new(scope, app, cx));
-        let pane = arena.read(cx).active_pane.clone();
-        pane.update(cx, |pane, cx| {
-            pane.add_item(Box::new(view), true, true, None, window, cx);
-        });
+        self.overview_collapsed = false;
         cx.notify();
     }
 
@@ -7294,7 +7532,7 @@ impl AgentiumApp {
                     .map(|arena| self.overview_scope(arena, cx))
             });
         if let Some(scope) = scope {
-            self.open_overview_scope(scope, window, cx);
+            self.show_overview_scope(scope, window, cx);
         }
     }
 
@@ -7306,7 +7544,14 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let (title, paths, arena_ids) = match overview.scope {
+        let Some(scope) = overview.scope else {
+            return div()
+                .p_4()
+                .text_color(colors.text_muted)
+                .child("Select a task or open an arena.")
+                .into_any_element();
+        };
+        let (title, paths, arena_ids) = match scope {
             task_overview::OverviewScope::Task(id) => {
                 let Some(task) = self.board.tasks.iter().find(|task| task.id == id) else {
                     return div()
@@ -7343,9 +7588,32 @@ impl AgentiumApp {
             .p_4()
             .gap_4()
             .bg(colors.editor_background)
-            .child(div().text_xl().child(title));
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().truncate().text_xl().child(title))
+                    .child(
+                        IconButton::new("overview-collapse", IconName::ChevronLeft)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Hide Task Overview"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                // Focus may sit in a note editor inside the
+                                // column; leaving it in a removed subtree
+                                // would hand focus to the unrendered
+                                // Workspace pane.
+                                let fallback = this
+                                    .active_arena()
+                                    .map(|arena| arena.focus_handle(cx))
+                                    .unwrap_or_else(|| this.focus_handle.clone());
+                                fallback.focus(window, cx);
+                                this.overview_collapsed = true;
+                                cx.notify();
+                            })),
+                    ),
+            );
         let mut linked_prs = Vec::new();
-        if let task_overview::OverviewScope::Task(task_id) = overview.scope {
+        if let task_overview::OverviewScope::Task(task_id) = scope {
             if let Some(task) = self
                 .board
                 .tasks
@@ -7430,30 +7698,12 @@ impl AgentiumApp {
             .collect();
         let mut rendered_todos = HashSet::new();
         for (arena_index, arena) in arenas {
-            let changes_arena = arena.clone();
-            content = content.child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().text_lg().child(arena.read(cx).name.clone()))
-                    .child(
-                        Button::new(("overview-changes", arena.entity_id()), "Changes").on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.switch_arena(arena_index, window, cx);
-                                changes_arena
-                                    .update(cx, |arena, cx| arena.add_diff_view(window, cx));
-                            }),
-                        ),
-                    ),
-            );
+            content = content.child(self.render_overview_arena_row(arena_index, &arena, cx));
             content = content.child(self.render_coordinator(&arena, cx));
             let panes: Vec<_> = arena.read(cx).center.panes().into_iter().cloned().collect();
             for pane in panes {
                 let items: Vec<_> = pane.read(cx).items().cloned().collect();
                 for item in items {
-                    // act_as reads the entity, including this currently rendering overview.
-                    if item.downcast::<task_overview::TaskOverview>().is_some() {
-                        continue;
-                    }
                     let asker = self.inbox_asker(item.as_ref(), cx);
                     let process = item.act_as::<TerminalView>(cx).and_then(|view| {
                         view.read(cx).terminal().read(cx).foreground_process_name()
@@ -7627,6 +7877,22 @@ impl AgentiumApp {
                     }
                     content = content.child(card);
                 }
+            }
+        }
+        if let task_overview::OverviewScope::Task(task_id) = scope {
+            let rows = self
+                .board_cache
+                .task_worktrees
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default();
+            for row in rows {
+                let (path, missing) = match row {
+                    WorktreeRow::Live { .. } => continue,
+                    WorktreeRow::Closed { path } => (path, false),
+                    WorktreeRow::Missing { path } => (path, true),
+                };
+                content = content.child(self.render_closed_worktree_row(task_id, path, missing, &colors, cx));
             }
         }
         for todo_id in todo_ids {
@@ -7869,7 +8135,7 @@ impl AgentiumApp {
         section.into_any_element()
     }
 
-    fn render_arena_row(&mut self, i: usize, task_id: Option<Uuid>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_arena_row(&mut self, i: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(arena_entity) = self.arenas.get(i).cloned() else {
             return div().into_any_element();
         };
@@ -7896,40 +8162,14 @@ impl AgentiumApp {
                                 path.file_name().map(|name| name.to_string_lossy().to_string())
                             });
 
-                            let git_info = effective_path.as_ref().and_then(|working_dir| {
-                                let git_store = self.project.read(cx).git_store().read(cx);
-                                git_store.repositories().values()
-                                    .filter_map(|repo| {
-                                        let repo = repo.read(cx);
-                                        let repo_path = &repo.work_directory_abs_path;
-                                        if working_dir.starts_with(repo_path.as_ref()) {
-                                            let branch_name = repo.branch.as_ref().map(|b| b.name().to_string());
-                                            let head_sha = repo.head_commit.as_ref().map(|c| c.sha.clone());
-                                            let head_tags = repo.head_tags.clone();
-                                            let browser_url = repo.remote_origin_url.as_deref()
-                                                .and_then(remote_url_to_browser_url);
-                                            let (lines_added, lines_deleted) = repo.cached_status()
-                                                .fold((0u32, 0u32), |(added, deleted), entry| {
-                                                    if let Some(stat) = &entry.diff_stat {
-                                                        (added + stat.added, deleted + stat.deleted)
-                                                    } else {
-                                                        (added, deleted)
-                                                    }
-                                                });
-                                            Some((repo_path.clone(), branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .max_by_key(|(repo_path, _, _, _, _, _, _)| repo_path.clone())
-                                    .map(|(_, branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted)| (branch_name, head_sha, head_tags, browser_url, lines_added, lines_deleted))
-                            });
+                            let git_info = effective_path
+                                .as_ref()
+                                .and_then(|working_dir| self.arena_git_info(working_dir, cx));
 
                             let entity_id = arena_entity.entity_id();
                             let prs = self.pr_info.get(&entity_id);
                             let multiple_prs = prs.map_or(false, |prs| prs.len() > 1);
-                            let tooltip_branch = git_info.as_ref()
-                                .and_then(|(branch, _, _, _, _, _)| branch.clone());
+                            let tooltip_branch = git_info.as_ref().and_then(|info| info.branch.clone());
 
                             let mut pr_rows: Vec<(AnyElement, Option<AnyElement>)> = Vec::new();
                             for pr in prs.map(|prs| prs.as_slice()).unwrap_or_default() {
@@ -7950,8 +8190,7 @@ impl AgentiumApp {
                             let first_pr_row = pr_rows.next();
                             let extra_pr_rows: Vec<_> = pr_rows.collect();
 
-                            let project_url = git_info.as_ref()
-                                .and_then(|(_, _, _, browser_url, _, _)| browser_url.clone());
+                            let project_url = git_info.as_ref().and_then(|info| info.browser_url.clone());
 
                             div()
                                 .id(("arena", arena.id))
@@ -8017,15 +8256,11 @@ impl AgentiumApp {
                                                     .gap_0p5()
                                                     .when(todo_count > 0, |d| {
                                                         d.child(render_arena_pill(("arena-todo-badge", arena.id), todo_count, inbox_todo_color(), colors.surface_background)
-                                                            .tooltip(Tooltip::text("Open Task Overview"))
+                                                            .tooltip(Tooltip::text("Show in Task Overview"))
                                                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                                                 cx.stop_propagation();
                                                                 this.switch_arena(i, window, cx);
-                                                                if let Some(task_id) = task_id {
-                                                                    this.open_overview_scope(task_overview::OverviewScope::Task(task_id), window, cx);
-                                                                } else {
-                                                                    this.open_task_overview(window, cx);
-                                                                }
+                                                                this.overview_collapsed = false;
                                                             })))
                                                     })
                                                     .when(!permission_infos.is_empty(), |d| {
@@ -8158,22 +8393,10 @@ impl AgentiumApp {
                                 })
                                 // Row 2: branch/tag/sha (left) + diff stats (right)
                                 .child({
-                                    let (ref_icon, ref_label): (Option<IconName>, SharedString) =
-                                        if let Some((Some(branch), _, _, _, _, _)) = git_info.as_ref() {
-                                            (Some(IconName::GitBranch), branch.clone().into())
-                                        } else if let Some((None, _, head_tags, _, _, _)) = git_info.as_ref() {
-                                            if let Some(tag) = head_tags.first() {
-                                                (Some(IconName::Tag), tag.clone().into())
-                                            } else if let Some((_, Some(sha), _, _, _, _)) = git_info.as_ref() {
-                                                (None, sha.chars().take(8).collect::<String>().into())
-                                            } else {
-                                                (None, SharedString::default())
-                                            }
-                                        } else {
-                                            (None, SharedString::default())
-                                        };
-                                    let diff_stats = git_info.as_ref()
-                                        .map(|(_, _, _, _, added, deleted)| (*added, *deleted));
+                                    let (ref_icon, ref_label) = git_reference_label(git_info.as_ref());
+                                    let diff_stats = git_info
+                                        .as_ref()
+                                        .map(|info| (info.lines_added, info.lines_deleted));
                                     h_flex()
                                         .items_center()
                                         .gap_1()
@@ -9178,38 +9401,300 @@ impl AgentiumApp {
             .into_any_element()
     }
 
-    fn render_sidebar_tab_button(
+    /// Presence of each agent state across the task's open arenas, for the
+    /// sidebar dots.
+    fn task_status_dots(&self, worktrees: &[WorktreeRow], cx: &App) -> TaskStatusDots {
+        let mut dots = TaskStatusDots::default();
+        for row in worktrees {
+            let WorktreeRow::Live { arena_index } = row else {
+                continue;
+            };
+            let Some(arena_entity) = self.arenas.get(*arena_index) else {
+                continue;
+            };
+            let index = *arena_index;
+            dots.permission
+                .add(index, self.collect_permission_terminal_infos(arena_entity, cx));
+            dots.running
+                .add(index, self.collect_running_terminal_infos(arena_entity, cx));
+            dots.ready
+                .add(index, self.collect_ready_terminal_infos(arena_entity, cx));
+            dots.busy
+                .add(index, self.collect_busy_terminal_infos(arena_entity, cx));
+            dots.error.add(
+                index,
+                codex_badge_entries(
+                    arena_entity.read(cx),
+                    codex_acp_view::CodexAcpState::Error,
+                    cx,
+                ),
+            );
+        }
+        dots
+    }
+
+    /// One dot per agent state present in the task, in the badge order the
+    /// per-arena rows use. Clicking a dot shows the task and opens the same
+    /// terminal menu as the per-arena badge.
+    fn render_task_dots(
         &self,
-        label: &'static str,
-        tab: SidebarTab,
+        task_id: Uuid,
+        dots: TaskStatusDots,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let is_active = self.sidebar_tab == tab;
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
+        let states = [
+            ("permission", dots.permission, status_colors.warning),
+            ("running", dots.running, status_colors.success),
+            ("ready", dots.ready, colors.text_accent),
+            ("error", dots.error, status_colors.error),
+            ("busy", dots.busy, colors.text),
+        ];
         h_flex()
-            .id(label)
-            .flex_1()
-            .justify_center()
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .text_sm()
-            .cursor_pointer()
-            .when(is_active, |d| {
-                d.bg(colors.element_selected)
-                    .font_weight(FontWeight::SEMIBOLD)
-            })
-            .when(!is_active, |d| {
-                d.text_color(colors.text_muted)
-                    .hover(|d| d.bg(colors.element_hover))
-            })
             .gap_1()
-            .child(label)
-            .on_click(cx.listener(move |this, _, _window, cx| {
-                this.agent_activity = None;
-                this.sidebar_tab = tab;
-                cx.notify();
+            .items_center()
+            .flex_shrink_0()
+            .children(states.into_iter().filter_map(|(name, dot, color)| {
+                let arena_index = dot.first_arena?;
+                let entries = dot.entries;
+                let tooltip_entries = entries.clone();
+                Some(
+                    div()
+                        .id(SharedString::from(format!("task-dot-{name}-{task_id}")))
+                        .size(px(8.0))
+                        .rounded_full()
+                        .bg(color)
+                        .cursor_pointer()
+                        .tooltip(Tooltip::element(move |_window, cx| {
+                            render_badge_tooltip(&tooltip_entries, cx)
+                        }))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.select_task(task_id, window, cx);
+                            this.switch_arena(arena_index, window, cx);
+                            this.deploy_badge_menu(
+                                arena_index,
+                                entries.clone(),
+                                event.position(),
+                                window,
+                                cx,
+                            );
+                        })),
+                )
             }))
+    }
+
+    /// Pending To do items plus unanswered questions in the given scope; the
+    /// same count the per-arena badge shows.
+    fn pending_todo_count(&self, arena_ids: &[EntityId], paths: &[PathBuf], cx: &App) -> usize {
+        self.overview_todo_ids(arena_ids, paths, cx)
+            .iter()
+            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
+            .map(|list| list.items.len())
+            .sum::<usize>()
+            + self
+                .inbox_questions
+                .iter()
+                .filter(|question| {
+                    question.resolution.is_none()
+                        && self.question_in_scope(question, arena_ids, paths, cx)
+                })
+                .count()
+    }
+
+    /// The row heading one arena in the overview column: name (click to
+    /// rename while active), branch, directory and PRs. Replaces the arena
+    /// rows the sidebar used to show under each task.
+    fn render_overview_arena_row(
+        &mut self,
+        arena_index: usize,
+        arena_entity: &Entity<Arena>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let arena = arena_entity.read(cx);
+        let arena_id = arena.id;
+        let entity_id = arena_entity.entity_id();
+        let name = arena.name.clone();
+        let is_active = Some(arena_index) == self.active_arena_index;
+        let is_renaming = self.renaming_arena.as_ref() == Some(arena_entity);
+        let directory = arena
+            .working_directory
+            .as_ref()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()));
+        let git_info = arena
+            .working_directory
+            .as_ref()
+            .and_then(|working_dir| self.arena_git_info(working_dir, cx));
+        let branch = git_info.as_ref().and_then(|info| info.branch.clone());
+        let (ref_icon, ref_label) = git_reference_label(git_info.as_ref());
+        let diff_stats = git_info
+            .as_ref()
+            .map(|info| (info.lines_added, info.lines_deleted))
+            .filter(|(added, deleted)| *added > 0 || *deleted > 0);
+        let prs: Vec<PrInfo> = self.pr_info.get(&entity_id).cloned().unwrap_or_default();
+        let multiple_prs = prs.len() > 1;
+        let pr_rows: Vec<(AnyElement, Option<AnyElement>)> = prs
+            .iter()
+            .map(|pr| {
+                self.render_pr_elements(
+                    &format!("overview-arena-pr-{arena_id}"),
+                    pr,
+                    self.ci_status.get(&(entity_id, pr.number)),
+                    branch.as_deref(),
+                    multiple_prs,
+                    true,
+                    self.manual_pr_link_for_arena(arena_index, &pr.html_url),
+                    cx,
+                )
+            })
+            .collect();
+        let changes_arena = arena_entity.clone();
+        let menu_arena = arena_entity.clone();
+        let rename_arena = arena_entity.clone();
+
+        v_flex()
+            .id(("overview-arena", arena_id))
+            .flex_shrink_0()
+            .min_w_0()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .when(is_active, |d| d.bg(colors.element_selected))
+            .when(!is_active, |d| d.hover(|d| d.bg(colors.element_hover)))
+            .cursor_pointer()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(if is_renaming {
+                        div().flex_1().child(self.rename_editor.clone()).into_any_element()
+                    } else if is_active {
+                        div()
+                            .id(("overview-arena-name", arena_id))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_lg()
+                            .rounded_sm()
+                            .hover(|d| d.bg(colors.element_hover))
+                            .tooltip(Tooltip::text("Click to rename"))
+                            .child(name)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.start_rename_arena(rename_arena.clone(), window, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_lg()
+                            .child(name)
+                            .into_any_element()
+                    })
+                    .child(
+                        Button::new(("overview-changes", entity_id), "Changes").on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.switch_arena(arena_index, window, cx);
+                                changes_arena
+                                    .update(cx, |arena, cx| arena.add_diff_view(window, cx));
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .when(!ref_label.is_empty(), |row| {
+                        row.child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_0p5()
+                                .items_center()
+                                .when_some(ref_icon, |row, icon| {
+                                    row.child(
+                                        Icon::new(icon).size(IconSize::XSmall).color(Color::Muted),
+                                    )
+                                })
+                                .child(div().min_w_0().truncate().child(ref_label)),
+                        )
+                    })
+                    .when_some(directory, |row, directory| {
+                        row.child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_0p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Folder)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(div().min_w_0().truncate().child(directory)),
+                        )
+                    })
+                    .child(div().flex_grow_1())
+                    .when_some(diff_stats, |row, (added, deleted)| {
+                        let status_colors = cx.theme().status();
+                        row.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .when(added > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .text_color(status_colors.created)
+                                            .child(format!("+{added}")),
+                                    )
+                                })
+                                .when(deleted > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .text_color(status_colors.deleted)
+                                            .child(format!("-{deleted}")),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+            .children(pr_rows.into_iter().map(|(pr_el, review_el)| {
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .child(pr_el)
+                    .children(review_el)
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.switch_arena(arena_index, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    let browser_url = menu_arena
+                        .read(cx)
+                        .working_directory
+                        .as_ref()
+                        .and_then(|working_dir| this.arena_git_info(working_dir, cx))
+                        .and_then(|info| info.browser_url);
+                    this.deploy_arena_context_menu(
+                        menu_arena.clone(),
+                        browser_url,
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .into_any_element()
     }
 
     fn render_task_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -9218,9 +9703,8 @@ impl AgentiumApp {
         struct TaskData {
             id: Uuid,
             title: String,
-            issues: Vec<board::IssueLink>,
+            worktree_paths: Vec<PathBuf>,
             worktrees: Vec<WorktreeRow>,
-            collapsed: bool,
         }
         let tasks: Vec<TaskData> = self
             .board
@@ -9228,14 +9712,13 @@ impl AgentiumApp {
             .map(|task| TaskData {
                 id: task.id,
                 title: task.title.clone(),
-                issues: task.issues.clone(),
+                worktree_paths: task.worktrees.clone(),
                 worktrees: self
                     .board_cache
                     .task_worktrees
                     .get(&task.id)
                     .cloned()
                     .unwrap_or_default(),
-                collapsed: task.collapsed,
             })
             .collect();
         let unassigned = self.board_cache.unassigned_arenas.clone();
@@ -9256,10 +9739,23 @@ impl AgentiumApp {
         for task in tasks {
             let task_id = task.id;
             let is_renaming = self.renaming_task == Some(task_id);
+            let is_selected = self.selected_task == Some(task_id);
             let contains_active_arena = task.worktrees.iter().any(|row| {
                 matches!(row, WorktreeRow::Live { arena_index }
                     if Some(*arena_index) == self.active_arena_index)
             });
+            let live_arena_ids: Vec<EntityId> = task
+                .worktrees
+                .iter()
+                .filter_map(|row| match row {
+                    WorktreeRow::Live { arena_index } => {
+                        self.arenas.get(*arena_index).map(|arena| arena.entity_id())
+                    }
+                    WorktreeRow::Closed { .. } | WorktreeRow::Missing { .. } => None,
+                })
+                .collect();
+            let dots = self.task_status_dots(&task.worktrees, cx);
+            let todo_count = self.pending_todo_count(&live_arena_ids, &task.worktree_paths, cx);
             let header = h_flex()
                 .id(SharedString::from(format!("task-header-{task_id}")))
                 .px_2()
@@ -9267,16 +9763,8 @@ impl AgentiumApp {
                 .gap_1()
                 .items_center()
                 .cursor_pointer()
-                .hover(|d| d.bg(colors.element_hover))
-                .child(
-                    Icon::new(if task.collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-                )
+                .when(is_selected, |d| d.bg(colors.element_selected))
+                .when(!is_selected, |d| d.hover(|d| d.bg(colors.element_hover)))
                 .child(if is_renaming {
                     div()
                         .flex_1()
@@ -9292,14 +9780,24 @@ impl AgentiumApp {
                         .child(task.title.clone())
                         .into_any_element()
                 })
-                .on_click(cx.listener(move |this, _, _window, cx| {
+                .child(self.render_task_dots(task_id, dots, cx))
+                .when(todo_count > 0, |row| {
+                    row.child(
+                        render_arena_pill(
+                            SharedString::from(format!("task-todo-badge-{task_id}")),
+                            todo_count,
+                            inbox_todo_color(),
+                            colors.surface_background,
+                        )
+                        .tooltip(Tooltip::text("Pending To do items and questions")),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
                     if this.renaming_task == Some(task_id) {
                         return;
                     }
-                    if let Ok(task) = this.board.task_mut(task_id) {
-                        task.collapsed = !task.collapsed;
-                        this.persist_board(cx);
-                    }
+                    this.select_task(task_id, window, cx);
+                    this.overview_collapsed = false;
                     cx.notify();
                 }))
                 .on_mouse_down(
@@ -9322,54 +9820,24 @@ impl AgentiumApp {
                 })
                 .child(header);
 
-            if !task.collapsed {
-                if self.adding_issue_to_task == Some(task_id) {
+            if self.adding_issue_to_task == Some(task_id) {
+                section = section.child(
+                    div()
+                        .pl_5()
+                        .pr_2()
+                        .py_0p5()
+                        .text_xs()
+                        .child(self.issue_input_editor.clone()),
+                );
+                if let Some(error) = self.issue_input_error.clone() {
                     section = section.child(
                         div()
                             .pl_5()
                             .pr_2()
-                            .py_0p5()
                             .text_xs()
-                            .child(self.issue_input_editor.clone()),
+                            .text_color(cx.theme().status().error)
+                            .child(error),
                     );
-                    if let Some(error) = self.issue_input_error.clone() {
-                        section = section.child(
-                            div()
-                                .pl_5()
-                                .pr_2()
-                                .text_xs()
-                                .text_color(cx.theme().status().error)
-                                .child(error),
-                        );
-                    }
-                }
-                for issue in &task.issues {
-                    section = section.child(self.render_issue_row(task_id, issue, &colors, cx));
-                }
-                for row in &task.worktrees {
-                    section = match row {
-                        WorktreeRow::Live { arena_index } => section.child(
-                            div().pl_3().child(self.render_arena_row(*arena_index, Some(task_id), cx)),
-                        ),
-                        WorktreeRow::Closed { path } => section.child(
-                            self.render_closed_worktree_row(
-                                task_id,
-                                path.clone(),
-                                false,
-                                &colors,
-                                cx,
-                            ),
-                        ),
-                        WorktreeRow::Missing { path } => section.child(
-                            self.render_closed_worktree_row(
-                                task_id,
-                                path.clone(),
-                                true,
-                                &colors,
-                                cx,
-                            ),
-                        ),
-                    };
                 }
             }
             list = list.child(section);
@@ -9392,7 +9860,7 @@ impl AgentiumApp {
                     .child(div().flex_1().h_px().bg(colors.border)),
             );
             for arena_index in unassigned {
-                section = section.child(self.render_arena_row(arena_index, None, cx));
+                section = section.child(self.render_arena_row(arena_index, cx));
             }
             list = list.child(section);
         }
@@ -9527,7 +9995,7 @@ impl AgentiumApp {
                 render_arena_pill(SharedString::from(format!("closed-todo-{task_id}-{name}")), todo_count, inbox_todo_color(), colors.surface_background)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.open_overview_scope(task_overview::OverviewScope::Task(task_id), window, cx);
+                        this.select_task(task_id, window, cx);
                     }))
             ))
             .when(missing, |d| {
@@ -9574,9 +10042,89 @@ impl Render for AgentiumApp {
 
         div()
             .key_context("Agentium")
-            .on_action(cx.listener(|this, _: &NewTaskOverview, window, cx| { this.open_task_overview(window, cx); }))
-            .on_action(cx.listener(|this, action: &ActivateArena, window, cx| {
-                this.switch_arena(action.index, window, cx);
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, action: &ActivateTask, window, cx| {
+                let task_id = this.board.active_tasks().nth(action.index).map(|task| task.id);
+                if let Some(task_id) = task_id {
+                    this.select_task(task_id, window, cx);
+                }
+            }))
+            // New-item actions reach here only when nothing inside an arena
+            // handled them, i.e. while the sidebar or the overview column has
+            // focus; they then target the active arena.
+            .on_action(cx.listener(|this, _: &OpenNewItemMenu, window, cx| {
+                if let Some(arena) = this.active_arena().cloned() {
+                    let handle = arena.read(cx).active_pane.read(cx).new_item_context_menu_handle.clone();
+                    handle.toggle(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenSplitMenu, window, cx| {
+                if let Some(arena) = this.active_arena().cloned() {
+                    let handle = arena.read(cx).active_pane.read(cx).split_item_context_menu_handle.clone();
+                    handle.toggle(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &workspace::NewTerminal, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_terminal(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewClaudeCode, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_claude_code(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewCodexAcp, window, cx| {
+                this.update_active_arena(cx, |arena, cx| {
+                    arena.add_codex_acp(None, None, window, cx).log_err();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &NewDiffView, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_diff_view(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewBranchDiff, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_branch_diff(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewProjectSearch, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_project_search(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewGitStatus, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_git_status(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewFileBrowser, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_file_browser(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NewGitGraph, window, cx| {
+                this.update_active_arena(cx, |arena, cx| arena.add_git_graph(window, cx));
+            }))
+            // Single dispatcher for every inline editor (Inbox note, issue
+            // input, task rename, arena rename). The arena rename editor now
+            // renders in the overview column as well as the sidebar, so the
+            // handler lives on their common ancestor; actions stop at the
+            // first matching handler, so exactly one must exist.
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                if let Some(question_id) = this.focused_inbox_note(window, cx) {
+                    // Enter sends only an option-less question's
+                    // answer; with options, a click picks which one.
+                    this.answer_inbox_question(question_id, None, window, cx);
+                } else if this.adding_issue_to_task.is_some() {
+                    this.finish_add_issue(true, cx);
+                } else if this.renaming_task.is_some() {
+                    this.finish_rename_task(true, cx);
+                } else if this.renaming_arena.is_some() {
+                    this.finish_rename_arena(true, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                if this.focused_inbox_note(window, cx).is_some() {
+                    // Keep the draft; Escape only leaves the note.
+                } else if this.adding_issue_to_task.is_some() {
+                    this.finish_add_issue(false, cx);
+                } else if this.renaming_task.is_some() {
+                    this.finish_rename_task(false, cx);
+                } else if this.renaming_arena.is_some() {
+                    this.finish_rename_arena(false, cx);
+                } else {
+                    cx.propagate();
+                }
             }))
             .on_action(|_: &workspace::Open, _, _| {})
             .on_action(|_: &workspace::OpenFiles, _, _| {})
@@ -9594,34 +10142,6 @@ impl Render for AgentiumApp {
                     .bg(colors.panel_background)
                     .border_r_1()
                     .border_color(colors.border)
-                    // Single dispatcher for both rename editors: arena rows are
-                    // also rendered under the Tasks tab, so their editor can be
-                    // focused outside #arena-list; actions stop at the first
-                    // matching handler, so exactly one handler must exist here.
-                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
-                        if let Some(question_id) = this.focused_inbox_note(window, cx) {
-                            // Enter sends only an option-less question's
-                            // answer; with options, a click picks which one.
-                            this.answer_inbox_question(question_id, None, window, cx);
-                        } else if this.adding_issue_to_task.is_some() {
-                            this.finish_add_issue(true, cx);
-                        } else if this.renaming_task.is_some() {
-                            this.finish_rename_task(true, cx);
-                        } else {
-                            this.finish_rename_arena(true, cx);
-                        }
-                    }))
-                    .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
-                        if this.focused_inbox_note(window, cx).is_some() {
-                            // Keep the draft; Escape only leaves the note.
-                        } else if this.adding_issue_to_task.is_some() {
-                            this.finish_add_issue(false, cx);
-                        } else if this.renaming_task.is_some() {
-                            this.finish_rename_task(false, cx);
-                        } else {
-                            this.finish_rename_arena(false, cx);
-                        }
-                    }))
                     .child(
                         div()
                             .id("agentium-title")
@@ -9655,32 +10175,19 @@ impl Render for AgentiumApp {
                                 }
                             }),
                     )
+                    .child(self.render_task_list(cx))
                     .child(
-                        h_flex()
-                            .px_2()
-                            .pb_1()
-                            .gap_1()
-                            .child(self.render_sidebar_tab_button(
-                                "Repositories",
-                                SidebarTab::Repositories,
-                                cx,
-                            ))
-                            .child(self.render_sidebar_tab_button("Tasks", SidebarTab::Tasks, cx)),
-                    )
-                    .child(match self.sidebar_tab {
-                        SidebarTab::Repositories => div()
-                            .id("arena-list")
-                            .flex_1()
-                            .overflow_y_scroll()
-                            .children(
-                                (0..self.arenas.len()).map(|i| self.render_arena_row(i, None, cx)),
-                            )
-                            .into_any_element(),
-                        SidebarTab::Tasks => self.render_task_list(cx),
-                    })
-                    .when(self.sidebar_tab == SidebarTab::Repositories, |d| d.child(
-                        div()
+                        v_flex()
                             .p_2()
+                            .gap_1()
+                            .child(
+                                Button::new("new-task", "+ New Task")
+                                    .full_width()
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_task(None, window, cx);
+                                    })),
+                            )
                             .child({
                                 let agentium_weak = cx.entity().downgrade();
                                 let fs = self.app_state.fs.clone();
@@ -9701,20 +10208,8 @@ impl Render for AgentiumApp {
                                             .style(ButtonStyle::Subtle),
                                     )
                                     .anchor(Anchor::BottomLeft)
-                            })
-                    ))
-                    .when(self.sidebar_tab == SidebarTab::Tasks, |d| d.child(
-                        div()
-                            .p_2()
-                            .child(
-                                Button::new("new-task", "+ New Task")
-                                    .full_width()
-                                    .style(ButtonStyle::Subtle)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_task(None, window, cx);
-                                    })),
-                            ),
-                    ))
+                            }),
+                    )
                     .when_some(self.rate_limits.as_ref(), |sidebar, rate_limits| {
                         let is_stale =
                             rate_limits.received_at.elapsed() > Duration::from_secs(3600);
@@ -9784,6 +10279,40 @@ impl Render for AgentiumApp {
                         .with_priority(1)
                     })),
             )
+            .child(if self.overview_collapsed {
+                div()
+                    .id("overview-collapsed")
+                    .w(px(20.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt_2()
+                    .bg(colors.panel_background)
+                    .border_r_1()
+                    .border_color(colors.border)
+                    .child(
+                        IconButton::new("overview-expand", IconName::ChevronRight)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Show Task Overview"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.overview_collapsed = false;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .id("overview-column")
+                    .w(px(OVERVIEW_COLUMN_WIDTH))
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(colors.border)
+                    .child(self.overview.clone())
+                    .into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
@@ -10235,7 +10764,7 @@ mod tests {
         parse_todo_set_request, record_finished_tabs, todo_list_index,
         ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
-        tasks_sharing_arena, with_from_line,
+        tasks_sharing_arena, with_from_line, resolve_selected_task, arena_to_open_for_task,
     };
     use crate::arena::TitleState;
     use crate::board::{BoardTask, IssueLink, IssueRef, PrRef};
@@ -11086,5 +11615,28 @@ mod tests {
         expected.sort();
         assert_eq!(result, expected);
         assert!(tasks_sharing_arena(&task_worktrees, 2).is_empty());
+    }
+
+    #[test]
+    fn selection_stays_on_the_selected_task_when_the_arena_is_shared() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert_eq!(resolve_selected_task(Some(second), &[first, second]), Some(second));
+        assert_eq!(resolve_selected_task(Some(other), &[first, second]), Some(first));
+        assert_eq!(resolve_selected_task(None, &[first, second]), Some(first));
+        assert_eq!(resolve_selected_task(Some(other), &[]), None);
+    }
+
+    #[test]
+    fn selecting_a_task_returns_to_its_last_active_arena() {
+        let arena_a = gpui::EntityId::from(1u64);
+        let arena_b = gpui::EntityId::from(2u64);
+        let closed = gpui::EntityId::from(3u64);
+        let live = [(0, arena_a), (1, arena_b)];
+        assert_eq!(arena_to_open_for_task(Some(arena_b), &live), Some(1));
+        assert_eq!(arena_to_open_for_task(Some(closed), &live), Some(0));
+        assert_eq!(arena_to_open_for_task(None, &live), Some(0));
+        assert_eq!(arena_to_open_for_task(Some(arena_a), &[]), None);
     }
 }

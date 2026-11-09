@@ -2,18 +2,19 @@ use std::collections::HashMap;
 
 use gpui::{prelude::*, *};
 use ui::{Button, Clickable as _, Icon, IconSize, Tooltip, h_flex, v_flex};
-use workspace::item::{Item, ItemEvent};
 
 use crate::{AgentiumApp, inbox_todo_view::InboxTodoView};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverviewScope {
     Task(uuid::Uuid),
     Arena(EntityId),
 }
 
+/// The always-visible column beside the sidebar. It is not a pane item: it
+/// shows whichever task (or task-less arena) the sidebar selection points at.
 pub(crate) struct TaskOverview {
-    pub(crate) scope: OverviewScope,
+    pub(crate) scope: Option<OverviewScope>,
     app: WeakEntity<AgentiumApp>,
     focus_handle: FocusHandle,
     pub(crate) todos: HashMap<u64, Entity<InboxTodoView>>,
@@ -26,14 +27,10 @@ pub(crate) struct TaskOverview {
 }
 
 impl TaskOverview {
-    pub(crate) fn new(
-        scope: OverviewScope,
-        app: Entity<AgentiumApp>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub(crate) fn new(app: Entity<AgentiumApp>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&app, |_, _, cx| cx.notify());
         Self {
-            scope,
+            scope: None,
             app: app.downgrade(),
             focus_handle: cx.focus_handle(),
             todos: HashMap::new(),
@@ -136,24 +133,6 @@ impl Render for TaskOverview {
 impl Focusable for TaskOverview {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
-    }
-}
-
-impl EventEmitter<ItemEvent> for TaskOverview {}
-
-impl Item for TaskOverview {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
-        "Task Overview".into()
-    }
-
-    fn telemetry_event_text(&self) -> Option<&'static str> {
-        None
-    }
-
-    fn to_item_events(event: &ItemEvent, emit: &mut dyn FnMut(ItemEvent)) {
-        emit(*event);
     }
 }
 
