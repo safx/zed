@@ -4,7 +4,7 @@
 
 Agentium uses two distinct concepts that must not be confused:
 
-- **Arena** (`Arena` struct in `arena.rs`): An Agentium-specific concept representing an isolated work area for an AI agent. Each arena has its own name, pane layout, working directory, and active pane. Multiple arenas are listed in the left sidebar and can be switched between. This is the unit the user creates via "+ New Arena".
+- **Arena** (`Arena` struct in `arena.rs`): An Agentium-specific concept representing an isolated work area for an AI agent. Each arena has its own name, pane layout, working directory, and active pane. The left sidebar lists tasks (one line each); an arena is reached through its task's Task Overview column, or directly from the sidebar's Unassigned section when it belongs to no task. This is the unit the user creates via "+ New Arena".
 
 - **Workspace** (`workspace::Workspace` from the `workspace` crate): A Zed infrastructure entity that provides project, language registry, modal layer, and other shared services. It is **not rendered** in Agentium's element tree — it exists only as a data store. There is one `Workspace` entity shared across all arenas.
 
@@ -47,7 +47,7 @@ When integrating a Zed crate that registers workspace actions (e.g. `markdown_pr
 
 Additionally, many default keybindings in `assets/keymaps/` are scoped to `"context": "Workspace"`. GPUI matches this predicate against `KeyContext` values set on elements in the tree via `.key_context()`. Since `Workspace` is not rendered, its `KeyContext` with `"Workspace"` is never in the dispatch path. The `Arena` render method must set `.key_context("Workspace")` on a wrapper div that is an ancestor of focused elements, so that keybindings scoped to `"Workspace"` context (e.g. `cmd-p` for `file_finder::Toggle`) can match.
 
-`AgentiumApp::render()` also sets `.key_context("Agentium")` on its root div. This context is always in the dispatch path regardless of focus location (sidebar or arena). Agentium-specific keybindings that must work from anywhere (e.g. `cmd-1`...`cmd-9` for arena switching) are bound to the `"Agentium"` context in `main.rs`. GPUI uses depth-based precedence — deeper contexts win — so bindings that need to override default `"Workspace"`-scoped bindings inside arenas must also be registered at the `"Workspace"` context level.
+`AgentiumApp::render()` also sets `.key_context("Agentium")` on its root div. This context is always in the dispatch path regardless of focus location (sidebar or arena). Agentium-specific keybindings that must work from anywhere (e.g. `cmd-1`...`cmd-9` for task selection) are bound to the `"Agentium"` context in `main.rs`. The Task Overview column is a sibling of the arena, outside every `"Workspace"` context, so actions that create tabs (`OpenNewItemMenu`, `OpenSplitMenu`, `NewTerminal`, the `New*` actions) also have handlers on the `"Agentium"` root that delegate to the active arena, and `Workspace`-only default bindings they need (`ctrl-~`) are duplicated under `"Agentium"`. GPUI uses depth-based precedence — deeper contexts win — so bindings that need to override default `"Workspace"`-scoped bindings inside arenas must also be registered at the `"Workspace"` context level.
 
 ## Claude Code hook IPC uses `Rc<RefCell<HashSet<u32>>>` for cross-closure state
 
@@ -130,9 +130,9 @@ The task board (`board::Board`, persisted at `data_dir()/board.json`) follows a 
 
 macOS caps unix datagrams at 2048 bytes (`net.local.dgram.maxdgram`). Task-command envelopes are kept ≤1900 bytes; an oversized `New` is split into `New` + `AddIssue`×N + `AddArena`×N before sending. `Board::apply` is idempotent (duplicate `New` ids ignored, issues/worktrees deduped) so datagram duplication and CLI retries are safe.
 
-## Sidebar inline editors share one `menu::Confirm`/`Cancel` dispatcher
+## Inline editors share one `menu::Confirm`/`Cancel` dispatcher on the root
 
-GPUI actions stop at the first matching handler during bubble dispatch. The sidebar has three inline editors (arena rename, task rename, issue input) and exactly **one** Confirm/Cancel handler pair, on the sidebar column div, which branches on the active editing state. Do not add a second `on_action::<menu::Confirm>` for a new editor — extend the dispatcher, add mutual exclusion in the `start_*` method (each cancels the others), and subscribe to `EditorEvent::Blurred` as **cancel** (matching the existing rename behavior).
+GPUI actions stop at the first matching handler during bubble dispatch. There are four inline editors (arena rename in the Task Overview column and the sidebar's Unassigned section, task rename and issue input in the sidebar, Inbox note editors in the overview) and exactly **one** Confirm/Cancel handler pair, on `AgentiumApp`'s root div, which branches on the active editing state and calls `cx.propagate()` when nothing is being edited. Do not add a second `on_action::<menu::Confirm>` for a new editor and do not move the pair below the root (an editor rendered in a sibling column would stop reaching it) — extend the dispatcher, add mutual exclusion in the `start_*` method (each cancels the others), and subscribe to `EditorEvent::Blurred` as **cancel** (matching the existing rename behavior).
 
 ## No filesystem calls in sidebar render — cache derived board state
 

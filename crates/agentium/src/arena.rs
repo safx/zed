@@ -353,7 +353,7 @@ impl Arena {
         }
     }
 
-    fn add_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(self.working_directory.clone(), cx)
         });
@@ -381,7 +381,7 @@ impl Arena {
         .detach_and_log_err(cx);
     }
 
-    fn add_claude_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_claude_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shell = Shell::WithArguments {
             program: "claude".to_string(),
             args: vec![],
@@ -447,7 +447,7 @@ impl Arena {
         });
     }
 
-    fn add_branch_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_branch_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -505,7 +505,7 @@ impl Arena {
         self.add_project_search(window, cx);
     }
 
-    fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_project_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
         let project_search = self.new_project_search(cx);
         let workspace_weak = self.workspace.clone();
@@ -519,7 +519,7 @@ impl Arena {
         });
     }
 
-    fn add_git_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_git_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
         let view =
             cx.new(|cx| GitStatusView::new(self.project.clone(), self.workspace.clone(), cx));
@@ -528,7 +528,7 @@ impl Arena {
         });
     }
 
-    fn add_file_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_file_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
         let worktree_id = self.worktree_id(cx);
         let view = cx.new(|cx| {
@@ -565,7 +565,7 @@ impl Arena {
             .max_by_key(|(_, path)| path.clone())
     }
 
-    fn add_git_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_git_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_context(cx);
         let Some((repo_id, _)) = self.find_repository(cx) else {
             return;
@@ -1991,7 +1991,6 @@ pub(crate) fn new_agentium_pane(
                                     |menu: ui::ContextMenu, _, _| {
                                         menu.key_context("AgentiumNewItemMenu")
                                             .context(focus_handle.clone())
-                                            .action("Task Overview", crate::NewTaskOverview.boxed_clone())
                                             .action("Claude Code", NewClaudeCode.boxed_clone())
                                             .action("Codex (ACP)", NewCodexAcp.boxed_clone())
                                             .action("Resume Codex Conversation…", ResumeCodexConversation.boxed_clone())

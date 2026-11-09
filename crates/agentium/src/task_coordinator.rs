@@ -17,7 +17,7 @@ use workspace::Item as _;
 
 use crate::{
     AgentiumApp, Arena, InboxAsker, codex_acp_persistence::SavedCodexTab,
-    codex_acp_view::CodexAcpView, task_overview::TaskOverview,
+    codex_acp_view::CodexAcpView,
 };
 
 pub(crate) const TITLE: &str = "Task Coordinator";
@@ -560,8 +560,7 @@ impl AgentiumApp {
                 .and_then(|runtime| runtime.item);
             let mut sources = Vec::new();
             for item in &items {
-                if item.downcast::<TaskOverview>().is_some() || runtime_item == Some(item.item_id())
-                {
+                if runtime_item == Some(item.item_id()) {
                     continue;
                 }
                 if let Some(view) = item.act_as::<CodexAcpView>(cx) {
@@ -774,7 +773,6 @@ impl AgentiumApp {
                     .panes()
                     .iter()
                     .flat_map(|pane| pane.read(cx).items().cloned().collect::<Vec<_>>())
-                    .filter(|item| item.downcast::<TaskOverview>().is_none())
                     .find(|item| {
                         self.inbox_asker(item.as_ref(), cx)
                             == Some(InboxAsker::ClaudeSession {

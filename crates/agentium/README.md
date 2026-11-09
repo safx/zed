@@ -19,7 +19,7 @@ A terminal application for parallel work with AI coding agents, powered by [Zed]
 - **Pane splitting** — split panes in any direction, drag and drop tabs between panes
 - **PR tracking** — display every PR of the arena's branch (e.g. one to `develop` and one to `master`) with status icons (draft/open/merged/closed/conflicted) and base branch names, clickable to open in browser. GitHub repositories require the `gh` CLI. Backlog Git repositories (detected from the origin remote) require the [`bee`](https://nulab.github.io/bee/) CLI; their PRs are discovered through Backlog issues — the issue key in the branch name (e.g. `PROJ-123/fix-thing`) or issues registered on a task containing the arena — and show open/merged/closed states (Backlog has no draft, review, or CI data)
 - **CI status** — poll GitHub Actions check status per PR (GitHub PRs only) with adaptive intervals based on commit age (60s/180s/300s), show pass/fail/pending icons with rich tooltip showing individual check results
-- **Task board** — a Tasks sidebar tab with a priority-ordered task list; each task bundles issues (GitHub and Backlog) and arenas (worktrees), so multi-repository work is grouped under one task. Persisted to `~/Library/Application Support/Agentium/board.json`; closed worktrees reopen as arenas with one click. Issue titles/states are fetched via the `gh` and [`bee`](https://nulab.github.io/bee/) CLIs (both optional)
+- **Task board** — the sidebar lists tasks one line each, with agent state dots and a To do count; each task bundles issues (GitHub and Backlog) and arenas (worktrees), so multi-repository work is grouped under one task. Arenas that belong to no task are listed below the tasks. Persisted to `~/Library/Application Support/Agentium/board.json`; closed worktrees reopen as arenas with one click from Task Overview. Issue titles/states are fetched via the `gh` and [`bee`](https://nulab.github.io/bee/) CLIs (both optional)
 - **Claude Code integration** — receive notifications when Claude Code finishes a task via hook-based IPC, fork sessions from tab context menu, display rate limit usage in sidebar
 - **Claude Code session ↔ PR tracking** — persist a many-to-many mapping between Claude Code session IDs and PR numbers per project (`~/Library/Application Support/Agentium/pr.json`), queryable via CLI. PR numbers are GitHub or Backlog depending on the project's origin remote
 - **Codex state** — Codex terminals get the same running/permission/completed indicators as Claude Code, read from the terminal title Codex sets (braille spinner while working, `Action Required` while awaiting an approval); no hooks or Codex config needed
@@ -74,7 +74,7 @@ This feature is experimental. Automatic ACP Registry installation and remote Are
 
 | Shortcut | Action |
 |---|---|
-| `Cmd+1`...`Cmd+9` | Switch to arena 1-9 |
+| `Cmd+1`...`Cmd+9` | Select task 1-9 and show its last active arena |
 | `Ctrl+[` / `Ctrl+]` | Previous / next pane |
 | `Cmd+[` / `Cmd+]` | Previous / next tab |
 | `Cmd+P` | File finder |
@@ -112,9 +112,11 @@ Pressing any key while focused on a terminal clears its dot (and border). Openin
 
 ## Task Overview
 
-Choose **Task Overview** from the tab bar’s **+** menu. It gathers the task’s arenas, agent requests and results, To do items, and pull requests in one tab. An arena without a task gets an arena-scoped overview. Opening the same overview again activates its existing tab.
+Task Overview is the column between the sidebar and the arena. It shows the selected task: its issues, arenas (name, branch, directory and pull requests; click to switch, click the active name to rename, right-click for the arena menu), closed worktrees, agent requests and results, To do items, and pull requests. An arena without a task gets an arena-scoped overview. Selecting a task in the sidebar returns the center to the arena last used for that task; switching arenas selects the task that contains the arena. The chevron in the heading hides the column.
 
-The sidebar shows aggregate running, completed, permission, error, and non-agent process badges, plus a teal badge with the total pending To do items in that arena. There are no per-agent sidebar rows. Clicking a To do badge opens the task’s overview; there is no standalone To do tab or Inbox tab.
+The sidebar shows one line per task with a dot per agent state present (permission, running, completed, error, non-agent process) and a teal badge with the pending To do items and questions of that task. There are no per-agent or per-arena rows under a task. Clicking a To do badge shows the task’s overview; there is no standalone To do tab or Inbox tab.
+
+Keyboard shortcuts that create tabs (`Cmd+T`, `Cmd+Shift+T`, `Ctrl+~`) work while the overview column has focus and target the active arena.
 
 Each agent card links to its original tab. Request and Response initially show the first sentence (ending at `.` or `。`); Show more / Show less toggles the received text. New text starts collapsed. The status button opens its activity, including questions and permission responses. Expand **To do** to choose Done / Go / Skip, add notes, and send directly to that agent. Drafts survive switching tabs; successfully sent items appear in a collapsed Processed items section, marked Done, Skipped, or Requested and only delivered items leave the list. Closed owners retain their items and can be restored from the overview before sending.
 
@@ -214,7 +216,7 @@ agentium tab list [--arena <PATH>] [--json]
 
 ### `agentium task`
 
-Manage the task board. `new` / `add-issue` / `add-arena` / `add-pr` / `done` mutate the board: when an Agentium instance is running, they are handed to it as datagrams over `agentium.sock` (changes appear in the Tasks tab immediately); otherwise `board.json` is modified directly. `list` / `info` are read-only: when an Agentium instance is running, they are answered over the CLI socket (`~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`) from its in-memory board and PR cache, avoiding a race with the app's own background writes to `board.json`; without a running instance, they read `board.json` (and, for `info`, `pr_cache.json`) directly.
+Manage the task board. `new` / `add-issue` / `add-arena` / `add-pr` / `done` mutate the board: when an Agentium instance is running, they are handed to it as datagrams over `agentium.sock` (changes appear in the sidebar immediately); otherwise `board.json` is modified directly. `list` / `info` are read-only: when an Agentium instance is running, they are answered over the CLI socket (`~/.local/share/agentium/agentium-cli.sock`; the Claude Code sandbox needs it in `sandbox.network.allowUnixSockets`) from its in-memory board and PR cache, avoiding a race with the app's own background writes to `board.json`; without a running instance, they read `board.json` (and, for `info`, `pr_cache.json`) directly.
 
 ```
 agentium task new <TITLE> [--issue <ISSUE>]... [--arena <PATH>]...
