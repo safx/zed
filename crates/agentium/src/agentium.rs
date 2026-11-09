@@ -408,7 +408,7 @@ fn next_inbox_id(
 /// What survives an Agentium restart to find the asking tab again: tab
 /// entities and shell PIDs do not, but `claude --resume` keeps the session id
 /// and restored ACP tabs keep their saved id.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InboxAsker {
     ClaudeSession { session_id: String },
@@ -419,6 +419,29 @@ struct InboxTab {
     arena: WeakEntity<Arena>,
     pane: WeakEntity<Pane>,
     item: Box<dyn workspace::WeakItemHandle>,
+}
+
+struct PendingAssignment {
+    todo_id: u64,
+    started_at: Instant,
+}
+
+/// How long a tab started from Assign… may go without the hooks reporting
+/// its session before the wait is given up as a hook problem.
+const PENDING_ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// One agent tab as Task Overview shows it.
+struct SessionCard {
+    arena_index: usize,
+    arena: Entity<Arena>,
+    pane: Entity<Pane>,
+    item: Box<dyn workspace::ItemHandle>,
+    asker: Option<InboxAsker>,
+    icon: IconName,
+    title: String,
+    status: &'static str,
+    question_ids: Vec<u64>,
+    context: inbox_todo_view::AssigneeContext,
 }
 
 /// The tab a `todo` CLI command was run from.
@@ -954,7 +977,22 @@ pub struct CiInfo {
     pub checks: Vec<CiCheckEntry>,
 }
 
+const SIDEBAR_WIDTH: f32 = 320.0;
 const OVERVIEW_COLUMN_WIDTH: f32 = 400.0;
+const OVERVIEW_MIN_WIDTH: f32 = 240.0;
+const OVERVIEW_MAX_WIDTH: f32 = 900.0;
+const OVERVIEW_RESIZE_HANDLE_SIZE: f32 = 6.0;
+
+/// The drag payload of the overview column's resize handle; nothing is drawn
+/// while dragging.
+#[derive(Clone)]
+struct DraggedOverviewHandle;
+
+impl Render for DraggedOverviewHandle {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 /// What the arena rows show about the repository containing an arena.
 struct ArenaGitInfo {
@@ -1138,6 +1176,8 @@ pub struct AgentiumApp {
     last_active_arena: HashMap<Uuid, EntityId>,
     overview: Entity<task_overview::TaskOverview>,
     overview_collapsed: bool,
+    /// Dragged at the column's right edge; not persisted.
+    overview_width: Pixels,
     agent_activity: Option<(EntityId, Point<Pixels>)>,
     inbox_questions: Vec<InboxQuestion>,
     next_inbox_question_id: u64,
@@ -1149,6 +1189,15 @@ pub struct AgentiumApp {
     /// Why restoring a list's owner tab failed, shown on its row until the
     /// next click retries.
     todo_restore_errors: HashMap<u64, String>,
+    /// Claude Code tabs started from an item's Assign… menu, by tab item id:
+    /// the item is assigned once the hooks report the tab's session.
+    pending_todo_assignments: HashMap<EntityId, PendingAssignment>,
+    /// Tabs still being created for an item, by item id: the token lets a
+    /// Cancel invalidate a launch that has not produced its tab yet.
+    pending_todo_launches: HashMap<u64, Vec<Uuid>>,
+    /// Why a session started for an item never became its assignee, shown
+    /// on the item until dismissed.
+    todo_session_errors: HashMap<u64, String>,
     _inbox_todos_subscription: Subscription,
     inbox_note_editors: HashMap<u64, Entity<Editor>>,
     inbox_permissions: Vec<InboxPermission>,
@@ -1560,6 +1609,7 @@ impl AgentiumApp {
             last_active_arena: HashMap::new(),
             overview,
             overview_collapsed: false,
+            overview_width: px(OVERVIEW_COLUMN_WIDTH),
             agent_activity: None,
             next_inbox_question_id,
             inbox_questions,
@@ -1567,6 +1617,9 @@ impl AgentiumApp {
             inbox_todos,
             pending_todo_restores: HashMap::new(),
             todo_restore_errors: HashMap::new(),
+            pending_todo_assignments: HashMap::new(),
+            pending_todo_launches: HashMap::new(),
+            todo_session_errors: HashMap::new(),
             _inbox_todos_subscription: inbox_todos_subscription,
             inbox_note_editors: HashMap::new(),
             inbox_permissions: Vec::new(),
@@ -3668,6 +3721,102 @@ impl AgentiumApp {
         Ok(TodoListReply { items, questions })
     }
 
+    /// Starts a Claude Code tab in the arena for the item and assigns the
+    /// item once the tab's session is reported. The arena becomes the item's
+    /// default for later sessions.
+    fn start_session_for_todo(
+        &mut self,
+        todo_id: u64,
+        arena_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(arena) = self.arenas.get(arena_index).cloned() else {
+            return;
+        };
+        if let Some(path) = arena.read(cx).working_directory.clone() {
+            let name = arena.read(cx).name.clone();
+            self.inbox_todos
+                .update(cx, |todos, cx| todos.set_arena(todo_id, path, name, cx));
+        }
+        self.switch_arena(arena_index, window, cx);
+        self.todo_session_errors.remove(&todo_id);
+        // Registered before the terminal exists, so a Cancel in the meantime
+        // can invalidate this launch; a stale completion leaves the tab open
+        // but unassigned.
+        let token = Uuid::new_v4();
+        self.pending_todo_launches
+            .entry(todo_id)
+            .or_default()
+            .push(token);
+        let launch = arena.update(cx, |arena, cx| arena.start_claude_code(window, cx));
+        cx.spawn(async move |this, cx| {
+            let result = launch.await;
+            this.update(cx, |this, cx| {
+                let Some(tokens) = this.pending_todo_launches.get_mut(&todo_id) else {
+                    return;
+                };
+                let Some(position) = tokens.iter().position(|candidate| *candidate == token)
+                else {
+                    return;
+                };
+                tokens.remove(position);
+                if tokens.is_empty() {
+                    this.pending_todo_launches.remove(&todo_id);
+                }
+                match result {
+                    Ok(item_id) => {
+                        this.pending_todo_assignments.insert(
+                            item_id,
+                            PendingAssignment {
+                                todo_id,
+                                started_at: Instant::now(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        this.todo_session_errors
+                            .insert(todo_id, format!("Could not start Claude Code: {error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Reopens the arena the item remembers, then starts the session there.
+    fn start_session_for_todo_at_path(
+        &mut self,
+        todo_id: u64,
+        arena_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `add_arena_with_path` reports failure only through `arena_error`,
+        // so success is checked by finding the arena.
+        self.add_arena_with_path(arena_path.clone(), window, cx);
+        let canonical = std::fs::canonicalize(&arena_path).ok();
+        let index = self.arenas.iter().position(|arena| {
+            arena.read(cx).working_directory.as_ref().is_some_and(|path| {
+                *path == arena_path || Some(path) == canonical.as_ref()
+            })
+        });
+        match index {
+            Some(index) => self.start_session_for_todo(todo_id, index, window, cx),
+            None => {
+                let detail = self.arena_error.clone().unwrap_or_default();
+                self.todo_session_errors.insert(
+                    todo_id,
+                    format!("Could not open {}. {detail}", arena_path.display())
+                        .trim()
+                        .to_string(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
     /// The tab title of an assigned session, or its kind when the tab is
     /// closed.
     fn assignee_label(&self, assignee: &Assignee, cx: &App) -> String {
@@ -3704,18 +3853,24 @@ impl AgentiumApp {
                     .map(|(index, _)| index)
                     .collect()
             }
+            // Task-less items: their arena by path, or by name for items
+            // saved before paths were recorded.
             None => self
                 .arenas
                 .iter()
                 .enumerate()
                 .filter(|(_, arena)| {
-                    arena.read(cx).working_directory == item.arena_path && item.arena_path.is_some()
+                    let arena = arena.read(cx);
+                    match &item.arena_path {
+                        Some(path) => arena.working_directory.as_ref() == Some(path),
+                        None => arena.name == item.arena_name,
+                    }
                 })
                 .map(|(index, _)| index)
                 .collect(),
         };
         let mut candidates: Vec<(String, Assignee)> = Vec::new();
-        for index in arena_indices {
+        for index in arena_indices.iter().copied() {
             let arena = &self.arenas[index];
             let arena_name = arena.read(cx).name.clone();
             let arena_path = arena.read(cx).working_directory.clone();
@@ -3738,6 +3893,22 @@ impl AgentiumApp {
                 }
             }
         }
+        // A new Claude Code tab goes to the item's own arena when it has one
+        // (reopened if closed); otherwise the user picks the arena once and
+        // the item remembers it. Other arenas of the task stay reachable
+        // through a submenu that changes the default.
+        let own_live = arena_indices.iter().copied().find(|index| {
+            item.arena_path.is_some()
+                && self.arenas[*index].read(cx).working_directory == item.arena_path
+        });
+        let own_closed = (own_live.is_none()).then(|| item.arena_path.clone()).flatten();
+        let other_arenas: Vec<(usize, String)> = arena_indices
+            .iter()
+            .filter(|index| Some(**index) != own_live)
+            .map(|index| (*index, self.arenas[*index].read(cx).name.clone()))
+            .collect();
+        let own_live_name = own_live.map(|index| self.arenas[index].read(cx).name.clone());
+        let own_closed_name = item.arena_name.clone();
         let this = cx.entity();
         self.badge_menu.take();
         let context_menu = ContextMenu::build(window, cx, |mut menu, window, _| {
@@ -3755,6 +3926,55 @@ impl AgentiumApp {
                             .log_err();
                     }),
                 );
+            }
+            menu = menu.separator();
+            match (own_live, own_closed) {
+                (Some(arena_index), _) => {
+                    menu = menu.entry(
+                        format!("New Claude Code · {}", own_live_name.unwrap_or_default()),
+                        None,
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.start_session_for_todo(todo_id, arena_index, window, cx);
+                        }),
+                    );
+                }
+                (None, Some(path)) => {
+                    menu = menu.entry(
+                        format!("Reopen {own_closed_name} and start Claude Code"),
+                        None,
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.start_session_for_todo_at_path(todo_id, path.clone(), window, cx);
+                        }),
+                    );
+                }
+                (None, None) => {
+                    for (arena_index, arena_name) in &other_arenas {
+                        let arena_index = *arena_index;
+                        menu = menu.entry(
+                            format!("New Claude Code · {arena_name}"),
+                            None,
+                            window.handler_for(&this, move |this, window, cx| {
+                                this.start_session_for_todo(todo_id, arena_index, window, cx);
+                            }),
+                        );
+                    }
+                }
+            }
+            if item.arena_path.is_some() && !other_arenas.is_empty() {
+                let submenu_this = this.clone();
+                menu = menu.submenu("New Claude Code in another arena…", move |mut submenu, window, _| {
+                    for (arena_index, arena_name) in &other_arenas {
+                        let arena_index = *arena_index;
+                        submenu = submenu.entry(
+                            arena_name.clone(),
+                            None,
+                            window.handler_for(&submenu_this, move |this, window, cx| {
+                                this.start_session_for_todo(todo_id, arena_index, window, cx);
+                            }),
+                        );
+                    }
+                    submenu
+                });
             }
             menu
         });
@@ -3956,6 +4176,26 @@ impl AgentiumApp {
                     view.update(cx, |view, cx| view.set_error(Some(format!("{error:#}")), cx));
                 }
             }
+            inbox_todo_view::InboxTodoViewEvent::OpenActivity { asker, position } => {
+                if let Some(item_id) = self
+                    .tab_for_asker(asker, cx)
+                    .and_then(|tab| tab.item.upgrade())
+                    .map(|item| item.item_id())
+                {
+                    self.agent_activity = Some((item_id, *position));
+                    cx.notify();
+                }
+            }
+            inbox_todo_view::InboxTodoViewEvent::CancelPendingSession { todo_id } => {
+                self.pending_todo_assignments
+                    .retain(|_, pending| pending.todo_id != *todo_id);
+                self.pending_todo_launches.remove(todo_id);
+                cx.notify();
+            }
+            inbox_todo_view::InboxTodoViewEvent::DismissSessionError { todo_id } => {
+                self.todo_session_errors.remove(todo_id);
+                cx.notify();
+            }
         }
     }
 
@@ -4020,6 +4260,66 @@ impl AgentiumApp {
             if let Some(completion) = self.inbox_completions.get_mut(index) {
                 completion.tab = Some(tab);
             }
+        }
+
+        // Tabs started from Assign… become assignees as soon as their
+        // session is known; a tab closed before that is forgotten.
+        let mut assignments = Vec::new();
+        let mut session_errors = Vec::new();
+        let mut pending_assignments = std::mem::take(&mut self.pending_todo_assignments);
+        pending_assignments.retain(|item_id, pending| {
+            let todo_id = pending.todo_id;
+            let item_open = self
+                .inbox_todos
+                .read(cx)
+                .item(todo_id)
+                .is_some_and(|item| item.is_open());
+            if !item_open {
+                return false;
+            }
+            let Some((arena, _, item)) =
+                inbox_todo_view::find_item_location(&self.arenas, *item_id, cx)
+            else {
+                session_errors.push((
+                    todo_id,
+                    "The Claude Code tab closed before its session was reported.".to_string(),
+                ));
+                return false;
+            };
+            let Some(asker) = self.inbox_asker(item.as_ref(), cx) else {
+                if pending.started_at.elapsed() > PENDING_ASSIGNMENT_TIMEOUT {
+                    session_errors.push((
+                        todo_id,
+                        "The tab reported no Claude session in 3 minutes; check the Claude Code hooks, then assign the tab from Assign….".to_string(),
+                    ));
+                    return false;
+                }
+                return true;
+            };
+            assignments.push((
+                todo_id,
+                Assignee {
+                    asker,
+                    arena_path: arena.read(cx).working_directory.clone(),
+                    arena_name: arena.read(cx).name.clone(),
+                },
+            ));
+            false
+        });
+        self.pending_todo_assignments = pending_assignments;
+        for (todo_id, error) in session_errors {
+            self.todo_session_errors.insert(todo_id, error);
+        }
+        self.todo_session_errors.retain(|todo_id, _| {
+            self.inbox_todos
+                .read(cx)
+                .item(*todo_id)
+                .is_some_and(|item| item.is_open())
+        });
+        for (todo_id, assignee) in assignments {
+            self.inbox_todos
+                .update(cx, |todos, cx| todos.assign(todo_id, assignee, cx))
+                .log_err();
         }
 
         let todos = self.inbox_todos.read(cx);
@@ -7797,171 +8097,41 @@ impl AgentiumApp {
             .filter(|(_, arena)| arena_ids.contains(&arena.entity_id()))
             .map(|(index, arena)| (index, arena.clone()))
             .collect();
-        for (arena_index, arena) in arenas {
-            content = content.child(self.render_overview_arena_row(arena_index, &arena, cx));
-            content = content.child(self.render_coordinator(&arena, cx));
-            let panes: Vec<_> = arena.read(cx).center.panes().into_iter().cloned().collect();
-            for pane in panes {
-                let items: Vec<_> = pane.read(cx).items().cloned().collect();
-                for item in items {
-                    let asker = self.inbox_asker(item.as_ref(), cx);
-                    let process = item.act_as::<TerminalView>(cx).and_then(|view| {
-                        view.read(cx).terminal().read(cx).foreground_process_name()
-                    });
-                    let Some(icon) = arena_agent_icon(
-                        item.act_as::<codex_acp_view::CodexAcpView>(cx).is_some(),
-                        matches!(asker, Some(InboxAsker::ClaudeSession { .. })),
-                        process.as_deref(),
-                    ) else {
-                        continue;
-                    };
-                    let info = self.tab_info(item.as_ref(), &arena, cx);
-                    let coordinator_provider = self.coordinator_provider_for_item(item.as_ref(), cx);
-                    let session = match asker.as_ref() {
-                        Some(InboxAsker::ClaudeSession { session_id }) => {
-                            self.claude_sessions.get(session_id)
-                        }
-                        _ => None,
-                    };
-                    let model = item
-                        .act_as::<codex_acp_view::CodexAcpView>(cx)
-                        .and_then(|view| view.read(cx).current_model_name(cx))
-                        .or_else(|| match asker.as_ref() {
-                            Some(InboxAsker::ClaudeSession { session_id }) => self.claude_models.get(session_id).cloned(),
-                            _ => None,
-                        });
-                    let model_label = model.map(|model| {
-                        if coordinator_provider.is_some() {
-                            format!("Coordinator · {model}")
-                        } else {
-                            model
-                        }
-                    }).or_else(|| coordinator_provider.map(|provider| match provider {
-                        task_coordinator::Provider::ClaudeHaiku => "Coordinator · Claude / Haiku (configured)".into(),
-                        task_coordinator::Provider::CodexLuna => "Coordinator · Codex / Luna (configured)".into(),
-                    }));
-                    let acp_turn = item
-                        .act_as::<codex_acp_view::CodexAcpView>(cx)
-                        .and_then(|view| view.read(cx).overview_turn(cx));
-                    let unsupported_codex_terminal = acp_turn.is_none()
-                        && session.is_none()
-                        && process.as_deref() == Some("codex");
-                    let prompt = acp_turn
-                        .as_ref()
-                        .map(|turn| turn.0.clone())
-                        .or_else(|| session.map(|session| session.user_prompt.clone()))
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or_else(|| {
-                            if unsupported_codex_terminal {
-                                "Codex terminal requests are not collected — use a Codex ACP tab for coordinator summaries".into()
-                            } else {
-                                "Request not available. Open the agent tab to view the conversation.".into()
-                            }
-                        });
-                    let result = acp_turn
-                        .map(|turn| turn.1)
-                        .or_else(|| session.and_then(|session| session.result_title.clone()))
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or_else(|| {
-                            if unsupported_codex_terminal {
-                                "Codex terminal results are not collected".into()
-                            } else {
-                                "No result received for this turn.".into()
-                            }
-                        });
-                    let arena_path = arena.read(cx).working_directory.clone();
-                    let (prompt, request_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), false, prompt, cx);
-                    let (result, response_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), true, result, cx);
-                    let item_id = item.item_id();
-                    let target_pane = pane.clone();
-                    let target_item = item.clone();
-                    let show_context = overview.show_context.contains(&item_id);
-                    let context_view = overview_entity.clone();
-                    let mut card = v_flex()
-                        .flex_shrink_0()
-                        .min_w_0()
-                        .gap_2()
-                        .p_3()
-                        .border_1()
-                        .border_color(colors.border)
-                        .when(
-                            window.is_window_active()
-                                && self.is_active_tab(&arena, &pane, item_id, cx)
-                                && item.item_focus_handle(cx).contains_focused(window, cx),
-                            |card| card.border_2().border_color(colors.text_accent),
-                        )
-                        .rounded_md()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Icon::new(icon))
-                                .child(div().flex_1().min_w_0().truncate().child(
-                                    if coordinator_provider.is_some() {
-                                        task_coordinator::TITLE.to_string()
-                                    } else {
-                                        info.title.split_whitespace().collect::<Vec<_>>().join(" ")
-                                    },
-                                ))
-                                .child(
-                                    Button::new(
-                                        ("overview-status", item_id),
-                                        if self.inbox_questions.iter().any(|question| {
-                                            question.resolution.is_none() && !question.assumed && question
-                                                .tab
-                                                .as_ref()
-                                                .is_some_and(|tab| tab.item.id() == item_id)
-                                        }) {
-                                            "Awaiting answer"
-                                        } else {
-                                            match info.state {
-                                                Some("running") => "Running",
-                                                Some("ready") => "Completed",
-                                                Some("permission") => "Permission",
-                                                Some("error") => "Failed",
-                                                _ => "Idle",
-                                            }
-                                        },
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, _, cx| {
-                                            this.agent_activity = Some((item_id, event.position()));
-                                            cx.notify();
-                                        },
-                                    )),
-                                ),
-                        )
-                        .when_some(model_label, |card, label| {
-                            card.child(Label::new(label).color(Color::Muted))
-                        })
-                        .child(Button::new(("overview-context", item_id), if show_context { "▾ Request and response" } else { "▸ Request and response" })
-                            .on_click(move |_, _, cx| context_view.update(cx, |overview, cx| {
-                                if !overview.show_context.remove(&item_id) { overview.show_context.insert(item_id); }
-                                cx.notify();
-                            })))
-                        .when(show_context, |card| card
-                            .child(overview.render_message(item_id, "Request", prompt, request_summary, overview_entity.clone()))
-                            .child(overview.render_message(item_id, "Response", result, response_summary, overview_entity.clone())))
-                        .child(
-                            Button::new(("overview-open-agent", item_id), "Open agent tab")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.navigate_to_item(
-                                        arena_index,
-                                        &target_pane,
-                                        target_item.as_ref(),
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        );
-                    let question_ids: Vec<_> = self.inbox_questions.iter()
-                        .filter(|question| question.belongs_to(item_id, asker.as_ref()))
-                        .map(|question| question.id).collect();
-                    if !question_ids.is_empty() {
-                        card = card.child(self.render_agent_questions(&question_ids, overview, &overview_entity, cx));
-                    }
-                    content = content.child(card);
+        let todo_scope = self.todo_scope_for_overview(scope, cx);
+        // Sessions assigned to an open item appear under that item; the rest
+        // keep their own card.
+        let assigned_askers: HashSet<InboxAsker> = self
+            .inbox_todos
+            .read(cx)
+            .items()
+            .iter()
+            .filter(|item| item.is_open() && todo_scope.contains(item))
+            .flat_map(|item| item.assigned.iter().map(|assignee| assignee.asker.clone()))
+            .collect();
+        // Contexts come from every open arena: an assignee may live outside
+        // the task (assigned by CLI, or its tab moved).
+        let mut contexts: HashMap<InboxAsker, inbox_todo_view::AssigneeContext> = HashMap::new();
+        for (index, arena) in self.arenas.clone().iter().enumerate() {
+            if arena_ids.contains(&arena.entity_id()) {
+                continue;
+            }
+            for card in self.session_cards(index, arena, cx) {
+                if let Some(asker) = card.asker.filter(|asker| assigned_askers.contains(asker)) {
+                    contexts.insert(asker, card.context);
                 }
             }
+        }
+        let mut cards = Vec::new();
+        for (arena_index, arena) in arenas {
+            content = content.child(self.render_overview_arena_row(arena_index, &arena, cx));
+            cards.extend(self.session_cards(arena_index, &arena, cx));
+        }
+        for card in &cards {
+            if let Some(asker) = card.asker.clone().filter(|asker| assigned_askers.contains(asker)) {
+                contexts.insert(asker, card.context.clone());
+                continue;
+            }
+            content = content.child(self.render_session_card(card, overview, &overview_entity, window, cx));
         }
         if let task_overview::OverviewScope::Task(task_id) = scope {
             let rows = self
@@ -7980,16 +8150,227 @@ impl AgentiumApp {
             }
         }
         content = content.child(Label::new("To do"));
-        content = content.child(self.render_scope_todos(scope, overview, window, cx));
+        content = content.child(self.render_scope_todos(scope, overview, &contexts, window, cx));
+        // Questions stand on their own: a session with a pending question is
+        // listed here whether or not an item is assigned to it.
+        let asking: Vec<_> = cards
+            .iter()
+            .filter(|card| !card.question_ids.is_empty())
+            .map(|card| (card.title.clone(), card.question_ids.clone()))
+            .collect();
         let closed_questions: Vec<_> = self.inbox_questions.iter()
             .filter(|question| question.live_tab().is_none() && self.question_in_scope(question, &arena_ids, &paths, cx))
             .map(|question| (question.id, question.arena_name.clone())).collect();
+        if !asking.is_empty() || !closed_questions.is_empty() {
+            content = content.child(Label::new("Questions"));
+        }
+        for (title, question_ids) in asking {
+            content = content.child(v_flex().min_w_0().flex_shrink_0().gap_2().p_3().border_1().border_color(colors.border).rounded_md()
+                .child(Label::new(title))
+                .child(self.render_agent_questions(&question_ids, overview, &overview_entity, cx)));
+        }
         for (question_id, arena_name) in closed_questions {
             content = content.child(v_flex().min_w_0().flex_shrink_0().gap_2().p_3().border_1().border_color(colors.border).rounded_md()
                 .child(Label::new(format!("{arena_name} · Agent not restored")))
                 .child(self.render_agent_questions(&[question_id], overview, &overview_entity, cx)));
         }
         content.into_any_element()
+    }
+
+    /// What the overview knows about one agent tab: its latest turn, state
+    /// and pending questions.
+    fn session_cards(
+        &self,
+        arena_index: usize,
+        arena: &Entity<Arena>,
+        cx: &App,
+    ) -> Vec<SessionCard> {
+        let mut cards = Vec::new();
+        let arena_path = arena.read(cx).working_directory.clone();
+        for pane in arena.read(cx).center.panes() {
+            for item in pane.read(cx).items().cloned() {
+                let asker = self.inbox_asker(item.as_ref(), cx);
+                let process = item.act_as::<TerminalView>(cx).and_then(|view| {
+                    view.read(cx).terminal().read(cx).foreground_process_name()
+                });
+                let Some(icon) = arena_agent_icon(
+                    item.act_as::<codex_acp_view::CodexAcpView>(cx).is_some(),
+                    matches!(asker, Some(InboxAsker::ClaudeSession { .. })),
+                    process.as_deref(),
+                ) else {
+                    continue;
+                };
+                let info = self.tab_info(item.as_ref(), arena, cx);
+                let coordinator_provider = self.coordinator_provider_for_item(item.as_ref(), cx);
+                let session = match asker.as_ref() {
+                    Some(InboxAsker::ClaudeSession { session_id }) => {
+                        self.claude_sessions.get(session_id)
+                    }
+                    _ => None,
+                };
+                let model = item
+                    .act_as::<codex_acp_view::CodexAcpView>(cx)
+                    .and_then(|view| view.read(cx).current_model_name(cx))
+                    .or_else(|| match asker.as_ref() {
+                        Some(InboxAsker::ClaudeSession { session_id }) => self.claude_models.get(session_id).cloned(),
+                        _ => None,
+                    });
+                let model_label = model.map(|model| {
+                    if coordinator_provider.is_some() {
+                        format!("Coordinator · {model}")
+                    } else {
+                        model
+                    }
+                }).or_else(|| coordinator_provider.map(|provider| match provider {
+                    task_coordinator::Provider::ClaudeHaiku => "Coordinator · Claude / Haiku (configured)".into(),
+                    task_coordinator::Provider::CodexLuna => "Coordinator · Codex / Luna (configured)".into(),
+                }));
+                let acp_turn = item
+                    .act_as::<codex_acp_view::CodexAcpView>(cx)
+                    .and_then(|view| view.read(cx).overview_turn(cx));
+                let unsupported_codex_terminal = acp_turn.is_none()
+                    && session.is_none()
+                    && process.as_deref() == Some("codex");
+                let prompt = acp_turn
+                    .as_ref()
+                    .map(|turn| turn.0.clone())
+                    .or_else(|| session.map(|session| session.user_prompt.clone()))
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| {
+                        if unsupported_codex_terminal {
+                            "Codex terminal requests are not collected — use a Codex ACP tab for coordinator summaries".into()
+                        } else {
+                            "Request not available. Open the agent tab to view the conversation.".into()
+                        }
+                    });
+                let result = acp_turn
+                    .map(|turn| turn.1)
+                    .or_else(|| session.and_then(|session| session.result_title.clone()))
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| {
+                        if unsupported_codex_terminal {
+                            "Codex terminal results are not collected".into()
+                        } else {
+                            "No result received for this turn.".into()
+                        }
+                    });
+                let (request, request_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), false, prompt, cx);
+                let (response, response_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), true, result, cx);
+                let item_id = item.item_id();
+                let awaiting_answer = self.inbox_questions.iter().any(|question| {
+                    question.resolution.is_none()
+                        && !question.assumed
+                        && question.tab.as_ref().is_some_and(|tab| tab.item.id() == item_id)
+                });
+                let status = if awaiting_answer {
+                    "Awaiting answer"
+                } else {
+                    match info.state {
+                        Some("running") => "Running",
+                        Some("ready") => "Completed",
+                        Some("permission") => "Permission",
+                        Some("error") => "Failed",
+                        _ => "Idle",
+                    }
+                };
+                let question_ids: Vec<_> = self.inbox_questions.iter()
+                    .filter(|question| question.belongs_to(item_id, asker.as_ref()))
+                    .map(|question| question.id).collect();
+                cards.push(SessionCard {
+                    arena_index,
+                    arena: arena.clone(),
+                    pane: pane.clone(),
+                    item,
+                    asker,
+                    icon,
+                    title: if coordinator_provider.is_some() {
+                        task_coordinator::TITLE.to_string()
+                    } else {
+                        info.title.split_whitespace().collect::<Vec<_>>().join(" ")
+                    },
+                    status,
+                    question_ids,
+                    context: inbox_todo_view::AssigneeContext {
+                        request,
+                        request_summary,
+                        response,
+                        response_summary,
+                        model: model_label,
+                    },
+                });
+            }
+        }
+        cards
+    }
+
+    /// The card of a session that no open item is assigned to.
+    fn render_session_card(
+        &mut self,
+        card: &SessionCard,
+        overview: &mut task_overview::TaskOverview,
+        overview_entity: &Entity<task_overview::TaskOverview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let item_id = card.item.item_id();
+        let arena_index = card.arena_index;
+        let target_pane = card.pane.clone();
+        let target_item = card.item.clone();
+        let show_context = overview.show_context.contains(&item_id);
+        let context_view = overview_entity.clone();
+        v_flex()
+            .flex_shrink_0()
+            .min_w_0()
+            .gap_2()
+            .p_3()
+            .border_1()
+            .border_color(colors.border)
+            .when(
+                window.is_window_active()
+                    && self.is_active_tab(&card.arena, &card.pane, item_id, cx)
+                    && card.item.item_focus_handle(cx).contains_focused(window, cx),
+                |card| card.border_2().border_color(colors.text_accent),
+            )
+            .rounded_md()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(card.icon))
+                    .child(div().flex_1().min_w_0().truncate().child(card.title.clone()))
+                    .child(
+                        Button::new(("overview-status", item_id), card.status).on_click(cx.listener(
+                            move |this, event: &ClickEvent, _, cx| {
+                                this.agent_activity = Some((item_id, event.position()));
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .when_some(card.context.model.clone(), |card, label| {
+                card.child(Label::new(label).color(Color::Muted))
+            })
+            .child(Button::new(("overview-context", item_id), if show_context { "▾ Request and response" } else { "▸ Request and response" })
+                .on_click(move |_, _, cx| context_view.update(cx, |overview, cx| {
+                    if !overview.show_context.remove(&item_id) { overview.show_context.insert(item_id); }
+                    cx.notify();
+                })))
+            .when(show_context, |element| element
+                .child(overview.render_message(item_id, "Request", card.context.request.clone(), card.context.request_summary.clone(), overview_entity.clone()))
+                .child(overview.render_message(item_id, "Response", card.context.response.clone(), card.context.response_summary.clone(), overview_entity.clone())))
+            .child(
+                Button::new(("overview-open-agent", item_id), "Open agent tab")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate_to_item(
+                            arena_index,
+                            &target_pane,
+                            target_item.as_ref(),
+                            window,
+                            cx,
+                        )
+                    })),
+            )
+            .into_any_element()
     }
 
     fn question_in_scope(&self, question: &InboxQuestion, arena_ids: &[EntityId], paths: &[PathBuf], cx: &App) -> bool {
@@ -8049,6 +8430,7 @@ impl AgentiumApp {
         &mut self,
         scope: task_overview::OverviewScope,
         overview: &mut task_overview::TaskOverview,
+        contexts: &HashMap<InboxAsker, inbox_todo_view::AssigneeContext>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -8069,16 +8451,30 @@ impl AgentiumApp {
                 view
             }
         };
-        let assignees = self.assignee_rows(&view, cx);
-        view.update(cx, |view, cx| view.set_assignees(assignees, cx));
+        let assignees = self.assignee_rows(&view, contexts, cx);
+        let mut pending_sessions: HashMap<u64, inbox_todo_view::PendingSession> = HashMap::new();
+        let waiting_ids = self
+            .pending_todo_assignments
+            .values()
+            .map(|pending| pending.todo_id)
+            .chain(self.pending_todo_launches.keys().copied());
+        for todo_id in waiting_ids {
+            pending_sessions.entry(todo_id).or_default().waiting =
+                Some("Starting Claude Code… assigned once its session is reported.".to_string());
+        }
+        for (todo_id, error) in &self.todo_session_errors {
+            pending_sessions.entry(*todo_id).or_default().error = Some(error.clone());
+        }
+        view.update(cx, |view, cx| view.set_assignees(assignees, pending_sessions, cx));
         view.into_any_element()
     }
 
     /// Where each assignee of the view's open items is now: its tab title
-    /// and agent state, or closed.
+    /// and agent state, or closed, plus its latest turn when open.
     fn assignee_rows(
         &self,
         view: &Entity<inbox_todo_view::InboxTodoView>,
+        contexts: &HashMap<InboxAsker, inbox_todo_view::AssigneeContext>,
         cx: &App,
     ) -> HashMap<u64, Vec<inbox_todo_view::AssigneeRow>> {
         let colors = cx.theme().colors();
@@ -8099,7 +8495,7 @@ impl AgentiumApp {
                 let live = self
                     .tab_for_asker(&assignee.asker, cx)
                     .and_then(|tab| Some((tab.arena.upgrade()?, tab.item.upgrade()?)));
-                let (label, state_color, state_label) = match live {
+                let (label, state_color, state_label, status) = match live {
                     Some((arena, tab)) => {
                         let info = self.tab_info(tab.as_ref(), &arena, cx);
                         let (color, label) = match info.state {
@@ -8109,12 +8505,30 @@ impl AgentiumApp {
                             Some("error") => (status_colors.error, "error"),
                             _ => (colors.text, "idle"),
                         };
-                        (info.title, Some(color), label)
+                        let tab_id = tab.item_id();
+                        let awaiting_answer = self.inbox_questions.iter().any(|question| {
+                            question.resolution.is_none()
+                                && !question.assumed
+                                && question.tab.as_ref().is_some_and(|tab| tab.item.id() == tab_id)
+                        });
+                        let status = if awaiting_answer {
+                            "Awaiting answer"
+                        } else {
+                            match info.state {
+                                Some("running") => "Running",
+                                Some("ready") => "Completed",
+                                Some("permission") => "Permission",
+                                Some("error") => "Failed",
+                                _ => "Idle",
+                            }
+                        };
+                        (info.title, Some(color), label, status)
                     }
                     None => (
                         format!("{} · {}", self.assignee_label(assignee, cx), assignee.arena_name),
                         None,
                         "closed",
+                        "Closed",
                     ),
                 };
                 entries.push(inbox_todo_view::AssigneeRow {
@@ -8125,6 +8539,8 @@ impl AgentiumApp {
                     state_label,
                     restoring: restoring.as_ref() == Some(&assignee.asker),
                     error: error.clone().filter(|_| restoring.is_none()),
+                    status,
+                    context: contexts.get(&assignee.asker).cloned(),
                 });
             }
             rows.insert(item.id, entries);
@@ -9612,8 +10028,46 @@ impl AgentiumApp {
                                     .update(cx, |arena, cx| arena.add_diff_view(window, cx));
                             }),
                         ),
-                    ),
+                    )
+                    .child({
+                        // The same menu as the tab bar's +, anchored to this
+                        // row. Opening it switches to the arena first, so the
+                        // actions reach that arena's handlers once the menu
+                        // entry is picked (by then the arena has rendered).
+                        let app = cx.entity().downgrade();
+                        let menu_arena = arena_entity.clone();
+                        PopoverMenu::new(("overview-arena-new-menu", entity_id))
+                            .menu(move |window, cx| {
+                                if let Some(app) = app.upgrade() {
+                                    app.update(cx, |this, cx| {
+                                        this.switch_arena(arena_index, window, cx);
+                                    });
+                                }
+                                let focus_handle = menu_arena.read(cx).active_pane.focus_handle(cx);
+                                Some(ContextMenu::build(window, cx, |menu, _, _| {
+                                    menu.key_context("AgentiumNewItemMenu")
+                                        .context(focus_handle)
+                                        .action("Claude Code", NewClaudeCode.boxed_clone())
+                                        .action("Codex (ACP)", NewCodexAcp.boxed_clone())
+                                        .action("Resume Codex Conversation…", ResumeCodexConversation.boxed_clone())
+                                        .action("Terminal", workspace::NewTerminal::default().boxed_clone())
+                                        .action("Git Status", NewGitStatus.boxed_clone())
+                                        .action("Git Graph", NewGitGraph.boxed_clone())
+                                        .action("Git Diff", NewDiffView.boxed_clone())
+                                        .action("Git Diff (Branch)", NewBranchDiff.boxed_clone())
+                                        .action("Project Search", NewProjectSearch.boxed_clone())
+                                        .action("File Browser", NewFileBrowser.boxed_clone())
+                                }))
+                            })
+                            .trigger_with_tooltip(
+                                IconButton::new(("overview-arena-new", entity_id), IconName::Plus)
+                                    .icon_size(IconSize::Small),
+                                Tooltip::text("New tab in this arena…"),
+                            )
+                            .anchor(Anchor::TopRight)
+                    }),
             )
+            .child(self.render_coordinator(arena_entity, cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -10138,7 +10592,7 @@ impl Render for AgentiumApp {
                 div()
                     .flex()
                     .flex_col()
-                    .w(px(320.0))
+                    .w(px(SIDEBAR_WIDTH))
                     .h_full()
                     .bg(colors.panel_background)
                     .border_r_1()
@@ -10304,16 +10758,53 @@ impl Render for AgentiumApp {
                     )
                     .into_any_element()
             } else {
+                let resize_handle = deferred(
+                    div()
+                        .id("overview-resize-handle")
+                        .absolute()
+                        .right(px(-OVERVIEW_RESIZE_HANDLE_SIZE / 2.0))
+                        .top(px(0.0))
+                        .h_full()
+                        .w(px(OVERVIEW_RESIZE_HANDLE_SIZE))
+                        .cursor_col_resize()
+                        .on_drag(DraggedOverviewHandle, |dragged, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| dragged.clone())
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                                if event.click_count == 2 {
+                                    this.overview_width = px(OVERVIEW_COLUMN_WIDTH);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .occlude(),
+                );
                 div()
                     .id("overview-column")
-                    .w(px(OVERVIEW_COLUMN_WIDTH))
+                    .relative()
+                    .w(self.overview_width)
                     .h_full()
                     .flex_shrink_0()
                     .border_r_1()
                     .border_color(colors.border)
                     .child(self.overview.clone())
+                    .child(resize_handle)
                     .into_any_element()
             })
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedOverviewHandle>, _, cx| {
+                    let width = event.event.position.x - px(SIDEBAR_WIDTH);
+                    this.overview_width = width.clamp(px(OVERVIEW_MIN_WIDTH), px(OVERVIEW_MAX_WIDTH));
+                    cx.notify();
+                },
+            ))
             .child(
                 div()
                     .flex_1()

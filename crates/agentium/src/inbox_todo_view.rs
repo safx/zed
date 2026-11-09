@@ -745,6 +745,28 @@ impl InboxTodos {
         Ok(())
     }
 
+    /// Records the arena the user chose when starting a session for an item
+    /// that had none, so the next session defaults to it.
+    pub(crate) fn set_arena(
+        &mut self,
+        todo_id: u64,
+        arena_path: PathBuf,
+        arena_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(item) = self.item_mut(todo_id) else {
+            return;
+        };
+        if item.arena_path.as_ref() == Some(&arena_path) {
+            return;
+        }
+        item.arena_path = Some(arena_path);
+        item.arena_name = arena_name;
+        item.updated_at = Utc::now();
+        self.persist(cx);
+        cx.notify();
+    }
+
     pub(crate) fn unassign(
         &mut self,
         todo_id: u64,
@@ -1075,6 +1097,29 @@ pub(crate) enum InboxTodoViewEvent {
         todo_id: u64,
         asker: InboxAsker,
     },
+    /// Open the assignee's activity popover (permission, completion, failure).
+    OpenActivity {
+        asker: InboxAsker,
+        position: Point<Pixels>,
+    },
+    /// Stop waiting for every session started from Assign… for the item.
+    CancelPendingSession {
+        todo_id: u64,
+    },
+    /// Hide the failure of a session start; other attempts keep waiting.
+    DismissSessionError {
+        todo_id: u64,
+    },
+}
+
+/// The latest turn of an assigned session, shown under its row.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AssigneeContext {
+    pub(crate) request: String,
+    pub(crate) request_summary: Option<String>,
+    pub(crate) response: String,
+    pub(crate) response_summary: Option<String>,
+    pub(crate) model: Option<String>,
 }
 
 /// What the overview knows about one assignee that the view cannot find out
@@ -1089,6 +1134,26 @@ pub(crate) struct AssigneeRow {
     pub(crate) state_label: &'static str,
     pub(crate) restoring: bool,
     pub(crate) error: Option<String>,
+    /// The card's status button, kept on the row: "Running", "Awaiting
+    /// answer", … Click opens the agent's activity.
+    pub(crate) status: &'static str,
+    pub(crate) context: Option<AssigneeContext>,
+}
+
+/// Claude Code tabs started for the item from Assign…: the wait for a
+/// session, and the last failure, each shown while present.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PendingSession {
+    pub(crate) waiting: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+/// Which part of an assignee's latest turn the user unfolded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ContextPart {
+    Turn,
+    Request,
+    Response,
 }
 
 /// The To do list of one task (or task-less arena) in Task Overview.
@@ -1096,6 +1161,9 @@ pub(crate) struct InboxTodoView {
     todos: Entity<InboxTodos>,
     scope: TodoScope,
     assignees: HashMap<u64, Vec<AssigneeRow>>,
+    pending_sessions: HashMap<u64, PendingSession>,
+    /// Unfolded parts of assignee turns, by item, assignee position and part.
+    unfolded: std::collections::HashSet<(u64, usize, ContextPart)>,
     note_editors: HashMap<u64, Entity<Editor>>,
     error: Option<String>,
     last_report: Option<SendReport>,
@@ -1118,6 +1186,8 @@ impl InboxTodoView {
             todos,
             scope,
             assignees: HashMap::new(),
+            pending_sessions: HashMap::new(),
+            unfolded: Default::default(),
             note_editors: HashMap::new(),
             error: None,
             last_report: None,
@@ -1145,10 +1215,12 @@ impl InboxTodoView {
     pub(crate) fn set_assignees(
         &mut self,
         assignees: HashMap<u64, Vec<AssigneeRow>>,
+        pending_sessions: HashMap<u64, PendingSession>,
         cx: &mut Context<Self>,
     ) {
-        if self.assignees != assignees {
+        if self.assignees != assignees || self.pending_sessions != pending_sessions {
             self.assignees = assignees;
+            self.pending_sessions = pending_sessions;
             cx.notify();
         }
     }
@@ -1296,10 +1368,132 @@ impl InboxTodoView {
         cx.notify();
     }
 
+    /// One message of an assignee's latest turn: the summary or the first
+    /// sentence, with the rest behind a toggle.
+    fn render_context_message(
+        &self,
+        todo_id: u64,
+        index: usize,
+        part: ContextPart,
+        label: &'static str,
+        text: &str,
+        summary: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let text = text.trim().to_owned();
+        let first_sentence_end = text
+            .char_indices()
+            .find(|(_, character)| matches!(character, '.' | '。'))
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(text.len());
+        let has_more = summary.is_some() || !text[first_sentence_end..].trim().is_empty();
+        let expanded = self.unfolded.contains(&(todo_id, index, part));
+        let visible = if expanded {
+            text
+        } else {
+            summary
+                .map(str::to_owned)
+                .unwrap_or_else(|| text[..first_sentence_end].to_owned())
+        };
+        let colors = cx.theme().colors().clone();
+        v_flex()
+            .min_w_0()
+            .gap_0p5()
+            .child(div().text_xs().text_color(colors.text_muted).child(label))
+            .child(div().text_sm().child(visible))
+            .when(has_more, |column| {
+                column.child(
+                    Button::new(
+                        SharedString::from(format!("todo-context-{todo_id}-{index}-{label}")),
+                        if expanded {
+                            "Show less"
+                        } else if summary.is_some() {
+                            "Show original"
+                        } else {
+                            "Show more"
+                        },
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        if !this.unfolded.remove(&(todo_id, index, part)) {
+                            this.unfolded.insert((todo_id, index, part));
+                        }
+                        cx.notify();
+                    })),
+                )
+            })
+    }
+
+    /// The latest request and response of an assigned session, folded under
+    /// its row.
+    fn render_assignee_context(
+        &self,
+        todo_id: u64,
+        index: usize,
+        context: &AssigneeContext,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let open = self.unfolded.contains(&(todo_id, index, ContextPart::Turn));
+        v_flex()
+            .min_w_0()
+            .gap_1()
+            .pl_3()
+            .child(
+                Button::new(
+                    SharedString::from(format!("todo-turn-{todo_id}-{index}")),
+                    if open { "▾ Request and response" } else { "▸ Request and response" },
+                )
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    if !this.unfolded.remove(&(todo_id, index, ContextPart::Turn)) {
+                        this.unfolded.insert((todo_id, index, ContextPart::Turn));
+                    }
+                    cx.notify();
+                })),
+            )
+            .when(open, |column| {
+                column
+                    .when_some(context.model.clone(), |column, model| {
+                        column.child(div().text_xs().text_color(colors.text_muted).child(model))
+                    })
+                    .child(self.render_context_message(
+                        todo_id,
+                        index,
+                        ContextPart::Request,
+                        "Request",
+                        &context.request,
+                        context.request_summary.as_deref(),
+                        cx,
+                    ))
+                    .child(self.render_context_message(
+                        todo_id,
+                        index,
+                        ContextPart::Response,
+                        "Response",
+                        &context.response,
+                        context.response_summary.as_deref(),
+                        cx,
+                    ))
+            })
+    }
+
     fn render_assignees(&self, item: &TodoItem, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let todo_id = item.id;
         let rows = self.assignees.get(&todo_id).cloned().unwrap_or_default();
+        let contexts: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.context
+                    .as_ref()
+                    .map(|context| self.render_assignee_context(todo_id, index, context, cx).into_any_element())
+            })
+            .collect();
+        v_flex().min_w_0().gap_1().child(
         h_flex()
             .flex_wrap()
             .gap_2()
@@ -1311,6 +1505,7 @@ impl InboxTodoView {
             .children(rows.into_iter().enumerate().map(|(index, assignee)| {
                 let asker = assignee.asker.clone();
                 let unassign_asker = assignee.asker.clone();
+                let activity_asker = assignee.asker.clone();
                 let dot_color = assignee.state_color.unwrap_or(colors.text_muted);
                 let tooltip = match (&assignee.error, assignee.restoring, assignee.state_color) {
                     (Some(error), _, _) => error.clone(),
@@ -1336,6 +1531,23 @@ impl InboxTodoView {
                             .when(assignee.state_color.is_none(), |d| d.text_color(colors.text_muted))
                             .child(assignee.label),
                     )
+                    .when(assignee.state_color.is_some(), |row| {
+                        row.child(
+                            Button::new(
+                                SharedString::from(format!("todo-activity-{todo_id}-{index}")),
+                                assignee.status,
+                            )
+                            .label_size(LabelSize::Small)
+                            .tooltip(ui::Tooltip::text("Show the agent's activity"))
+                            .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(InboxTodoViewEvent::OpenActivity {
+                                    asker: activity_asker.clone(),
+                                    position: event.position(),
+                                });
+                            })),
+                        )
+                    })
                     .child(
                         ui::IconButton::new(
                             SharedString::from(format!("todo-unassign-{todo_id}-{index}")),
@@ -1372,7 +1584,52 @@ impl InboxTodoView {
                         position: event.position(),
                     });
                 })),
-            )
+            ))
+            .when_some(self.pending_sessions.get(&todo_id).cloned(), |column, pending| {
+                let status_colors = cx.theme().status().clone();
+                column
+                    .when_some(pending.waiting, |column, waiting| {
+                        column.child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .text_xs()
+                                .child(div().text_color(colors.text_muted).child(waiting))
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("todo-pending-cancel-{todo_id}")),
+                                        "Cancel",
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(InboxTodoViewEvent::CancelPendingSession { todo_id });
+                                    })),
+                                ),
+                        )
+                    })
+                    .when_some(pending.error, |column, error| {
+                        column.child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .text_xs()
+                                .child(div().text_color(status_colors.error).child(error))
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("todo-pending-dismiss-{todo_id}")),
+                                        "Dismiss",
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(InboxTodoViewEvent::DismissSessionError { todo_id });
+                                    })),
+                                ),
+                        )
+                    })
+            })
+            .children(contexts)
     }
 
     fn render_item(
