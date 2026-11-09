@@ -1,6 +1,6 @@
 ---
 name: agentium-inbox
-description: "Ask the user to decide an implementation question (spec gap, design choice between alternatives) through the Task Overview with `agentium todo ask`, then end the turn; or, at the end of a turn, hand the user your requests and proposals with `agentium todo set` instead of listing them in chat. Use when TERM_PROGRAM=agentium and you need the user's decision before continuing, or are about to list remaining items, things for the user to do, or work you propose next. Not for permission to run commands, and not for questions you can settle from the code, the spec, or past decisions."
+description: "Ask the user to decide an implementation question (spec gap, design choice between alternatives) through the Task Overview with `agentium todo ask`, then end the turn; or, at the end of a turn, hand the user your requests and proposals with `agentium todo add` instead of listing them in chat, and close items the user sent you with `agentium todo done`. Use when TERM_PROGRAM=agentium and you need the user's decision before continuing, are about to list remaining items, things for the user to do, or work you propose next, or received a `[from: Task Overview]` To do message. Not for permission to run commands, and not for questions you can settle from the code, the spec, or past decisions."
 ---
 
 # Task Overview questions
@@ -35,21 +35,23 @@ If the command fails (e.g. `caller is not running inside an Agentium terminal or
 
 # Agentium To do
 
-Use at the end of a turn, when you would otherwise list remaining items in chat: things the user must do, or work you propose and the user should pick. The agent does not wait on these; that is the difference from `todo ask`, which you use when you cannot continue without the answer.
+The task's To do list in Task Overview: things the user must do, and work an agent does once the user says Go. Items belong to the task, not to your tab; each has an id, zero or more assigned agents, and a state (open, assigned, requested, done). Use it at the end of a turn, when you would otherwise list remaining items in chat. You do not wait on these; that is the difference from `todo ask`, which you use when you cannot continue without the answer.
 
 ```bash
-agentium todo set \
-  --user-task "Check the Failed lane on screen :: stop a Codex ACP tab with an error; the lane is red" \
-  --proposal "Add GPUI tests :: rebinding after restart, record aging, badge colors" \
-  --proposal "Push and open a PR :: goes outside this machine"
+agentium todo add --user-task "Check the Failed lane on screen :: stop a Codex ACP tab with an error; the lane is red"
+agentium todo add --proposal "Add GPUI tests :: rebinding after restart, record aging, badge colors"
+agentium todo add --proposal "Rewrite the billing job :: not my area" --unassigned
+agentium todo list
+agentium todo done 12 --note "pushed as 3f2a1c"
 ```
 
-- `--user-task`: something only the user can do (verify on screen, configure, link). `--proposal`: work you would do if the user says go. Each is `TITLE :: DETAIL`; titles must be unique.
-- `set` replaces this tab's whole list. Pass every item that still applies, not only the new ones. If the list is not in your context (e.g. after a compaction), run `agentium todo list` first.
-- Read the output: a `Dropped ... unanswered items` line means you left out items. If they still apply, run `todo set` again with them.
-- Aim for at most 5 items (8 is the hard limit). Leave out FYIs and known limitations; those go in your final report.
-- After a successful `set`, write only the count in chat (e.g. "4 items in Task Overview To do"), not the items.
-- If `todo set` fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), list the actual user tasks and proposals in chat and say they were not saved to Task Overview. Do not turn them into `todo ask` questions.
+- `--user-task`: something only the user can do (verify on screen, configure, link). `--proposal`: work an agent does if the user says Go. Each is `TITLE :: DETAIL`, one item per `add`.
+- An item you `add` is assigned to you and already requested: you are expected to finish it and run `todo done <id>`. Add `--unassigned` when it is not yours to do (another repository, another agent's area, or a human decision), so the user can assign it from Task Overview or another agent can `todo take <id>`.
+- Aim for at most 5 new items per turn; a task holds at most 30 open items. Leave out FYIs and known limitations; those go in your final report.
+- After adding, write only the count in chat (e.g. "4 items added to Task Overview To do"), not the items.
+- If `todo add` fails (e.g. `caller is not running inside an Agentium terminal or ACP tab`), list the actual user tasks and proposals in chat and say they were not saved to Task Overview. Do not turn them into `todo ask` questions.
 - Include things the user said they will do later (e.g. "I'll check the CI failure later") as user tasks, so they are not lost.
-- The user answers from Task Overview in one message starting with `[from: Task Overview]` and `To do`, one line per answered item: `Done: N TITLE` (the user did it), `Go: N TITLE` (start it now), `Skip: N TITLE` (drop it; do not propose it again). A `— Note:` suffix is the user's condition and overrides the item's detail. Numbers are the positions in your list at that time; match items by title. Answered items are already removed from your list, so do not repeat them in the next `todo set`; unanswered ones are still there.
-- `agentium todo clear` empties the list when nothing is left. Other tabs' lists in the same arena are shown by `todo list` and are read-only.
+- `agentium todo list` prints the task's open items with ids, states and assignees (`--all` includes done ones), and this arena's pending questions. Run it after a compaction, or when a message refers to an item id.
+- The user sends Go from Task Overview in one message starting with `[from: Task Overview]` and `To do`, one line per item: `Go: #ID TITLE :: DETAIL — Note: CONDITION`. The note is the user's condition and overrides the detail. Do the work, then `agentium todo done <id> --note "..."` for each item; items stay listed until you close them. Skip and Done answers never reach you: the user closes those items directly.
+- Only an assigned agent may `done` or `update` an item (`todo take <id>` assigns you first). Anyone may change assignees: `todo assign <id> --to self`, `--to "<tab title>" [--arena <path>]`, or `--unassign`. This is a guard against closing someone else's work by accident, not a permission boundary.
+- `todo set` and `todo clear` no longer exist; there is no per-tab list to replace.

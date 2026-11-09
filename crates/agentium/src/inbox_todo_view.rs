@@ -1,37 +1,211 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use chrono::{DateTime, Utc};
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    Styled, Subscription, Task, Window, div,
+    Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
     prelude::FluentBuilder as _,
 };
 use ui::{
-    ActiveTheme, Button, Clickable as _, Disableable as _, LabelSize,
-    Toggleable as _, h_flex, v_flex,
+    ActiveTheme, Button, ButtonCommon as _, Clickable as _, Disableable as _, Icon, IconName,
+    IconSize, LabelSize, Toggleable as _, h_flex, v_flex,
 };
 use util::ResultExt as _;
+use uuid::Uuid;
 use workspace::Pane;
-use workspace::item::ItemEvent;
 
 use crate::arena::Arena;
-use crate::{
-    InboxAsker, InboxTab, InboxTodoItem, InboxTodoKind, InboxTodoList, dropped_todo_titles,
-    inbox_todo_color, todo_list_index, with_from_line,
-};
+use crate::{InboxAsker, inbox_todo_color, with_from_line};
 
 gpui::actions!(
     agentium_inbox_todo,
     [
-        /// Send the chosen answers to the tab that wrote the to-do list.
+        /// Send the chosen answers to the assigned agents.
         SendAnswers
     ]
 );
 
 pub(crate) const KEY_CONTEXT: &str = "InboxTodo";
+
+pub const MAX_TODO_TITLE_CHARS: usize = 200;
+pub const MAX_TODO_TEXT_CHARS: usize = 2000;
+/// Open items (not Done) one task, or one task-less arena, may hold.
+pub const MAX_OPEN_TODOS_PER_SCOPE: usize = 30;
+/// Done items older than this are dropped when the store loads.
+const DONE_RETENTION_DAYS: i64 = 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxTodoKind {
+    /// The user does something, then answers "Done".
+    UserTask,
+    /// The user decides whether an agent does it ("Go" / "Skip").
+    Proposal,
+}
+
+/// Who created, requested or closed an item. A human has no session
+/// identity: the CLI resolves the caller's tab, and a plain shell has no
+/// agent in it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "who", rename_all = "snake_case")]
+pub enum TodoCreator {
+    Session { asker: InboxAsker },
+    Human,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoState {
+    Open,
+    Assigned,
+    Requested,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoOutcome {
+    Completed,
+    Skipped,
+    Dismissed,
+}
+
+/// A session working on an item, with where its tab lived so the tab can be
+/// brought back after it closed. The item's own arena is where it was
+/// created, which can differ.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Assignee {
+    pub asker: InboxAsker,
+    pub arena_path: Option<PathBuf>,
+    pub arena_name: String,
+}
+
+/// Set when the item was requested: by the user's Go, or by the agent that
+/// created it for itself.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TodoRequest {
+    /// The user's condition; it overrides `detail` but never rewrites it.
+    pub note: Option<String>,
+    pub at: DateTime<Utc>,
+    pub by: TodoCreator,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TodoResolution {
+    pub outcome: TodoOutcome,
+    pub note: Option<String>,
+    pub at: DateTime<Utc>,
+    pub by: TodoCreator,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TodoItem {
+    pub id: u64,
+    /// `None` for an arena that belongs to no task.
+    pub task_id: Option<Uuid>,
+    /// The arena the item was created in; the default when a session is
+    /// attached from the overview.
+    pub arena_path: Option<PathBuf>,
+    /// Kept from lists written before `arena_path` existed; such items are
+    /// matched to a scope by name.
+    pub arena_name: String,
+    pub branch: Option<String>,
+    pub kind: InboxTodoKind,
+    pub title: String,
+    pub detail: Option<String>,
+    pub created_by: TodoCreator,
+    pub assigned: Vec<Assignee>,
+    pub state: TodoState,
+    pub request: Option<TodoRequest>,
+    /// `Some` exactly when `state` is `Done`.
+    pub resolution: Option<TodoResolution>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TodoItem {
+    pub fn is_open(&self) -> bool {
+        self.state != TodoState::Done
+    }
+
+    pub fn is_assigned_to(&self, asker: &InboxAsker) -> bool {
+        self.assigned.iter().any(|assignee| &assignee.asker == asker)
+    }
+
+    /// Only an assigned session closes or edits an item. The user does both
+    /// from the overview as `Human`. This is a guard against accidents, not a
+    /// boundary: any session may assign itself first.
+    fn may_write(&self, by: &TodoCreator) -> bool {
+        match by {
+            TodoCreator::Human => true,
+            TodoCreator::Session { asker } => self.is_assigned_to(asker),
+        }
+    }
+}
+
+/// What `add` needs besides the generated id and timestamps.
+pub struct TodoDraft {
+    pub task_id: Option<Uuid>,
+    pub arena_path: Option<PathBuf>,
+    pub arena_name: String,
+    pub branch: Option<String>,
+    pub kind: InboxTodoKind,
+    pub title: String,
+    pub detail: Option<String>,
+    pub created_by: TodoCreator,
+    /// The creating session when it keeps the item; `None` leaves it Open.
+    pub assignee: Option<Assignee>,
+}
+
+/// Which items an overview shows. `task_id` is authoritative: an item owned
+/// by a task appears only there, even when another task shares its worktree
+/// or the arena later moved. Only task-less items fall back to the arena's
+/// path, or to its name for items saved before paths were recorded.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TodoScope {
+    pub task_id: Option<Uuid>,
+    pub arena_paths: Vec<PathBuf>,
+    pub arena_names: Vec<String>,
+}
+
+impl TodoScope {
+    pub fn contains(&self, item: &TodoItem) -> bool {
+        match (self.task_id, item.task_id) {
+            (Some(scope_task), Some(item_task)) => scope_task == item_task,
+            (None, Some(_)) => false,
+            (_, None) => match &item.arena_path {
+                Some(path) => self.arena_paths.iter().any(|candidate| candidate == path),
+                None => self.arena_names.contains(&item.arena_name),
+            },
+        }
+    }
+}
+
+pub fn validate_todo_title(title: &str) -> anyhow::Result<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("the title is empty");
+    }
+    if title.chars().count() > MAX_TODO_TITLE_CHARS {
+        anyhow::bail!("the title is longer than {MAX_TODO_TITLE_CHARS} characters");
+    }
+    Ok(title.to_string())
+}
+
+/// Trims and drops empty text; detail and notes share one limit.
+pub fn validate_todo_text(label: &str, text: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    if text.chars().count() > MAX_TODO_TEXT_CHARS {
+        anyhow::bail!("the {label} is longer than {MAX_TODO_TEXT_CHARS} characters");
+    }
+    Ok(Some(text.to_string()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TodoChoice {
@@ -57,59 +231,25 @@ impl TodoChoice {
     }
 }
 
-/// The body of the answer, numbered as `todo list` numbers the items, or
-/// `None` when nothing is chosen. Each line repeats the title because the
-/// agent may have replaced its list (and so its numbering) since.
-pub(crate) fn todo_answer_message(
-    items: &[InboxTodoItem],
-    choices: &HashMap<String, TodoChoice>,
-    notes: &HashMap<String, String>,
-) -> Option<String> {
+/// The message one agent receives for the items the user sent it with Go.
+/// Items are named by id and title: the agent lists them with `todo list`
+/// and closes them with `todo done <id>`.
+pub(crate) fn todo_request_message(items: &[(&TodoItem, Option<&str>)]) -> String {
     let mut lines = vec!["To do".to_string()];
-    for (index, item) in items.iter().enumerate() {
-        let Some(choice) = choices.get(&item.title) else {
-            continue;
-        };
-        let mut line = format!("{}: {} {}", choice.label(), index + 1, item.title);
-        if let Some(note) = notes
-            .get(&item.title)
-            .map(|note| note.trim())
-            .filter(|note| !note.is_empty())
-        {
+    for (item, note) in items {
+        let mut line = format!("Go: #{} {}", item.id, item.title);
+        if let Some(detail) = &item.detail {
+            line.push_str(" :: ");
+            line.push_str(detail);
+        }
+        if let Some(note) = note {
             line.push_str(" — Note: ");
             line.push_str(note);
         }
         lines.push(line);
     }
-    (lines.len() > 1).then(|| lines.join("\n"))
-}
-
-/// Choices that still apply after the agent replaced its items: same title,
-/// and a kind the choice is valid for.
-pub(crate) fn carry_todo_choices(
-    choices: &HashMap<String, TodoChoice>,
-    items: &[InboxTodoItem],
-) -> HashMap<String, TodoChoice> {
-    choices
-        .iter()
-        .filter(|(title, choice)| {
-            items
-                .iter()
-                .any(|item| &item.title == *title && choice.allowed_for(item.kind))
-        })
-        .map(|(title, choice)| (title.clone(), *choice))
-        .collect()
-}
-
-pub(crate) fn todo_items_after_send(
-    items: &[InboxTodoItem],
-    choices: &HashMap<String, TodoChoice>,
-) -> Vec<InboxTodoItem> {
-    items
-        .iter()
-        .filter(|item| !choices.contains_key(&item.title))
-        .cloned()
-        .collect()
+    lines.push("Run `agentium todo done <id>` for each item once it is finished.".to_string());
+    lines.join("\n")
 }
 
 /// Where a tab is now. Tabs move between panes and a closed tab's entity can
@@ -133,15 +273,7 @@ pub(crate) fn find_item_location(
     None
 }
 
-/// What a list records about its owner tab at `todo set`.
-pub(crate) struct TodoOwner {
-    pub(crate) title: String,
-    pub(crate) arena_name: String,
-    pub(crate) arena_path: Option<PathBuf>,
-    pub(crate) branch: Option<String>,
-}
-
-/// How to bring back the tab of a list that is not bound to an open tab.
+/// How to bring back the tab of an assignee that is not open.
 #[derive(Debug, PartialEq)]
 pub(crate) enum RestorePlan {
     ResumeClaude { arena_path: PathBuf, session_id: String },
@@ -149,36 +281,31 @@ pub(crate) enum RestorePlan {
     Fallback(String),
 }
 
-/// Lists written before `arena_path` existed only know the arena's display
-/// name, which several worktrees can share; guessing would resume the agent
-/// in the wrong directory, so the name must match exactly one open arena.
+/// Assignees recorded without a path only know the arena's display name,
+/// which several worktrees can share; guessing would resume the agent in the
+/// wrong directory, so the name must match exactly one open arena.
 pub(crate) fn todo_restore_plan(
-    list: &InboxTodoList,
+    assignee: &Assignee,
     open_arenas: &[(String, PathBuf)],
 ) -> RestorePlan {
-    let Some(asker) = &list.asker else {
-        return RestorePlan::Fallback(
-            "This tab cannot be restored; open it again to answer.".to_string(),
-        );
-    };
-    let arena_path = match &list.arena_path {
+    let arena_path = match &assignee.arena_path {
         Some(path) => path.clone(),
         None => {
             let mut matches = open_arenas
                 .iter()
-                .filter(|(name, _)| *name == list.arena_name);
+                .filter(|(name, _)| *name == assignee.arena_name);
             match (matches.next(), matches.next()) {
                 (Some((_, path)), None) => path.clone(),
                 _ => {
                     return RestorePlan::Fallback(format!(
                         "Cannot tell which arena '{}' is; open the tab manually.",
-                        list.arena_name
+                        assignee.arena_name
                     ));
                 }
             }
         }
     };
-    match asker {
+    match &assignee.asker {
         InboxAsker::ClaudeSession { session_id } => RestorePlan::ResumeClaude {
             arena_path,
             session_id: session_id.clone(),
@@ -187,14 +314,24 @@ pub(crate) fn todo_restore_plan(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingRestore {
     /// `claude --resume` is being started.
-    Launching,
+    Launching { asker: InboxAsker },
     /// Started in this tab; waiting for its session to reconnect.
-    Launched { item_id: EntityId },
+    Launched { asker: InboxAsker, item_id: EntityId },
     /// The tab exists again (ACP, restored with its arena); binds at the next sync.
-    Restored,
+    Restored { asker: InboxAsker },
+}
+
+impl PendingRestore {
+    pub(crate) fn asker(&self) -> &InboxAsker {
+        match self {
+            Self::Launching { asker } | Self::Launched { asker, .. } | Self::Restored { asker } => {
+                asker
+            }
+        }
+    }
 }
 
 /// Applies the outcome of starting `claude --resume`; returns the error to
@@ -207,7 +344,8 @@ pub(crate) fn record_restore_launch(
     match result {
         Ok(item_id) => {
             if let Some(entry) = pending.get_mut(&todo_id) {
-                *entry = PendingRestore::Launched { item_id };
+                let asker = entry.asker().clone();
+                *entry = PendingRestore::Launched { asker, item_id };
             }
             None
         }
@@ -223,17 +361,18 @@ pub(crate) fn record_restore_launch(
 pub(crate) fn acp_restore_outcome(
     arena_found: bool,
     asker_tab_found: bool,
+    asker: InboxAsker,
 ) -> Result<PendingRestore, String> {
     match (arena_found, asker_tab_found) {
         (false, _) => Err("Could not open the arena of this tab.".to_string()),
         (true, false) => Err("This Codex ACP tab is no longer saved in its arena.".to_string()),
-        (true, true) => Ok(PendingRestore::Restored),
+        (true, true) => Ok(PendingRestore::Restored { asker }),
     }
 }
 
 pub(crate) struct RestoreObservation {
-    pub(crate) list_exists: bool,
-    pub(crate) list_bound: bool,
+    pub(crate) item_exists: bool,
+    pub(crate) assignee_open: bool,
     pub(crate) launched_tab_open: bool,
 }
 
@@ -243,9 +382,9 @@ pub(crate) enum RestoreOutcome {
     Failed(String),
 }
 
-/// Settles pending restorations at a sync: a bound list opens its detail
-/// tab, a vanished list is forgotten, and a launched tab that closed before
-/// its session reconnected fails so that the next click retries.
+/// Settles pending restorations at a sync: a reconnected assignee is done, a
+/// vanished item is forgotten, and a launched tab that closed before its
+/// session reconnected fails so that the next click retries.
 pub(crate) fn advance_pending_restores(
     pending: &mut HashMap<u64, PendingRestore>,
     observe: impl Fn(u64, &PendingRestore) -> RestoreObservation,
@@ -253,10 +392,10 @@ pub(crate) fn advance_pending_restores(
     let mut outcomes = Vec::new();
     pending.retain(|todo_id, restore| {
         let observation = observe(*todo_id, restore);
-        if !observation.list_exists {
+        if !observation.item_exists {
             return false;
         }
-        if observation.list_bound {
+        if observation.assignee_open {
             outcomes.push((*todo_id, RestoreOutcome::Open));
             return false;
         }
@@ -275,115 +414,421 @@ pub(crate) fn advance_pending_restores(
     outcomes
 }
 
-/// Every tab's to-do list. An entity of its own so detail tabs can observe
-/// it, and so tests can use it without `AgentiumApp` (whose construction
-/// reads and writes the user's data_dir).
+/// The persisted form: items of every task, plus a version so the per-tab
+/// lists written by earlier versions (a bare array) are recognized.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TodoFile {
+    version: u32,
+    items: Vec<TodoItem>,
+}
+
+const TODO_FILE_VERSION: u32 = 2;
+
+/// One per-tab list as versions before `TodoFile` wrote it.
+#[derive(serde::Deserialize)]
+struct LegacyTodoList {
+    id: u64,
+    #[serde(default)]
+    arena_name: String,
+    #[serde(default = "Utc::now")]
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    asker: Option<InboxAsker>,
+    #[serde(default)]
+    items: Vec<LegacyTodoItem>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    arena_path: Option<PathBuf>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyTodoItem {
+    kind: InboxTodoKind,
+    title: String,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// Turns per-tab lists into items. The list's tab becomes the assignee of
+/// every item, which stays Requested as the agent had already taken it on;
+/// a list without an asker (a plain terminal) becomes unassigned Open items.
+fn migrate_legacy_lists(
+    lists: Vec<LegacyTodoList>,
+    resolve_task: &dyn Fn(&Path) -> Option<Uuid>,
+    next_id: &mut u64,
+) -> Vec<TodoItem> {
+    let mut items = Vec::new();
+    for list in lists {
+        let task_id = list.arena_path.as_deref().and_then(resolve_task);
+        let (created_by, assignee, state, request) = match &list.asker {
+            Some(asker) => (
+                TodoCreator::Session {
+                    asker: asker.clone(),
+                },
+                Some(Assignee {
+                    asker: asker.clone(),
+                    arena_path: list.arena_path.clone(),
+                    arena_name: list.arena_name.clone(),
+                }),
+                TodoState::Requested,
+                Some(TodoRequest {
+                    note: None,
+                    at: list.updated_at,
+                    by: TodoCreator::Session {
+                        asker: asker.clone(),
+                    },
+                }),
+            ),
+            None => (TodoCreator::Human, None, TodoState::Open, None),
+        };
+        for item in list.items {
+            let id = *next_id;
+            *next_id += 1;
+            items.push(TodoItem {
+                id,
+                task_id,
+                arena_path: list.arena_path.clone(),
+                arena_name: list.arena_name.clone(),
+                branch: list.branch.clone(),
+                kind: item.kind,
+                title: item.title,
+                detail: item.detail,
+                created_by: created_by.clone(),
+                assigned: assignee.clone().into_iter().collect(),
+                state,
+                request: request.clone(),
+                resolution: None,
+                created_at: list.updated_at,
+                updated_at: list.updated_at,
+            });
+        }
+        // Ids of the old lists shared the Inbox counter; keep moving past them.
+        *next_id = (*next_id).max(list.id + 1);
+    }
+    items
+}
+
+/// Parses either file format. Legacy ids are reassigned from `next_id`; the
+/// flag says so, and the caller writes the result back before anything
+/// else can hand those ids out again.
+fn parse_todo_file(
+    content: &[u8],
+    resolve_task: &dyn Fn(&Path) -> Option<Uuid>,
+    next_id: &mut u64,
+) -> anyhow::Result<(Vec<TodoItem>, bool)> {
+    let value: serde_json::Value = serde_json::from_slice(content)?;
+    if value.is_array() {
+        let lists: Vec<LegacyTodoList> = serde_json::from_value(value)?;
+        return Ok((migrate_legacy_lists(lists, resolve_task, next_id), true));
+    }
+    let file: TodoFile = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        file.version <= TODO_FILE_VERSION,
+        "todo.json version {} is newer than this Agentium",
+        file.version
+    );
+    Ok((file.items, false))
+}
+
+/// Keeps every open item and the Done items closed within the retention.
+fn prune_done(items: Vec<TodoItem>, now: DateTime<Utc>) -> Vec<TodoItem> {
+    items
+        .into_iter()
+        .filter(|item| match &item.resolution {
+            Some(resolution) => now - resolution.at < chrono::Duration::days(DONE_RETENTION_DAYS),
+            None => true,
+        })
+        .collect()
+}
+
+/// What `send` did, for the view to report.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SendReport {
+    pub(crate) closed: usize,
+    pub(crate) requested: usize,
+}
+
+/// Every task's To do items. An entity of its own so the overview can
+/// observe it, and so tests can use it without `AgentiumApp` (whose
+/// construction reads and writes the user's data_dir).
 pub(crate) struct InboxTodos {
-    lists: Vec<InboxTodoList>,
+    items: Vec<TodoItem>,
+    /// The user's draft answers; cheap to redo, so not persisted.
+    choices: HashMap<u64, TodoChoice>,
+    /// Sessions that already received Go for an item whose other sessions
+    /// could not be reached, with the note they received, so a retry with
+    /// the same note does not ask them twice and a retry with an edited
+    /// note starts over. Cleared once the item is Requested or the choice
+    /// changes.
+    delivered: HashMap<u64, (Option<String>, Vec<InboxAsker>)>,
+    /// The file held legacy lists; their new ids are final only once
+    /// `persist_migration` wrote them.
+    migrated: bool,
     path: Option<PathBuf>,
     write_task: Option<Task<()>>,
 }
 
 impl InboxTodos {
-    pub(crate) fn new(path: Option<PathBuf>) -> Self {
-        let lists = path
+    /// `next_id` is the shared Inbox counter: migrated legacy items take ids
+    /// from it and advance it.
+    pub(crate) fn load(
+        path: Option<PathBuf>,
+        resolve_task: &dyn Fn(&Path) -> Option<Uuid>,
+        next_id: &mut u64,
+    ) -> Self {
+        let (items, migrated) = path
             .as_ref()
             .and_then(|path| std::fs::read(path).ok().map(|content| (path, content)))
             .and_then(|(path, content)| {
-                serde_json::from_slice(&content)
+                parse_todo_file(&content, resolve_task, next_id)
                     .with_context(|| format!("Failed to parse {}", path.display()))
                     .log_err()
             })
             .unwrap_or_default();
         Self {
-            lists,
+            items: prune_done(items, Utc::now()),
+            choices: HashMap::new(),
+            delivered: HashMap::new(),
+            migrated,
             path,
             write_task: None,
         }
     }
 
-    pub(crate) fn lists(&self) -> &[InboxTodoList] {
-        &self.lists
+    /// Writes a migrated file back at once, so the ids the migration handed
+    /// out survive a restart that writes nothing else.
+    pub(crate) fn persist_migration(&mut self, cx: &mut Context<Self>) {
+        if self.migrated {
+            self.migrated = false;
+            self.persist(cx);
+        }
     }
 
-    pub(crate) fn list(&self, todo_id: u64) -> Option<&InboxTodoList> {
-        self.lists.iter().find(|list| list.id == todo_id)
+    #[cfg(test)]
+    pub(crate) fn new(path: Option<PathBuf>) -> Self {
+        let mut next_id = 1;
+        Self::load(path, &|_| None, &mut next_id)
     }
 
-    /// Replaces the items of the list owned by `item_id` (or by `asker`),
-    /// creating it if needed, and returns the titles that disappeared.
-    pub(crate) fn set_items(
+    pub(crate) fn items(&self) -> &[TodoItem] {
+        &self.items
+    }
+
+    pub(crate) fn item(&self, todo_id: u64) -> Option<&TodoItem> {
+        self.items.iter().find(|item| item.id == todo_id)
+    }
+
+    pub(crate) fn max_id(&self) -> Option<u64> {
+        self.items.iter().map(|item| item.id).max()
+    }
+
+    pub(crate) fn choice(&self, todo_id: u64) -> Option<TodoChoice> {
+        self.choices.get(&todo_id).copied()
+    }
+
+    fn item_mut(&mut self, todo_id: u64) -> anyhow::Result<&mut TodoItem> {
+        self.items
+            .iter_mut()
+            .find(|item| item.id == todo_id)
+            .with_context(|| format!("no To do item #{todo_id}"))
+    }
+
+    fn open_items_in_same_scope(&self, draft: &TodoDraft) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.is_open())
+            .filter(|item| match draft.task_id {
+                Some(task_id) => item.task_id == Some(task_id),
+                None => item.task_id.is_none() && item.arena_path == draft.arena_path,
+            })
+            .count()
+    }
+
+    pub(crate) fn add(
         &mut self,
-        item_id: EntityId,
-        tab: InboxTab,
-        asker: Option<InboxAsker>,
-        owner: TodoOwner,
-        items: Vec<InboxTodoItem>,
+        draft: TodoDraft,
         next_id: &mut u64,
         cx: &mut Context<Self>,
-    ) -> Vec<String> {
-        let dropped = match todo_list_index(&self.lists, item_id, asker.as_ref()) {
-            Some(index) => {
-                let list = &mut self.lists[index];
-                let dropped = dropped_todo_titles(&list.items, &items);
-                list.choices = carry_todo_choices(&list.choices, &items);
-                list.items = items;
-                list.title = owner.title;
-                list.arena_name = owner.arena_name;
-                list.arena_path = owner.arena_path;
-                list.branch = owner.branch;
-                list.updated_at = chrono::Utc::now();
-                list.asker = asker;
-                list.tab = Some(tab);
-                dropped
-            }
-            None => {
-                let id = *next_id;
-                *next_id += 1;
-                self.lists.push(InboxTodoList {
-                    id,
-                    title: owner.title,
-                    arena_name: owner.arena_name,
-                    arena_path: owner.arena_path,
-                    branch: owner.branch,
-                    updated_at: chrono::Utc::now(),
-                    asker,
-                    items,
-                    tab: Some(tab),
-                    choices: HashMap::new(),
-                });
-                Vec::new()
-            }
+    ) -> anyhow::Result<u64> {
+        let title = validate_todo_title(&draft.title)?;
+        let detail = validate_todo_text("detail", draft.detail.as_deref())?;
+        if self.open_items_in_same_scope(&draft) >= MAX_OPEN_TODOS_PER_SCOPE {
+            anyhow::bail!(
+                "this task already has {MAX_OPEN_TODOS_PER_SCOPE} open To do items; close some first"
+            );
+        }
+        let now = Utc::now();
+        let id = *next_id;
+        *next_id += 1;
+        let (state, request) = match (&draft.assignee, &draft.created_by) {
+            (Some(_), TodoCreator::Session { .. }) => (
+                TodoState::Requested,
+                Some(TodoRequest {
+                    note: None,
+                    at: now,
+                    by: draft.created_by.clone(),
+                }),
+            ),
+            (Some(_), TodoCreator::Human) => (TodoState::Assigned, None),
+            (None, _) => (TodoState::Open, None),
         };
+        self.items.push(TodoItem {
+            id,
+            task_id: draft.task_id,
+            arena_path: draft.arena_path,
+            arena_name: draft.arena_name,
+            branch: draft.branch,
+            kind: draft.kind,
+            title,
+            detail,
+            created_by: draft.created_by,
+            assigned: draft.assignee.into_iter().collect(),
+            state,
+            request,
+            resolution: None,
+            created_at: now,
+            updated_at: now,
+        });
         self.persist(cx);
         cx.notify();
-        dropped
+        Ok(id)
     }
 
-    /// Removes the list owned by `item_id` (or by `asker`); returns how many
-    /// items it had.
-    pub(crate) fn clear_for(
+    /// Adds a session to the item. Anyone may do this (see `may_write`).
+    pub(crate) fn assign(
         &mut self,
-        item_id: EntityId,
-        asker: Option<&InboxAsker>,
+        todo_id: u64,
+        assignee: Assignee,
         cx: &mut Context<Self>,
-    ) -> usize {
-        let Some(index) = todo_list_index(&self.lists, item_id, asker) else {
-            return 0;
-        };
-        let list = self.lists.remove(index);
+    ) -> anyhow::Result<()> {
+        let item = self.item_mut(todo_id)?;
+        anyhow::ensure!(item.is_open(), "To do item #{todo_id} is already done");
+        if item.is_assigned_to(&assignee.asker) {
+            return Ok(());
+        }
+        item.assigned.push(assignee);
+        if item.state == TodoState::Open {
+            item.state = TodoState::Assigned;
+        }
+        item.updated_at = Utc::now();
         self.persist(cx);
         cx.notify();
-        list.items.len()
+        Ok(())
     }
 
-    pub(crate) fn dismiss(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        let before = self.lists.len();
-        self.lists.retain(|list| list.id != todo_id);
-        if self.lists.len() != before {
+    /// A session picks the item up for itself: assigned, and requested as if
+    /// it had created the item. A request the user already made (with its
+    /// condition) stays as it is.
+    pub(crate) fn take(
+        &mut self,
+        todo_id: u64,
+        assignee: Assignee,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let asker = assignee.asker.clone();
+        self.assign(todo_id, assignee, cx)?;
+        let item = self.item_mut(todo_id)?;
+        if item.state != TodoState::Requested {
+            item.state = TodoState::Requested;
+            if item.request.is_none() {
+                item.request = Some(TodoRequest {
+                    note: None,
+                    at: Utc::now(),
+                    by: TodoCreator::Session { asker },
+                });
+            }
+            item.updated_at = Utc::now();
             self.persist(cx);
             cx.notify();
         }
+        Ok(())
+    }
+
+    pub(crate) fn unassign(
+        &mut self,
+        todo_id: u64,
+        asker: &InboxAsker,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let item = self.item_mut(todo_id)?;
+        anyhow::ensure!(item.is_open(), "To do item #{todo_id} is already done");
+        let before = item.assigned.len();
+        item.assigned.retain(|assignee| &assignee.asker != asker);
+        if item.assigned.len() == before {
+            anyhow::bail!("that session is not assigned to To do item #{todo_id}");
+        }
+        if item.assigned.is_empty() {
+            // A request with nobody to carry it out waits for a new assignee.
+            item.state = TodoState::Open;
+        }
+        item.updated_at = Utc::now();
+        self.persist(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Closes the item. A session must be assigned to it; the user may close
+    /// anything. `request` stays as it was, so a Done item records whether it
+    /// was ever requested.
+    pub(crate) fn done(
+        &mut self,
+        todo_id: u64,
+        by: TodoCreator,
+        outcome: TodoOutcome,
+        note: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let note = validate_todo_text("note", note)?;
+        let item = self.item_mut(todo_id)?;
+        anyhow::ensure!(item.is_open(), "To do item #{todo_id} is already done");
+        anyhow::ensure!(
+            item.may_write(&by),
+            "only an assigned session can close To do item #{todo_id}; run `agentium todo take {todo_id}` first"
+        );
+        let now = Utc::now();
+        item.state = TodoState::Done;
+        item.resolution = Some(TodoResolution {
+            outcome,
+            note,
+            at: now,
+            by,
+        });
+        item.updated_at = now;
+        self.choices.remove(&todo_id);
+        self.persist(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        todo_id: u64,
+        by: &TodoCreator,
+        title: Option<&str>,
+        detail: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let title = title.map(validate_todo_title).transpose()?;
+        let detail = detail
+            .map(|detail| validate_todo_text("detail", Some(detail)))
+            .transpose()?;
+        let item = self.item_mut(todo_id)?;
+        anyhow::ensure!(item.is_open(), "To do item #{todo_id} is already done");
+        anyhow::ensure!(
+            item.may_write(by),
+            "only an assigned session can edit To do item #{todo_id}; run `agentium todo take {todo_id}` first"
+        );
+        if let Some(title) = title {
+            item.title = title;
+        }
+        if let Some(detail) = detail {
+            item.detail = detail;
+        }
+        item.updated_at = Utc::now();
+        self.persist(cx);
+        cx.notify();
+        Ok(())
     }
 
     /// `None` clears the choice. A choice the item's kind does not allow is
@@ -391,106 +836,214 @@ impl InboxTodos {
     pub(crate) fn set_choice(
         &mut self,
         todo_id: u64,
-        title: &str,
         choice: Option<TodoChoice>,
         cx: &mut Context<Self>,
     ) {
-        let Some(list) = self.lists.iter_mut().find(|list| list.id == todo_id) else {
-            return;
-        };
-        let Some(item) = list.items.iter().find(|item| item.title == title) else {
+        let Some(item) = self.item(todo_id) else {
             return;
         };
         match choice {
             Some(choice) if choice.allowed_for(item.kind) => {
-                list.choices.insert(title.to_string(), choice);
+                if choice != TodoChoice::Go {
+                    self.delivered.remove(&todo_id);
+                }
+                self.choices.insert(todo_id, choice);
             }
             Some(_) => return,
             None => {
-                list.choices.remove(title);
+                self.choices.remove(&todo_id);
+                self.delivered.remove(&todo_id);
             }
         }
         cx.notify();
     }
 
-    pub(crate) fn clear_choices(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        if let Some(list) = self.lists.iter_mut().find(|list| list.id == todo_id)
-            && !list.choices.is_empty()
-        {
-            list.choices.clear();
+    pub(crate) fn clear_choices(&mut self, todo_ids: &[u64], cx: &mut Context<Self>) {
+        let before = self.choices.len();
+        self.choices.retain(|todo_id, _| !todo_ids.contains(todo_id));
+        self.delivered.retain(|todo_id, _| !todo_ids.contains(todo_id));
+        if self.choices.len() != before {
             cx.notify();
         }
     }
 
-    /// Applies the owner tabs the app found at a sync. Runs on every app
-    /// render, so it notifies only when a list's owner actually changed;
-    /// notifying unconditionally would re-render the app forever.
-    pub(crate) fn rebind(
-        &mut self,
-        bindings: Vec<(u64, Option<InboxTab>)>,
-        cx: &mut Context<Self>,
-    ) {
-        let mut changed = false;
-        for (todo_id, tab) in bindings {
-            let Some(list) = self.lists.iter_mut().find(|list| list.id == todo_id) else {
-                continue;
-            };
-            let current = list.tab.as_ref().map(|tab| tab.item.id());
-            if current != tab.as_ref().map(|tab| tab.item.id()) {
-                list.tab = tab;
-                changed = true;
-            }
-        }
-        if changed {
-            cx.notify();
-        }
-    }
-
-    /// Delivers the chosen answers to `owner` in one message, then removes
-    /// exactly the answered items. Nothing changes when there is no owner or
-    /// delivery fails, so the user can retry.
+    /// Applies the user's choices for `todo_ids`: Done and Skip close the
+    /// item; Go sends one message per assigned session (an item with several
+    /// assignees is named in each) and marks the item Requested once every
+    /// one of its sessions received it. A Go item one of whose sessions
+    /// cannot be reached stays as it was, so the user can retry; the others
+    /// still go through.
     pub(crate) fn send(
         &mut self,
-        todo_id: u64,
-        notes: &HashMap<String, String>,
-        owner: Option<&dyn workspace::ItemHandle>,
-        deliver: impl FnOnce(&dyn workspace::ItemHandle, &str, &mut App) -> anyhow::Result<()>,
+        todo_ids: &[u64],
+        notes: &HashMap<u64, String>,
+        mut deliver: impl FnMut(&InboxAsker, &str, &mut App) -> anyhow::Result<()>,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
-        let list = self
-            .list(todo_id)
-            .context("this to-do list no longer exists")?;
-        let body = todo_answer_message(&list.items, &list.choices, notes)
-            .context("choose Done, Go or Skip for at least one item")?;
-        let owner = owner.context("the tab that wrote this list is not open")?;
-        deliver(owner, &with_from_line("Task Overview", &body), cx)?;
-        if let Some(index) = self.lists.iter().position(|list| list.id == todo_id) {
-            let list = &mut self.lists[index];
-            list.items = todo_items_after_send(&list.items, &list.choices);
-            list.choices.clear();
-            if list.items.is_empty() {
-                self.lists.remove(index);
+    ) -> anyhow::Result<SendReport> {
+        let chosen: Vec<(u64, TodoChoice)> = todo_ids
+            .iter()
+            .filter_map(|todo_id| self.choices.get(todo_id).map(|choice| (*todo_id, *choice)))
+            .collect();
+        anyhow::ensure!(!chosen.is_empty(), "choose Done, Go or Skip for at least one item");
+        let mut report = SendReport::default();
+        let mut errors = Vec::new();
+        // Notes are checked before anything is sent or closed, so one bad
+        // note never leaves a message delivered and its item unchanged.
+        let mut valid_notes: HashMap<u64, Option<String>> = HashMap::new();
+        let chosen: Vec<(u64, TodoChoice)> = chosen
+            .into_iter()
+            .filter(|(todo_id, _)| {
+                match validate_todo_text("note", notes.get(todo_id).map(String::as_str)) {
+                    Ok(note) => {
+                        valid_notes.insert(*todo_id, note);
+                        true
+                    }
+                    Err(error) => {
+                        errors.push(format!("#{todo_id}: {error:#}"));
+                        false
+                    }
+                }
+            })
+            .collect();
+        let note_for = |todo_id: u64| valid_notes.get(&todo_id).cloned().flatten();
+        let mut go_by_asker: Vec<(InboxAsker, Vec<u64>)> = Vec::new();
+        for (todo_id, choice) in &chosen {
+            match choice {
+                TodoChoice::Done | TodoChoice::Skip => {
+                    let outcome = if *choice == TodoChoice::Done {
+                        TodoOutcome::Completed
+                    } else {
+                        TodoOutcome::Skipped
+                    };
+                    let note = note_for(*todo_id);
+                    match self.done(*todo_id, TodoCreator::Human, outcome, note.as_deref(), cx) {
+                        Ok(()) => report.closed += 1,
+                        Err(error) => errors.push(format!("#{todo_id}: {error:#}")),
+                    }
+                }
+                TodoChoice::Go => {
+                    let Some(item) = self.item(*todo_id) else {
+                        errors.push(format!("#{todo_id}: no such item"));
+                        continue;
+                    };
+                    if item.assigned.is_empty() {
+                        errors.push(format!(
+                            "#{todo_id}: assign a session before sending Go"
+                        ));
+                        continue;
+                    }
+                    let askers: Vec<InboxAsker> =
+                        item.assigned.iter().map(|assignee| assignee.asker.clone()).collect();
+                    // Receipts hold only for the note they were sent with: an
+                    // edited condition must reach every session again.
+                    let note = note_for(*todo_id);
+                    let already = match self.delivered.get(todo_id) {
+                        Some((sent_note, askers)) if *sent_note == note => askers.clone(),
+                        _ => {
+                            self.delivered.remove(todo_id);
+                            Vec::new()
+                        }
+                    };
+                    for asker in askers {
+                        // A retry after a partial failure skips the sessions
+                        // that already have the request.
+                        if already.contains(&asker) {
+                            continue;
+                        }
+                        match go_by_asker.iter_mut().find(|(candidate, _)| *candidate == asker) {
+                            Some((_, ids)) => ids.push(*todo_id),
+                            None => go_by_asker.push((asker, vec![*todo_id])),
+                        }
+                    }
+                }
             }
         }
-        self.persist(cx);
-        cx.notify();
-        Ok(())
+        for (asker, ids) in &go_by_asker {
+            let entries: Vec<(&TodoItem, Option<&str>)> = ids
+                .iter()
+                .filter_map(|todo_id| self.item(*todo_id))
+                .map(|item| (item, valid_notes.get(&item.id).and_then(|note| note.as_deref())))
+                .collect();
+            let body = with_from_line("Task Overview", &todo_request_message(&entries));
+            match deliver(asker, &body, cx) {
+                Ok(()) => {
+                    for todo_id in ids {
+                        let note = note_for(*todo_id);
+                        self.delivered
+                            .entry(*todo_id)
+                            .or_insert_with(|| (note, Vec::new()))
+                            .1
+                            .push(asker.clone());
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: {error:#}",
+                        ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+        }
+        let go_ids: Vec<u64> = chosen
+            .iter()
+            .filter(|(_, choice)| *choice == TodoChoice::Go)
+            .map(|(todo_id, _)| *todo_id)
+            .collect();
+        let now = Utc::now();
+        for todo_id in go_ids {
+            let Some(item) = self.item(todo_id) else {
+                continue;
+            };
+            // Requested once every current assignee holds this item's
+            // request; failures of other items in the same message do not
+            // hold it back.
+            let received: &[InboxAsker] = self
+                .delivered
+                .get(&todo_id)
+                .map(|(_, askers)| askers.as_slice())
+                .unwrap_or_default();
+            let unreached = item.assigned.is_empty()
+                || item
+                    .assigned
+                    .iter()
+                    .any(|assignee| !received.contains(&assignee.asker));
+            if unreached {
+                continue;
+            }
+            let note = note_for(todo_id);
+            if let Ok(item) = self.item_mut(todo_id) {
+                item.state = TodoState::Requested;
+                item.request = Some(TodoRequest {
+                    note,
+                    at: now,
+                    by: TodoCreator::Human,
+                });
+                item.updated_at = now;
+            }
+            self.choices.remove(&todo_id);
+            self.delivered.remove(&todo_id);
+            report.requested += 1;
+        }
+        if report.closed + report.requested > 0 {
+            self.persist(cx);
+            cx.notify();
+        }
+        if errors.is_empty() {
+            Ok(report)
+        } else {
+            Err(anyhow::anyhow!(errors.join("\n")))
+        }
     }
 
-    /// Lists of Codex terminal tabs have no asker to find them again after a
-    /// restart, so only lists with one are written, as for questions.
     fn persist(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else {
             return;
         };
         let previous = self.write_task.take();
-        let snapshot = serde_json::to_vec_pretty(
-            &self
-                .lists
-                .iter()
-                .filter(|list| list.asker.is_some())
-                .collect::<Vec<_>>(),
-        );
+        let snapshot = serde_json::to_vec_pretty(&TodoFile {
+            version: TODO_FILE_VERSION,
+            items: self.items.clone(),
+        });
         self.write_task = Some(cx.background_spawn(async move {
             if let Some(previous) = previous {
                 previous.await;
@@ -505,27 +1058,48 @@ impl InboxTodos {
 
 pub(crate) enum InboxTodoViewEvent {
     Send {
+        todo_ids: Vec<u64>,
+        notes: HashMap<u64, String>,
+    },
+    /// The user wants to pick a session for the item; the app shows the menu.
+    Assign {
         todo_id: u64,
-        notes: HashMap<String, String>,
+        position: Point<Pixels>,
+    },
+    /// Open the assignee's tab, or bring it back when it is closed.
+    OpenAssignee {
+        todo_id: u64,
+        asker: InboxAsker,
+    },
+    Unassign {
+        todo_id: u64,
+        asker: InboxAsker,
     },
 }
 
-pub(crate) struct ProcessedTodo {
-    item: InboxTodoItem,
-    choice: TodoChoice,
-    note: Option<String>,
+/// What the overview knows about one assignee that the view cannot find out
+/// itself: whether its tab is open and what state the agent is in.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AssigneeRow {
+    pub(crate) asker: InboxAsker,
+    pub(crate) label: String,
+    pub(crate) icon: Option<IconName>,
+    /// `None` while the tab is closed.
+    pub(crate) state_color: Option<Hsla>,
+    pub(crate) state_label: &'static str,
+    pub(crate) restoring: bool,
+    pub(crate) error: Option<String>,
 }
 
-/// Embedded answers for one agent in Task Overview.
+/// The To do list of one task (or task-less arena) in Task Overview.
 pub(crate) struct InboxTodoView {
     todos: Entity<InboxTodos>,
-    todo_id: u64,
-    note_editors: HashMap<String, Entity<Editor>>,
+    scope: TodoScope,
+    assignees: HashMap<u64, Vec<AssigneeRow>>,
+    note_editors: HashMap<u64, Entity<Editor>>,
     error: Option<String>,
-    processed: Vec<ProcessedTodo>,
-    show_processed: bool,
-    pub(crate) question_history: Vec<(String, String)>,
-    pub(crate) pending_questions: bool,
+    last_report: Option<SendReport>,
+    show_done: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -533,7 +1107,7 @@ pub(crate) struct InboxTodoView {
 impl InboxTodoView {
     pub(crate) fn new(
         todos: Entity<InboxTodos>,
-        todo_id: u64,
+        scope: TodoScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -542,13 +1116,12 @@ impl InboxTodoView {
         });
         let mut this = Self {
             todos,
-            todo_id,
+            scope,
+            assignees: HashMap::new(),
             note_editors: HashMap::new(),
             error: None,
-            processed: Vec::new(),
-            show_processed: false,
-            question_history: Vec::new(),
-            pending_questions: false,
+            last_report: None,
+            show_done: false,
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![subscription],
         };
@@ -556,103 +1129,28 @@ impl InboxTodoView {
         this
     }
 
-    /// The tab that wrote the list, as the app last found it in a pane.
-    pub(crate) fn owner_item_id(&self, cx: &App) -> Option<EntityId> {
-        self.todos
-            .read(cx)
-            .list(self.todo_id)?
-            .tab
-            .as_ref()?
-            .item
-            .upgrade()
-            .map(|item| item.item_id())
+    /// Re-points the view at another task. Note editors are kept: choices
+    /// live in the store across scopes, so their drafts must too.
+    pub(crate) fn set_scope(&mut self, scope: TodoScope, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.error = None;
+            self.last_report = None;
+            self.reconcile(window, cx);
+        }
     }
 
-    pub(crate) fn selected_items(
-        &self,
-        notes: &HashMap<String, String>,
-        cx: &App,
-    ) -> Vec<ProcessedTodo> {
-        let Some(list) = self.todos.read(cx).list(self.todo_id) else {
-            return Vec::new();
-        };
-        list.items
-            .iter()
-            .filter_map(|item| {
-                let choice = *list.choices.get(&item.title)?;
-                choice.allowed_for(item.kind).then(|| ProcessedTodo {
-                    item: item.clone(),
-                    choice,
-                    note: notes
-                        .get(&item.title)
-                        .filter(|note| !note.trim().is_empty())
-                        .cloned(),
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn record_processed(&mut self, items: Vec<ProcessedTodo>, cx: &mut Context<Self>) {
-        self.processed.extend(items);
-        cx.notify();
-    }
-
-    fn render_processed(&self, cx: &Context<Self>) -> impl IntoElement {
-        v_flex()
-            .min_w_0()
-            .flex_shrink_0()
-            .gap_2()
-            .when(!self.processed.is_empty() || !self.question_history.is_empty(), |column| {
-                column
-                    .child(
-                        Button::new(
-                            "processed-todos",
-                            format!(
-                                "{} Processed items · {}",
-                                if self.show_processed { "▾" } else { "▸" },
-                                self.processed.len() + self.question_history.len()
-                            ),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_processed = !this.show_processed;
-                            cx.notify();
-                        })),
-                    )
-                    .when(self.show_processed, |column| {
-                        column.children(self.question_history.iter().rev().map(|(question, resolution)| {
-                            v_flex().gap_1().p_2().border_1().border_color(cx.theme().colors().border_variant).rounded_md()
-                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(question.clone()))
-                                .child(div().text_sm().child(resolution.clone()))
-                        })).children(self.processed.iter().rev().map(|entry| {
-                            let state = match entry.choice {
-                                TodoChoice::Done => "Done",
-                                TodoChoice::Skip => "Skipped",
-                                TodoChoice::Go => "Requested",
-                            };
-                            v_flex()
-                                .min_w_0()
-                                .flex_shrink_0()
-                                .gap_1()
-                                .p_2()
-                                .border_1()
-                                .border_color(cx.theme().colors().border_variant)
-                                .rounded_md()
-                                .child(ui::Label::new(state))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(entry.item.title.clone()),
-                                )
-                                .when_some(entry.item.detail.clone(), |row, detail| {
-                                    row.child(div().text_sm().child(detail))
-                                })
-                                .when_some(entry.note.clone(), |row, note| {
-                                    row.child(div().text_sm().child(format!("Note: {note}")))
-                                })
-                        }))
-                    })
-            })
+    /// Called by the overview on every render; notifies only on a change so
+    /// the render loop settles.
+    pub(crate) fn set_assignees(
+        &mut self,
+        assignees: HashMap<u64, Vec<AssigneeRow>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.assignees != assignees {
+            self.assignees = assignees;
+            cx.notify();
+        }
     }
 
     pub(crate) fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
@@ -660,18 +1158,68 @@ impl InboxTodoView {
         cx.notify();
     }
 
-    /// Keeps one note editor per chosen item, so a replaced list keeps the
-    /// notes of the items that survived.
-    fn reconcile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let chosen: Vec<String> = self
+    pub(crate) fn set_report(&mut self, report: SendReport, cx: &mut Context<Self>) {
+        self.last_report = Some(report);
+        cx.notify();
+    }
+
+    /// Open items in scope: Pick (proposals) first, then You do, newest first
+    /// within each.
+    pub(crate) fn open_items(&self, cx: &App) -> Vec<TodoItem> {
+        let mut items: Vec<TodoItem> = self
             .todos
             .read(cx)
-            .list(self.todo_id)
-            .map(|list| list.choices.keys().cloned().collect())
-            .unwrap_or_default();
-        self.note_editors.retain(|title, _| chosen.contains(title));
-        for title in chosen {
-            if self.note_editors.contains_key(&title) {
+            .items()
+            .iter()
+            .filter(|item| item.is_open() && self.scope.contains(item))
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            kind_rank(a.kind)
+                .cmp(&kind_rank(b.kind))
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        items
+    }
+
+    fn done_items(&self, cx: &App) -> Vec<TodoItem> {
+        let mut items: Vec<TodoItem> = self
+            .todos
+            .read(cx)
+            .items()
+            .iter()
+            .filter(|item| !item.is_open() && self.scope.contains(item))
+            .cloned()
+            .collect();
+        items.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+        items
+    }
+
+    /// Keeps one note editor per chosen item. Editors of chosen items outside
+    /// the current scope are kept too: the choice is still in the store, and
+    /// the draft must be there when the user comes back.
+    fn reconcile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (chosen_anywhere, chosen_here): (Vec<u64>, Vec<u64>) = {
+            let todos = self.todos.read(cx);
+            let chosen_anywhere: Vec<u64> = todos
+                .items()
+                .iter()
+                .filter(|item| item.is_open() && todos.choice(item.id).is_some())
+                .map(|item| item.id)
+                .collect();
+            let chosen_here = todos
+                .items()
+                .iter()
+                .filter(|item| item.is_open() && self.scope.contains(item))
+                .filter(|item| todos.choice(item.id).is_some())
+                .map(|item| item.id)
+                .collect();
+            (chosen_anywhere, chosen_here)
+        };
+        self.note_editors
+            .retain(|todo_id, _| chosen_anywhere.contains(todo_id));
+        for todo_id in chosen_here {
+            if self.note_editors.contains_key(&todo_id) {
                 continue;
             }
             let editor = cx.new(|cx| {
@@ -685,89 +1233,180 @@ impl InboxTodoView {
                         cx.notify();
                     }
                 }));
-            self.note_editors.insert(title, editor);
+            self.note_editors.insert(todo_id, editor);
         }
-        cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
-    fn notes(&self, cx: &App) -> HashMap<String, String> {
+    fn notes(&self, cx: &App) -> HashMap<u64, String> {
         self.note_editors
             .iter()
-            .map(|(title, editor)| (title.clone(), editor.read(cx).text(cx)))
+            .map(|(todo_id, editor)| (*todo_id, editor.read(cx).text(cx)))
             .collect()
     }
 
-    pub(crate) fn preview(&self, cx: &App) -> Option<String> {
-        let list = self.todos.read(cx).list(self.todo_id)?;
-        todo_answer_message(&list.items, &list.choices, &self.notes(cx))
-    }
-
-    fn toggle(&mut self, title: String, choice: TodoChoice, cx: &mut Context<Self>) {
-        let current = self
-            .todos
-            .read(cx)
-            .list(self.todo_id)
-            .and_then(|list| list.choices.get(&title).copied());
+    fn toggle(&mut self, todo_id: u64, choice: TodoChoice, cx: &mut Context<Self>) {
+        let current = self.todos.read(cx).choice(todo_id);
         let next = (current != Some(choice)).then_some(choice);
         self.todos
-            .update(cx, |todos, cx| todos.set_choice(self.todo_id, &title, next, cx));
+            .update(cx, |todos, cx| todos.set_choice(todo_id, next, cx));
+    }
+
+    fn chosen_ids(&self, cx: &App) -> Vec<u64> {
+        let todos = self.todos.read(cx);
+        self.open_items(cx)
+            .iter()
+            .filter(|item| todos.choice(item.id).is_some())
+            .map(|item| item.id)
+            .collect()
     }
 
     /// The button is disabled when this does not hold; the keyboard shortcut
     /// says why instead.
-    fn send_problem(&self, cx: &App) -> Option<&'static str> {
-        if self.owner_item_id(cx).is_none() {
-            Some("The tab that wrote this list is not open.")
-        } else if self.preview(cx).is_none() {
-            Some("Choose Done, Go or Skip for at least one item.")
-        } else {
-            None
+    fn send_problem(&self, cx: &App) -> Option<String> {
+        let todos = self.todos.read(cx);
+        let chosen = self.chosen_ids(cx);
+        if chosen.is_empty() {
+            return Some("Choose Done, Go or Skip for at least one item.".to_string());
         }
+        for todo_id in chosen {
+            if todos.choice(todo_id) == Some(TodoChoice::Go)
+                && todos.item(todo_id).is_some_and(|item| item.assigned.is_empty())
+            {
+                return Some(format!("#{todo_id} needs a session before Go: use Assign."));
+            }
+        }
+        None
     }
 
     fn send_answers(&mut self, _: &SendAnswers, _window: &mut Window, cx: &mut Context<Self>) {
         match self.send_problem(cx) {
-            Some(problem) => self.set_error(Some(problem.to_string()), cx),
+            Some(problem) => self.set_error(Some(problem), cx),
             None => self.send(cx),
         }
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.last_report = None;
         cx.emit(InboxTodoViewEvent::Send {
-            todo_id: self.todo_id,
+            todo_ids: self.chosen_ids(cx),
             notes: self.notes(cx),
         });
         cx.notify();
     }
 
+    fn render_assignees(&self, item: &TodoItem, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let todo_id = item.id;
+        let rows = self.assignees.get(&todo_id).cloned().unwrap_or_default();
+        h_flex()
+            .flex_wrap()
+            .gap_2()
+            .items_center()
+            .text_xs()
+            .when(rows.is_empty(), |row| {
+                row.child(div().text_color(colors.text_muted).child("Unassigned"))
+            })
+            .children(rows.into_iter().enumerate().map(|(index, assignee)| {
+                let asker = assignee.asker.clone();
+                let unassign_asker = assignee.asker.clone();
+                let dot_color = assignee.state_color.unwrap_or(colors.text_muted);
+                let tooltip = match (&assignee.error, assignee.restoring, assignee.state_color) {
+                    (Some(error), _, _) => error.clone(),
+                    (None, true, _) => "Restoring the tab…".to_string(),
+                    (None, false, None) => "Tab closed · click to restore".to_string(),
+                    (None, false, Some(_)) => format!("{} · click to open", assignee.state_label),
+                };
+                h_flex()
+                    .id(SharedString::from(format!("todo-assignee-{todo_id}-{index}")))
+                    .gap_1()
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(colors.element_hover))
+                    .tooltip(ui::Tooltip::text(tooltip))
+                    .child(div().size(gpui::px(8.0)).rounded_full().bg(dot_color))
+                    .when_some(assignee.icon, |row, icon| {
+                        row.child(Icon::new(icon).size(IconSize::XSmall))
+                    })
+                    .child(
+                        div()
+                            .when(assignee.state_color.is_none(), |d| d.text_color(colors.text_muted))
+                            .child(assignee.label),
+                    )
+                    .child(
+                        ui::IconButton::new(
+                            SharedString::from(format!("todo-unassign-{todo_id}-{index}")),
+                            IconName::Close,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(ui::Tooltip::text("Unassign"))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(InboxTodoViewEvent::Unassign {
+                                todo_id,
+                                asker: unassign_asker.clone(),
+                            });
+                        })),
+                    )
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(InboxTodoViewEvent::OpenAssignee {
+                            todo_id,
+                            asker: asker.clone(),
+                        });
+                    }))
+            }))
+            .child(
+                Button::new(
+                    SharedString::from(format!("todo-assign-{todo_id}")),
+                    "Assign…",
+                )
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(InboxTodoViewEvent::Assign {
+                        todo_id,
+                        position: event.position(),
+                    });
+                })),
+            )
+    }
+
     fn render_item(
         &self,
         number: usize,
-        item: &InboxTodoItem,
+        item: &TodoItem,
         choice: Option<TodoChoice>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let todo_color = inbox_todo_color();
+        let todo_id = item.id;
         let choices: &[TodoChoice] = match item.kind {
             InboxTodoKind::UserTask => &[TodoChoice::Done],
             InboxTodoKind::Proposal => &[TodoChoice::Go, TodoChoice::Skip],
         };
         let buttons = choices.iter().map(|option| {
-            let title = item.title.clone();
             let option = *option;
             Button::new(
-                SharedString::from(format!("todo-{number}-{}", option.label())),
+                SharedString::from(format!("todo-{todo_id}-{}", option.label())),
                 option.label(),
             )
             .label_size(LabelSize::Small)
             .toggle_state(choice == Some(option))
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.toggle(title.clone(), option, cx);
+                this.toggle(todo_id, option, cx);
             }))
         });
+        let state_label = match item.state {
+            TodoState::Open => None,
+            TodoState::Assigned => Some("Assigned"),
+            TodoState::Requested => Some("Requested"),
+            TodoState::Done => Some("Done"),
+        };
         v_flex()
             .flex_shrink_0()
             .min_w_0()
@@ -789,7 +1428,7 @@ impl InboxTodoView {
                         div()
                             .text_xs()
                             .text_color(colors.text_muted)
-                            .child(number.to_string()),
+                            .child(format!("{number}.")),
                     )
                     .child(
                         div()
@@ -798,6 +1437,9 @@ impl InboxTodoView {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(item.title.clone()),
                     )
+                    .when_some(state_label, |row, label| {
+                        row.child(div().text_xs().text_color(colors.text_muted).child(label))
+                    })
                     .children(buttons),
             )
             .when_some(item.detail.clone(), |d, detail| {
@@ -809,7 +1451,19 @@ impl InboxTodoView {
                 )
             })
             .when_some(
-                choice.and_then(|_| self.note_editors.get(&item.title).cloned()),
+                item.request.as_ref().and_then(|request| request.note.clone()),
+                |d, note| {
+                    d.child(
+                        div()
+                            .text_sm()
+                            .text_color(colors.text_accent)
+                            .child(format!("Condition: {note}")),
+                    )
+                },
+            )
+            .child(self.render_assignees(item, cx))
+            .when_some(
+                choice.and_then(|_| self.note_editors.get(&todo_id).cloned()),
                 |d, editor| {
                     d.child(
                         div()
@@ -823,10 +1477,84 @@ impl InboxTodoView {
                 },
             )
     }
+
+    fn render_done(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let done = self.done_items(cx);
+        let colors = cx.theme().colors().clone();
+        v_flex()
+            .min_w_0()
+            .flex_shrink_0()
+            .gap_2()
+            .when(!done.is_empty(), |column| {
+                column
+                    .child(
+                        Button::new(
+                            "done-todos",
+                            format!(
+                                "{} Done · {}",
+                                if self.show_done { "▾" } else { "▸" },
+                                done.len()
+                            ),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_done = !this.show_done;
+                            cx.notify();
+                        })),
+                    )
+                    .when(self.show_done, |column| {
+                        column.children(done.into_iter().map(|item| {
+                            let (state, note) = match &item.resolution {
+                                Some(resolution) => (
+                                    match resolution.outcome {
+                                        TodoOutcome::Completed => "Done",
+                                        TodoOutcome::Skipped => "Skipped",
+                                        TodoOutcome::Dismissed => "Dismissed",
+                                    },
+                                    resolution.note.clone(),
+                                ),
+                                None => ("Done", None),
+                            };
+                            v_flex()
+                                .min_w_0()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .p_2()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .rounded_md()
+                                .child(ui::Label::new(state))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("#{} {}", item.id, item.title)),
+                                )
+                                .when_some(item.detail.clone(), |row, detail| {
+                                    row.child(div().text_sm().child(detail))
+                                })
+                                .when_some(
+                                    item.request.as_ref().and_then(|request| request.note.clone()),
+                                    |row, condition| {
+                                        row.child(div().text_sm().child(format!("Condition: {condition}")))
+                                    },
+                                )
+                                .when_some(note, |row, note| {
+                                    row.child(div().text_sm().child(format!("Note: {note}")))
+                                })
+                        }))
+                    })
+            })
+    }
+}
+
+fn kind_rank(kind: InboxTodoKind) -> u8 {
+    match kind {
+        InboxTodoKind::Proposal => 0,
+        InboxTodoKind::UserTask => 1,
+    }
 }
 
 impl EventEmitter<InboxTodoViewEvent> for InboxTodoView {}
-impl EventEmitter<ItemEvent> for InboxTodoView {}
 
 impl Focusable for InboxTodoView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -837,30 +1565,14 @@ impl Focusable for InboxTodoView {
 impl Render for InboxTodoView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let todos = self.todos.read(cx);
-        let Some(list) = todos.list(self.todo_id) else {
-            return v_flex()
-                .id("inbox-todo")
-                .w_full()
-                .p_4()
-                .child(self.render_processed(cx))
-                .track_focus(&self.focus_handle)
-                .bg(colors.editor_background)
-                .when(!self.pending_questions, |column| column.child(
-                    div().text_color(colors.text_muted).child("No pending To do items.")
-                ))
-                .into_any_element();
+        let items = self.open_items(cx);
+        let choices: Vec<Option<TodoChoice>> = {
+            let todos = self.todos.read(cx);
+            items.iter().map(|item| todos.choice(item.id)).collect()
         };
-        let items: Vec<(usize, InboxTodoItem, Option<TodoChoice>)> = list
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (index + 1, item.clone(), list.choices.get(&item.title).copied()))
-            .collect();
-        let owner_open = self.owner_item_id(cx).is_some();
-        let preview = self.preview(cx);
         let can_send = self.send_problem(cx).is_none();
-        let has_choices = !list.choices.is_empty();
+        let has_choices = choices.iter().any(|choice| choice.is_some());
+        let chosen_ids = self.chosen_ids(cx);
 
         let group = |label: &'static str, hint: &'static str| {
             h_flex()
@@ -875,18 +1587,20 @@ impl Render for InboxTodoView {
                 )
                 .child(div().text_xs().text_color(colors.text_placeholder).child(hint))
         };
-        let user_tasks: Vec<_> = items
-            .iter()
-            .filter(|(_, item, _)| item.kind == InboxTodoKind::UserTask)
-            .map(|(number, item, choice)| self.render_item(*number, item, *choice, cx).into_any_element())
-            .collect();
-        let proposals: Vec<_> = items
-            .iter()
-            .filter(|(_, item, _)| item.kind == InboxTodoKind::Proposal)
-            .map(|(number, item, choice)| self.render_item(*number, item, *choice, cx).into_any_element())
-            .collect();
-        let error = self.error.clone().or_else(|| {
-            (!owner_open).then(|| "The tab that wrote this list is not open.".to_string())
+        let mut proposals = Vec::new();
+        let mut user_tasks = Vec::new();
+        for (index, (item, choice)) in items.iter().zip(choices).enumerate() {
+            let element = self.render_item(index + 1, item, choice, cx).into_any_element();
+            match item.kind {
+                InboxTodoKind::Proposal => proposals.push(element),
+                InboxTodoKind::UserTask => user_tasks.push(element),
+            }
+        }
+        let report = self.last_report.as_ref().map(|report| {
+            format!(
+                "Sent: {} requested, {} closed.",
+                report.requested, report.closed
+            )
         });
 
         v_flex()
@@ -896,77 +1610,63 @@ impl Render for InboxTodoView {
             .w_full()
             .min_w_0()
             .flex_shrink_0()
-            .p_4()
             .gap_2()
             .track_focus(&self.focus_handle)
-            .bg(colors.editor_background)
-            .when(!user_tasks.is_empty(), |d| {
-                d.child(group("You do", "Done when finished"))
-                    .children(user_tasks)
+            .when(items.is_empty(), |column| {
+                column.child(div().text_color(colors.text_muted).child("No pending To do items."))
             })
             .when(!proposals.is_empty(), |d| {
                 d.child(group("Pick", "Go to have the agent do it, Skip to drop it"))
                     .children(proposals)
             })
-            .child(
-                v_flex()
-                    .mt_3()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.text_muted)
-                            .child("Message"),
-                    )
-                    .child(
-                        div()
-                            .p_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .font_family("monospace")
-                            .text_sm()
-                            .text_color(colors.text_muted)
-                            .whitespace_normal()
-                            .child(preview.unwrap_or_else(|| "Nothing chosen yet.".to_string())),
-                    )
-                    .when_some(error, |d, error| {
-                        d.child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().status().error)
-                                .child(error),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("inbox-todo-send", "Send")
-                                    .disabled(!can_send)
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                        this.send(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("inbox-todo-clear", "Clear choices")
-                                    .disabled(!has_choices)
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                        let todo_id = this.todo_id;
-                                        this.todos
-                                            .update(cx, |todos, cx| todos.clear_choices(todo_id, cx));
-                                    })),
-                            )
-                            .child(
+            .when(!user_tasks.is_empty(), |d| {
+                d.child(group("You do", "Done when finished")).children(user_tasks)
+            })
+            .when(!items.is_empty(), |column| {
+                column.child(
+                    v_flex()
+                        .mt_2()
+                        .gap_1()
+                        .when_some(self.error.clone(), |d, error| {
+                            d.child(
                                 div()
-                                    .text_xs()
-                                    .text_color(colors.text_placeholder)
-                                    .child("cmd-enter sends. Answered items leave the list; the rest stay."),
-                            ),
-                    ),
-            )
-            .child(self.render_processed(cx))
+                                    .text_sm()
+                                    .text_color(cx.theme().status().error)
+                                    .child(error),
+                            )
+                        })
+                        .when_some(report, |d, report| {
+                            d.child(div().text_sm().text_color(colors.text_muted).child(report))
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("inbox-todo-send", "Send")
+                                        .disabled(!can_send)
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                            this.send(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("inbox-todo-clear", "Clear choices")
+                                        .disabled(!has_choices)
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                            let ids = chosen_ids.clone();
+                                            this.todos
+                                                .update(cx, |todos, cx| todos.clear_choices(&ids, cx));
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(colors.text_placeholder)
+                                        .child("cmd-enter sends. Go asks the assigned agent; it closes the item with `todo done` when finished."),
+                                ),
+                        ),
+                )
+            })
+            .child(self.render_done(cx))
             .into_any_element()
     }
 }
@@ -976,98 +1676,61 @@ mod tests {
     // Not `use super::*`: that would pull gpui's `test` attribute macro into
     // scope and make `#[test]` expand recursively.
     use super::{
-        InboxTodoView, InboxTodoViewEvent, InboxTodos, PendingRestore,
-        RestoreObservation, RestoreOutcome, RestorePlan, SendAnswers, TodoChoice,
-        acp_restore_outcome, advance_pending_restores, carry_todo_choices,
-        find_item_location, record_restore_launch,
-        todo_answer_message, todo_items_after_send, todo_restore_plan,
+        Assignee, InboxTodoKind, InboxTodoView, InboxTodoViewEvent, InboxTodos, PendingRestore,
+        RestoreObservation, RestoreOutcome, RestorePlan, SendAnswers, TodoChoice, TodoCreator,
+        TodoDraft, TodoItem, TodoOutcome, TodoScope, TodoState, acp_restore_outcome,
+        advance_pending_restores, find_item_location, parse_todo_file, prune_done,
+        record_restore_launch, todo_request_message, todo_restore_plan,
     };
-    use crate::{InboxAsker, InboxTodoList};
-    use std::path::PathBuf;
+    use crate::InboxAsker;
     use crate::arena::Arena;
-    use crate::{InboxTab, InboxTodoItem, InboxTodoKind};
     use fs::FakeFs;
     use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, VisualContext as _, VisualTestContext};
     use project::Project;
     use settings::SettingsStore;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
-    use workspace::ItemHandle as _;
+    use uuid::Uuid;
     use workspace::item::test::TestItem;
 
-    fn item(kind: InboxTodoKind, title: &str) -> InboxTodoItem {
-        InboxTodoItem {
+    fn claude(session: &str) -> InboxAsker {
+        InboxAsker::ClaudeSession {
+            session_id: session.to_string(),
+        }
+    }
+
+    fn assignee(session: &str, path: Option<&str>) -> Assignee {
+        Assignee {
+            asker: claude(session),
+            arena_path: path.map(PathBuf::from),
+            arena_name: "zed".to_string(),
+        }
+    }
+
+    fn draft(kind: InboxTodoKind, title: &str, task_id: Option<Uuid>) -> TodoDraft {
+        TodoDraft {
+            task_id,
+            arena_path: Some(PathBuf::from("/src/zed")),
+            arena_name: "zed".to_string(),
+            branch: None,
             kind,
             title: title.to_string(),
             detail: None,
+            created_by: TodoCreator::Human,
+            assignee: None,
         }
     }
 
-    fn test_owner() -> super::TodoOwner {
-        super::TodoOwner {
-            title: "Fix the Inbox".to_string(),
-            arena_name: "zed".to_string(),
-            arena_path: None,
-            branch: None,
+    fn session_draft(kind: InboxTodoKind, title: &str, session: &str, unassigned: bool) -> TodoDraft {
+        TodoDraft {
+            created_by: TodoCreator::Session {
+                asker: claude(session),
+            },
+            assignee: (!unassigned).then(|| assignee(session, Some("/src/zed"))),
+            ..draft(kind, title, None)
         }
-    }
-
-    fn sample_items() -> Vec<InboxTodoItem> {
-        vec![
-            item(InboxTodoKind::UserTask, "Check the lane"),
-            item(InboxTodoKind::Proposal, "Add tests"),
-            item(InboxTodoKind::Proposal, "Open a PR"),
-        ]
-    }
-
-    #[test]
-    fn the_answer_numbers_items_like_todo_list_and_repeats_titles() {
-        let items = sample_items();
-        let choices = HashMap::from([
-            ("Check the lane".to_string(), TodoChoice::Done),
-            ("Open a PR".to_string(), TodoChoice::Skip),
-        ]);
-        let notes = HashMap::from([
-            ("Open a PR".to_string(), "  not yet ".to_string()),
-            ("Check the lane".to_string(), "   ".to_string()),
-        ]);
-        assert_eq!(
-            todo_answer_message(&items, &choices, &notes).as_deref(),
-            Some("To do\nDone: 1 Check the lane\nSkip: 3 Open a PR — Note: not yet")
-        );
-        assert_eq!(todo_answer_message(&items, &HashMap::new(), &notes), None);
-    }
-
-    #[test]
-    fn choices_survive_a_replacement_only_where_they_still_apply() {
-        let choices = HashMap::from([
-            ("Check the lane".to_string(), TodoChoice::Done),
-            ("Add tests".to_string(), TodoChoice::Go),
-            ("Open a PR".to_string(), TodoChoice::Skip),
-        ]);
-        let replaced = vec![
-            // Now a proposal: Done no longer fits.
-            item(InboxTodoKind::Proposal, "Check the lane"),
-            item(InboxTodoKind::Proposal, "Add tests"),
-            item(InboxTodoKind::UserTask, "Link the skill"),
-        ];
-        assert_eq!(
-            carry_todo_choices(&choices, &replaced),
-            HashMap::from([("Add tests".to_string(), TodoChoice::Go)])
-        );
-        assert_eq!(
-            todo_items_after_send(&sample_items(), &choices),
-            Vec::<InboxTodoItem>::new()
-        );
-        let titles: Vec<String> = todo_items_after_send(
-            &sample_items(),
-            &HashMap::from([("Add tests".to_string(), TodoChoice::Go)]),
-        )
-        .into_iter()
-        .map(|item| item.title)
-        .collect();
-        assert_eq!(titles, vec!["Check the lane", "Open a PR"]);
     }
 
     fn init(cx: &mut TestAppContext) {
@@ -1080,6 +1743,484 @@ mod tests {
             editor::init(cx);
             release_channel::init(semver::Version::new(0, 1, 0), cx);
         });
+    }
+
+    fn store(cx: &mut TestAppContext) -> Entity<InboxTodos> {
+        cx.new(|_| InboxTodos::new(None))
+    }
+
+    #[test]
+    fn task_id_is_authoritative_for_scope_matching() {
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        let mut item = TodoItem {
+            id: 1,
+            task_id: Some(task_a),
+            arena_path: Some(PathBuf::from("/shared")),
+            arena_name: "shared".to_string(),
+            branch: None,
+            kind: InboxTodoKind::Proposal,
+            title: "x".to_string(),
+            detail: None,
+            created_by: TodoCreator::Human,
+            assigned: Vec::new(),
+            state: TodoState::Open,
+            request: None,
+            resolution: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let scope_a = TodoScope {
+            task_id: Some(task_a),
+            arena_paths: vec![],
+            arena_names: vec![],
+        };
+        // Task B shares the worktree: the item still belongs to A only.
+        let scope_b = TodoScope {
+            task_id: Some(task_b),
+            arena_paths: vec![PathBuf::from("/shared")],
+            arena_names: vec!["shared".to_string()],
+        };
+        let arena_scope = TodoScope {
+            task_id: None,
+            arena_paths: vec![PathBuf::from("/shared")],
+            arena_names: vec!["shared".to_string()],
+        };
+        assert!(scope_a.contains(&item));
+        assert!(!scope_b.contains(&item));
+        assert!(!arena_scope.contains(&item));
+
+        // Task-less items fall back to the path, then the name, and so show
+        // under every scope that includes their arena.
+        item.task_id = None;
+        assert!(arena_scope.contains(&item));
+        assert!(scope_b.contains(&item));
+        assert!(!scope_a.contains(&item));
+        item.arena_path = None;
+        assert!(arena_scope.contains(&item));
+        item.arena_name = "other".to_string();
+        assert!(!arena_scope.contains(&item));
+    }
+
+    #[gpui::test]
+    fn adding_sets_the_state_from_creator_and_assignee(cx: &mut TestAppContext) {
+        let todos = store(cx);
+        let mut next_id = 7;
+        let (own, unassigned, human) = todos.update(cx, |todos, cx| {
+            (
+                todos.add(session_draft(InboxTodoKind::Proposal, "Add tests", "s1", false), &mut next_id, cx).unwrap(),
+                todos.add(session_draft(InboxTodoKind::UserTask, "Check CI", "s1", true), &mut next_id, cx).unwrap(),
+                todos.add(draft(InboxTodoKind::Proposal, "Human idea", None), &mut next_id, cx).unwrap(),
+            )
+        });
+        assert_eq!((own, unassigned, human, next_id), (7, 8, 9, 10));
+        todos.read_with(cx, |todos, _| {
+            let own = todos.item(own).unwrap();
+            assert_eq!(own.state, TodoState::Requested);
+            assert!(own.request.as_ref().is_some_and(|request| request.note.is_none()));
+            assert!(own.is_assigned_to(&claude("s1")));
+            assert_eq!(todos.item(unassigned).unwrap().state, TodoState::Open);
+            assert_eq!(todos.item(human).unwrap().state, TodoState::Open);
+        });
+        let rejected = todos.update(cx, |todos, cx| {
+            todos.add(draft(InboxTodoKind::Proposal, "   ", None), &mut next_id, cx)
+        });
+        assert!(rejected.is_err());
+        let long = "x".repeat(super::MAX_TODO_TITLE_CHARS + 1);
+        let rejected = todos.update(cx, |todos, cx| {
+            todos.add(draft(InboxTodoKind::Proposal, &long, None), &mut next_id, cx)
+        });
+        assert!(rejected.is_err());
+    }
+
+    #[gpui::test]
+    fn only_assignees_close_or_edit_but_anyone_assigns(cx: &mut TestAppContext) {
+        let todos = store(cx);
+        let mut next_id = 1;
+        let id = todos.update(cx, |todos, cx| {
+            todos.add(draft(InboxTodoKind::Proposal, "Add tests", None), &mut next_id, cx).unwrap()
+        });
+        let stranger = TodoCreator::Session { asker: claude("s2") };
+        let result = todos.update(cx, |todos, cx| {
+            todos.done(id, stranger.clone(), TodoOutcome::Completed, None, cx)
+        });
+        assert!(result.is_err());
+        let result = todos.update(cx, |todos, cx| todos.update(id, &stranger, Some("New"), None, cx));
+        assert!(result.is_err());
+
+        // A stranger may still assign (itself or another session), then close.
+        todos.update(cx, |todos, cx| todos.assign(id, assignee("s2", None), cx)).unwrap();
+        todos.read_with(cx, |todos, _| {
+            assert_eq!(todos.item(id).unwrap().state, TodoState::Assigned);
+        });
+        todos.update(cx, |todos, cx| todos.update(id, &stranger, Some("New title"), Some(" more "), cx)).unwrap();
+        todos.update(cx, |todos, cx| {
+            todos.done(id, stranger.clone(), TodoOutcome::Completed, Some("pushed"), cx)
+        }).unwrap();
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(id).unwrap();
+            assert_eq!(item.state, TodoState::Done);
+            assert_eq!(item.title, "New title");
+            assert_eq!(item.detail.as_deref(), Some("more"));
+            assert!(item.request.is_none());
+            let resolution = item.resolution.as_ref().unwrap();
+            assert_eq!(resolution.outcome, TodoOutcome::Completed);
+            assert_eq!(resolution.note.as_deref(), Some("pushed"));
+        });
+        // Done items reject every further write.
+        assert!(todos.update(cx, |todos, cx| todos.assign(id, assignee("s3", None), cx)).is_err());
+    }
+
+    #[gpui::test]
+    fn take_requests_and_unassign_reopens(cx: &mut TestAppContext) {
+        let todos = store(cx);
+        let mut next_id = 1;
+        let id = todos.update(cx, |todos, cx| {
+            todos.add(draft(InboxTodoKind::UserTask, "Verify", None), &mut next_id, cx).unwrap()
+        });
+        todos.update(cx, |todos, cx| todos.take(id, assignee("s1", Some("/src/zed")), cx)).unwrap();
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(id).unwrap();
+            assert_eq!(item.state, TodoState::Requested);
+            assert_eq!(
+                item.request.as_ref().map(|request| request.by.clone()),
+                Some(TodoCreator::Session { asker: claude("s1") })
+            );
+        });
+        assert!(todos.update(cx, |todos, cx| todos.unassign(id, &claude("nobody"), cx)).is_err());
+        todos.update(cx, |todos, cx| todos.unassign(id, &claude("s1"), cx)).unwrap();
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(id).unwrap();
+            assert!(item.assigned.is_empty());
+            assert_eq!(item.state, TodoState::Open);
+        });
+
+        // A user's Go condition outlives unassign + take by another session.
+        let requested = todos.update(cx, |todos, cx| {
+            let id = todos.add(draft(InboxTodoKind::Proposal, "Conditioned", None), &mut next_id, cx).unwrap();
+            todos.assign(id, assignee("s1", None), cx).unwrap();
+            todos.set_choice(id, Some(TodoChoice::Go), cx);
+            todos.send(&[id], &HashMap::from([(id, "only on main".to_string())]), |_, _, _| Ok(()), cx).unwrap();
+            todos.unassign(id, &claude("s1"), cx).unwrap();
+            todos.take(id, assignee("s2", None), cx).unwrap();
+            id
+        });
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(requested).unwrap();
+            assert_eq!(item.state, TodoState::Requested);
+            let request = item.request.as_ref().unwrap();
+            assert_eq!(request.note.as_deref(), Some("only on main"));
+            assert_eq!(request.by, TodoCreator::Human);
+        });
+    }
+
+    #[gpui::test]
+    fn sending_closes_done_and_skip_and_requests_go_per_session(cx: &mut TestAppContext) {
+        let todos = store(cx);
+        let mut next_id = 1;
+        let (done_id, skip_id, go_a, go_b, go_unassigned) = todos.update(cx, |todos, cx| {
+            let done_id = todos.add(draft(InboxTodoKind::UserTask, "Check the lane", None), &mut next_id, cx).unwrap();
+            let skip_id = todos.add(draft(InboxTodoKind::Proposal, "Open a PR", None), &mut next_id, cx).unwrap();
+            let go_a = todos.add(draft(InboxTodoKind::Proposal, "Add tests", None), &mut next_id, cx).unwrap();
+            let go_b = todos.add(draft(InboxTodoKind::Proposal, "Fix flake", None), &mut next_id, cx).unwrap();
+            let go_unassigned = todos.add(draft(InboxTodoKind::Proposal, "Nobody", None), &mut next_id, cx).unwrap();
+            todos.assign(go_a, assignee("s1", None), cx).unwrap();
+            todos.assign(go_b, assignee("s1", None), cx).unwrap();
+            todos.set_choice(done_id, Some(TodoChoice::Done), cx);
+            todos.set_choice(skip_id, Some(TodoChoice::Skip), cx);
+            todos.set_choice(go_a, Some(TodoChoice::Go), cx);
+            todos.set_choice(go_b, Some(TodoChoice::Go), cx);
+            todos.set_choice(go_unassigned, Some(TodoChoice::Go), cx);
+            // Done does not fit a proposal: ignored.
+            todos.set_choice(skip_id, Some(TodoChoice::Done), cx);
+            (done_id, skip_id, go_a, go_b, go_unassigned)
+        });
+        let notes = HashMap::from([
+            (go_a, "with the Failed lane".to_string()),
+            (skip_id, "not now".to_string()),
+        ]);
+        let ids = [done_id, skip_id, go_a, go_b, go_unassigned];
+
+        // Delivery rejected: the Go items stay with their choices; the rest
+        // still closed. The unassigned Go is reported.
+        let result = todos.update(cx, |todos, cx| {
+            todos.send(&ids, &notes, |_, _, _| anyhow::bail!("tab is busy"), cx)
+        });
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("tab is busy") && error.contains("assign a session"));
+        todos.read_with(cx, |todos, _| {
+            assert_eq!(todos.item(done_id).unwrap().state, TodoState::Done);
+            let skipped = todos.item(skip_id).unwrap();
+            assert_eq!(skipped.resolution.as_ref().unwrap().outcome, TodoOutcome::Skipped);
+            assert_eq!(skipped.resolution.as_ref().unwrap().note.as_deref(), Some("not now"));
+            assert!(skipped.request.is_none());
+            assert_eq!(todos.item(go_a).unwrap().state, TodoState::Assigned);
+            assert_eq!(todos.choice(go_a), Some(TodoChoice::Go));
+        });
+
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let result = todos.update(cx, |todos, cx| {
+            let delivered = delivered.clone();
+            todos.send(&[go_a, go_b], &notes, move |asker, text, _| {
+                delivered.borrow_mut().push((asker.clone(), text.to_string()));
+                Ok(())
+            }, cx)
+        });
+        let report = result.expect("delivered");
+        assert_eq!((report.requested, report.closed), (2, 0));
+        let delivered = delivered.borrow();
+        assert_eq!(delivered.len(), 1, "one message per session");
+        assert_eq!(delivered[0].0, claude("s1"));
+        assert_eq!(
+            delivered[0].1,
+            format!(
+                "[from: Task Overview]\nTo do\nGo: #{go_a} Add tests — Note: with the Failed lane\nGo: #{go_b} Fix flake\nRun `agentium todo done <id>` for each item once it is finished."
+            )
+        );
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(go_a).unwrap();
+            assert_eq!(item.state, TodoState::Requested);
+            assert_eq!(item.request.as_ref().unwrap().note.as_deref(), Some("with the Failed lane"));
+            assert_eq!(item.request.as_ref().unwrap().by, TodoCreator::Human);
+            assert!(todos.choice(go_a).is_none());
+        });
+        // Two assignees: both get a message naming the item, and the item is
+        // Requested only once both were reached.
+        let shared = todos.update(cx, |todos, cx| {
+            let shared = todos.add(draft(InboxTodoKind::Proposal, "Shared", None), &mut next_id, cx).unwrap();
+            todos.assign(shared, assignee("s1", None), cx).unwrap();
+            todos.assign(shared, assignee("s2", None), cx).unwrap();
+            todos.set_choice(shared, Some(TodoChoice::Go), cx);
+            shared
+        });
+        let shared_notes = HashMap::from([(shared, "carefully".to_string())]);
+        let result = todos.update(cx, |todos, cx| {
+            todos.send(&[shared], &shared_notes, |asker, _, _| {
+                if *asker == claude("s2") { anyhow::bail!("s2 is busy") } else { Ok(()) }
+            }, cx)
+        });
+        assert!(result.is_err());
+        todos.read_with(cx, |todos, _| {
+            assert_eq!(todos.item(shared).unwrap().state, TodoState::Assigned);
+            assert_eq!(todos.choice(shared), Some(TodoChoice::Go));
+        });
+        // The retry reaches only the session that missed the request.
+        let reached = Rc::new(RefCell::new(Vec::new()));
+        let report = todos.update(cx, |todos, cx| {
+            let reached = reached.clone();
+            todos.send(&[shared], &shared_notes, move |asker, _, _| {
+                reached.borrow_mut().push(asker.clone());
+                Ok(())
+            }, cx)
+        }).expect("both reached");
+        assert_eq!(report.requested, 1);
+        assert_eq!(*reached.borrow(), vec![claude("s2")]);
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(shared).unwrap();
+            assert_eq!(item.state, TodoState::Requested);
+            assert_eq!(item.request.as_ref().unwrap().note.as_deref(), Some("carefully"));
+        });
+
+        // Mixed retry: X (A done, B pending) sent together with Y (A busy).
+        // B receives X, A rejects Y; X is Requested, Y is not.
+        let (x, y) = todos.update(cx, |todos, cx| {
+            let x = todos.add(draft(InboxTodoKind::Proposal, "X", None), &mut next_id, cx).unwrap();
+            let y = todos.add(draft(InboxTodoKind::Proposal, "Y", None), &mut next_id, cx).unwrap();
+            todos.assign(x, assignee("s1", None), cx).unwrap();
+            todos.assign(x, assignee("s2", None), cx).unwrap();
+            todos.assign(y, assignee("s1", None), cx).unwrap();
+            todos.set_choice(x, Some(TodoChoice::Go), cx);
+            todos.set_choice(y, Some(TodoChoice::Go), cx);
+            todos.send(&[x], &HashMap::new(), |asker, _, _| {
+                if *asker == claude("s2") { anyhow::bail!("s2 is busy") } else { Ok(()) }
+            }, cx).unwrap_err();
+            (x, y)
+        });
+        let result = todos.update(cx, |todos, cx| {
+            todos.send(&[x, y], &HashMap::new(), |asker, _, _| {
+                if *asker == claude("s1") { anyhow::bail!("s1 is busy") } else { Ok(()) }
+            }, cx)
+        });
+        assert!(result.is_err());
+        todos.read_with(cx, |todos, _| {
+            assert_eq!(todos.item(x).unwrap().state, TodoState::Requested);
+            assert_eq!(todos.item(y).unwrap().state, TodoState::Assigned);
+            assert_eq!(todos.choice(y), Some(TodoChoice::Go));
+        });
+
+        // Editing the note after a partial delivery starts over: every
+        // session gets the new condition, and that is what is recorded.
+        let edited = todos.update(cx, |todos, cx| {
+            let id = todos.add(draft(InboxTodoKind::Proposal, "Edited", None), &mut next_id, cx).unwrap();
+            todos.assign(id, assignee("s1", None), cx).unwrap();
+            todos.assign(id, assignee("s2", None), cx).unwrap();
+            todos.set_choice(id, Some(TodoChoice::Go), cx);
+            todos.send(&[id], &HashMap::from([(id, "N1".to_string())]), |asker, _, _| {
+                if *asker == claude("s2") { anyhow::bail!("s2 is busy") } else { Ok(()) }
+            }, cx).unwrap_err();
+            id
+        });
+        let reached = Rc::new(RefCell::new(Vec::new()));
+        todos.update(cx, |todos, cx| {
+            let reached = reached.clone();
+            todos.send(&[edited], &HashMap::from([(edited, "N2".to_string())]), move |asker, text, _| {
+                reached.borrow_mut().push((asker.clone(), text.contains("Note: N2")));
+                Ok(())
+            }, cx)
+        }).expect("resent to both");
+        assert_eq!(reached.borrow().len(), 2);
+        assert!(reached.borrow().iter().all(|(_, has_new_note)| *has_new_note));
+        todos.read_with(cx, |todos, _| {
+            assert_eq!(todos.item(edited).unwrap().request.as_ref().unwrap().note.as_deref(), Some("N2"));
+        });
+
+        // An overlong Go note is rejected before anything is sent.
+        let long_id = todos.update(cx, |todos, cx| {
+            let id = todos.add(draft(InboxTodoKind::Proposal, "Long", None), &mut next_id, cx).unwrap();
+            todos.assign(id, assignee("s1", None), cx).unwrap();
+            todos.set_choice(id, Some(TodoChoice::Go), cx);
+            id
+        });
+        let long_note = HashMap::from([(long_id, "x".repeat(super::MAX_TODO_TEXT_CHARS + 1))]);
+        let sent = Rc::new(Cell::new(false));
+        let result = todos.update(cx, |todos, cx| {
+            let sent = sent.clone();
+            todos.send(&[long_id], &long_note, move |_, _, _| { sent.set(true); Ok(()) }, cx)
+        });
+        assert!(result.is_err() && !sent.get());
+        assert!(todos.read_with(cx, |todos, _| todos.item(long_id).unwrap().state == TodoState::Assigned));
+
+        // The condition survives reassignment and closing.
+        todos.update(cx, |todos, cx| {
+            todos.unassign(go_a, &claude("s1"), cx).unwrap();
+            todos.assign(go_a, assignee("s2", None), cx).unwrap();
+            todos.done(go_a, TodoCreator::Session { asker: claude("s2") }, TodoOutcome::Completed, None, cx).unwrap();
+        });
+        todos.read_with(cx, |todos, _| {
+            let item = todos.item(go_a).unwrap();
+            assert_eq!(item.request.as_ref().unwrap().note.as_deref(), Some("with the Failed lane"));
+            assert!(item.resolution.is_some());
+        });
+    }
+
+    #[test]
+    fn legacy_lists_become_items_with_the_tab_as_assignee() {
+        let task = Uuid::new_v4();
+        let content = serde_json::json!([
+            {
+                "id": 5,
+                "title": "Fix the Inbox",
+                "arena_name": "zed",
+                "updated_at": "2026-10-01T00:00:00Z",
+                "asker": { "kind": "claude_session", "session_id": "c8832ec2" },
+                "items": [
+                    { "kind": "user_task", "title": "Check the lane", "detail": "red" },
+                    { "kind": "proposal", "title": "Add tests" }
+                ],
+                "branch": "feature",
+                "arena_path": "/src/zed"
+            },
+            {
+                "id": 2,
+                "title": "shell",
+                "arena_name": "scala",
+                "updated_at": "2026-10-02T00:00:00Z",
+                "asker": null,
+                "items": [{ "kind": "proposal", "title": "Legacy" }]
+            }
+        ]);
+        let resolve = |path: &Path| (path == Path::new("/src/zed")).then_some(task);
+        let mut next_id = 10;
+        let (items, migrated) = parse_todo_file(content.to_string().as_bytes(), &resolve, &mut next_id)
+            .expect("migrated");
+        assert!(migrated);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, 10);
+        assert_eq!(items[0].task_id, Some(task));
+        assert_eq!(items[0].branch.as_deref(), Some("feature"));
+        assert_eq!(items[0].state, TodoState::Requested);
+        assert_eq!(items[0].assigned, vec![assignee("c8832ec2", Some("/src/zed"))]);
+        assert_eq!(items[0].created_by, TodoCreator::Session { asker: claude("c8832ec2") });
+        assert_eq!(items[0].detail.as_deref(), Some("red"));
+        assert_eq!(items[2].task_id, None);
+        assert_eq!(items[2].arena_path, None);
+        assert_eq!(items[2].arena_name, "scala");
+        assert_eq!(items[2].state, TodoState::Open);
+        assert_eq!(items[2].created_by, TodoCreator::Human);
+        assert!(items[2].assigned.is_empty());
+        // Past the migrated items and past the old list ids.
+        assert_eq!(next_id, 13);
+
+        let file = serde_json::json!({ "version": 2, "items": items });
+        let (reread, migrated) = parse_todo_file(file.to_string().as_bytes(), &resolve, &mut next_id).expect("v2");
+        assert_eq!(reread, items);
+        assert!(!migrated);
+        assert!(parse_todo_file(br#"{ "version": 3, "items": [] }"#, &resolve, &mut next_id).is_err());
+    }
+
+    #[test]
+    fn done_items_are_dropped_after_the_retention() {
+        let now = chrono::Utc::now();
+        let mut items = Vec::new();
+        for (id, days_ago) in [(1, 0), (2, 29), (3, 31)] {
+            let mut item = TodoItem {
+                id,
+                task_id: None,
+                arena_path: None,
+                arena_name: "zed".to_string(),
+                branch: None,
+                kind: InboxTodoKind::Proposal,
+                title: "x".to_string(),
+                detail: None,
+                created_by: TodoCreator::Human,
+                assigned: Vec::new(),
+                state: TodoState::Done,
+                request: None,
+                resolution: Some(super::TodoResolution {
+                    outcome: TodoOutcome::Completed,
+                    note: None,
+                    at: now - chrono::Duration::days(days_ago),
+                    by: TodoCreator::Human,
+                }),
+                created_at: now,
+                updated_at: now,
+            };
+            if id == 3 {
+                // An open item is never pruned, however old.
+                items.push(TodoItem { id: 4, state: TodoState::Open, resolution: None, ..item.clone() });
+            }
+            item.id = id;
+            items.push(item);
+        }
+        let kept: Vec<u64> = prune_done(items, now).into_iter().map(|item| item.id).collect();
+        assert_eq!(kept, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn the_request_message_names_items_by_id() {
+        let item = |id, title: &str, detail: Option<&str>| TodoItem {
+            id,
+            task_id: None,
+            arena_path: None,
+            arena_name: "zed".to_string(),
+            branch: None,
+            kind: InboxTodoKind::Proposal,
+            title: title.to_string(),
+            detail: detail.map(str::to_string),
+            created_by: TodoCreator::Human,
+            assigned: Vec::new(),
+            state: TodoState::Assigned,
+            request: None,
+            resolution: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let a = item(3, "Add tests", Some("rebinding"));
+        let b = item(8, "Open a PR", None);
+        assert_eq!(
+            todo_request_message(&[(&a, Some("quickly")), (&b, None)]),
+            "To do\nGo: #3 Add tests :: rebinding — Note: quickly\nGo: #8 Open a PR\nRun `agentium todo done <id>` for each item once it is finished."
+        );
     }
 
     /// An arena with two panes (`left`, `right`) and an owner tab in `left`.
@@ -1116,47 +2257,6 @@ mod tests {
         (arena, left, right, owner, cx)
     }
 
-    fn owner_tab(arena: &Entity<Arena>, pane: &Entity<workspace::Pane>, owner: &Entity<TestItem>) -> InboxTab {
-        InboxTab {
-            arena: arena.downgrade(),
-            pane: pane.downgrade(),
-            item: owner.downgrade_item(),
-        }
-    }
-
-    fn todos_with_list(
-        tab: InboxTab,
-        item_id: gpui::EntityId,
-        cx: &mut VisualTestContext,
-    ) -> (Entity<InboxTodos>, u64) {
-        let todos = cx.new(|_| InboxTodos::new(None));
-        let mut next_id = 1;
-        todos.update(cx, |todos, cx| {
-            todos.set_items(
-                item_id,
-                tab,
-                None,
-                test_owner(),
-                sample_items(),
-                &mut next_id,
-                cx,
-            );
-        });
-        (todos, 1)
-    }
-
-    fn notifications(
-        todos: &Entity<InboxTodos>,
-        cx: &mut VisualTestContext,
-    ) -> (Rc<Cell<usize>>, gpui::Subscription) {
-        let count = Rc::new(Cell::new(0));
-        let subscription = cx.update({
-            let count = count.clone();
-            |_, cx| cx.observe(todos, move |_, _| count.set(count.get() + 1))
-        });
-        (count, subscription)
-    }
-
     #[gpui::test]
     async fn the_owner_is_found_where_it_moved_and_lost_when_closed(cx: &mut TestAppContext) {
         let (arena, left, right, owner, cx) = arena_with_owner(cx).await;
@@ -1178,226 +2278,60 @@ mod tests {
         assert!(cx.update(|_, cx| find_item_location(&arenas, owner_id, cx)).is_none());
     }
 
-    #[gpui::test]
-    async fn rebinding_notifies_only_on_a_real_change(cx: &mut TestAppContext) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let (count, _subscription) = notifications(&todos, cx);
-
-        todos.update(cx, |todos, cx| {
-            todos.rebind(vec![(todo_id, Some(owner_tab(&arena, &left, &owner)))], cx)
+    fn scoped_view(cx: &mut TestAppContext) -> (Entity<InboxTodos>, u64, u64, Entity<InboxTodoView>, &mut VisualTestContext) {
+        init(cx);
+        let task = Uuid::new_v4();
+        let todos = cx.new(|_| InboxTodos::new(None));
+        let mut next_id = 1;
+        let (go_id, done_id) = todos.update(cx, |todos, cx| {
+            let go_id = todos.add(draft(InboxTodoKind::Proposal, "Add tests", Some(task)), &mut next_id, cx).unwrap();
+            let done_id = todos.add(draft(InboxTodoKind::UserTask, "Check the lane", Some(task)), &mut next_id, cx).unwrap();
+            // Another task's item never shows here.
+            todos.add(draft(InboxTodoKind::Proposal, "Elsewhere", Some(Uuid::new_v4())), &mut next_id, cx).unwrap();
+            todos.assign(go_id, assignee("s1", None), cx).unwrap();
+            (go_id, done_id)
         });
-        cx.run_until_parked();
-        assert_eq!(count.get(), 0);
-
-        todos.update(cx, |todos, cx| todos.rebind(vec![(todo_id, None)], cx));
-        todos.update(cx, |todos, cx| todos.rebind(vec![(todo_id, None)], cx));
-        cx.run_until_parked();
-        assert_eq!(count.get(), 1);
-
-        todos.update(cx, |todos, cx| {
-            todos.rebind(vec![(todo_id, Some(owner_tab(&arena, &left, &owner)))], cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(count.get(), 2);
+        let scope = TodoScope {
+            task_id: Some(task),
+            arena_paths: vec![],
+            arena_names: vec![],
+        };
+        let (view, cx) = cx.add_window_view(|window, cx| InboxTodoView::new(todos.clone(), scope, window, cx));
+        (todos, go_id, done_id, view, cx)
     }
 
     #[gpui::test]
-    async fn sending_removes_only_what_was_delivered(cx: &mut TestAppContext) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        todos.update(cx, |todos, cx| {
-            todos.set_choice(todo_id, "Check the lane", Some(TodoChoice::Done), cx);
-            todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx);
-            // Done does not fit a proposal: ignored.
-            todos.set_choice(todo_id, "Open a PR", Some(TodoChoice::Done), cx);
-        });
-        let notes = HashMap::from([("Add tests".to_string(), "with the Failed lane".to_string())]);
-        let owner_handle: Box<dyn workspace::ItemHandle> = Box::new(owner);
-
-        // No owner open: delivery is never attempted.
-        let delivered = Rc::new(Cell::new(false));
-        let result = todos.update(cx, |todos, cx| {
-            let delivered = delivered.clone();
-            todos.send(todo_id, &notes, None, move |_, _, _| {
-                delivered.set(true);
-                Ok(())
-            }, cx)
-        });
-        assert!(result.is_err() && !delivered.get());
-
-        // Delivery rejected: nothing changes, so the user can retry.
-        let result = todos.update(cx, |todos, cx| {
-            todos.send(todo_id, &notes, Some(owner_handle.as_ref()), |_, _, _| {
-                anyhow::bail!("tab is busy")
-            }, cx)
-        });
-        assert!(result.is_err());
-        todos.read_with(cx, |todos, _| {
-            let list = todos.list(todo_id).expect("list");
-            assert_eq!(list.items.len(), 3);
-            assert_eq!(list.choices.len(), 2);
-        });
-
-        let message = Rc::new(std::cell::RefCell::new(String::new()));
-        todos
-            .update(cx, |todos, cx| {
-                let message = message.clone();
-                todos.send(todo_id, &notes, Some(owner_handle.as_ref()), move |_, text, _| {
-                    *message.borrow_mut() = text.to_string();
-                    Ok(())
-                }, cx)
-            })
-            .expect("delivered");
-        assert_eq!(
-            message.borrow().as_str(),
-            "[from: Task Overview]\nTo do\nDone: 1 Check the lane\nGo: 2 Add tests — Note: with the Failed lane"
-        );
-        todos.read_with(cx, |todos, _| {
-            let list = todos.list(todo_id).expect("list");
-            let titles: Vec<&str> = list.items.iter().map(|item| item.title.as_str()).collect();
-            assert_eq!(titles, vec!["Open a PR"]);
-            assert!(list.choices.is_empty());
-        });
-
-        todos.update(cx, |todos, cx| todos.set_choice(todo_id, "Open a PR", Some(TodoChoice::Skip), cx));
-        todos
-            .update(cx, |todos, cx| {
-                todos.send(todo_id, &HashMap::new(), Some(owner_handle.as_ref()), |_, _, _| Ok(()), cx)
-            })
-            .expect("delivered");
-        assert!(todos.read_with(cx, |todos, _| todos.list(todo_id).is_none()));
-    }
-
-    #[gpui::test]
-    async fn processed_items_keep_titles_choices_and_notes_after_list_removal(
-        cx: &mut TestAppContext,
-    ) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) =
-            todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let view = cx
-            .new_window_entity(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
-        todos.update(cx, |todos, cx| {
-            todos.set_choice(todo_id, "Check the lane", Some(TodoChoice::Done), cx);
-            todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx);
-            todos.set_choice(todo_id, "Open a PR", Some(TodoChoice::Skip), cx);
-        });
-        let notes = HashMap::from([("Open a PR".to_string(), "Not needed".to_string())]);
-        let processed = view.read_with(cx, |view, cx| view.selected_items(&notes, cx));
-        assert_eq!(processed.len(), 3);
-        view.update(cx, |view, cx| view.record_processed(processed, cx));
-        todos.update(cx, |todos, cx| todos.clear_for(owner.entity_id(), None, cx));
-        cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            assert!(!view.show_processed);
-            assert_eq!(view.processed.len(), 3);
-            assert!(
-                view.processed
-                    .iter()
-                    .any(|entry| entry.item.title == "Check the lane"
-                        && entry.choice == TodoChoice::Done)
-            );
-            assert!(
-                view.processed
-                    .iter()
-                    .any(|entry| entry.item.title == "Add tests" && entry.choice == TodoChoice::Go)
-            );
-            assert!(
-                view.processed
-                    .iter()
-                    .any(|entry| entry.item.title == "Open a PR"
-                        && entry.choice == TodoChoice::Skip
-                        && entry.note.as_deref() == Some("Not needed"))
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn the_embedded_todo_follows_the_list(cx: &mut TestAppContext) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
-        assert_eq!(view.read_with(cx, |view, cx| view.owner_item_id(cx)), Some(owner.entity_id()));
+    async fn the_view_lists_pick_before_you_do_and_keeps_notes_per_item(cx: &mut TestAppContext) {
+        let (todos, go_id, done_id, view, cx) = scoped_view(cx);
+        let titles: Vec<String> = view.read_with(cx, |view, cx| view.open_items(cx).into_iter().map(|item| item.title).collect());
+        assert_eq!(titles, vec!["Add tests", "Check the lane"]);
 
         todos.update(cx, |todos, cx| {
-            todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx);
-            todos.set_choice(todo_id, "Open a PR", Some(TodoChoice::Skip), cx);
+            todos.set_choice(go_id, Some(TodoChoice::Go), cx);
+            todos.set_choice(done_id, Some(TodoChoice::Done), cx);
         });
         cx.run_until_parked();
-        let editor = view.read_with(cx, |view, _| view.note_editors.get("Add tests").cloned()).expect("note editor");
-        assert!(view.read_with(cx, |view, _| view.note_editors.contains_key("Open a PR")));
-
-        // Typing a note re-renders the preview.
-        let rendered = Rc::new(Cell::new(0));
-        let _observer = cx.update({
-            let rendered = rendered.clone();
-            |_, cx| cx.observe(&view, move |_, _| rendered.set(rendered.get() + 1))
-        });
+        let editor = view.read_with(cx, |view, _| view.note_editors.get(&go_id).cloned()).expect("note editor");
+        assert!(view.read_with(cx, |view, _| view.note_editors.contains_key(&done_id)));
         editor.update_in(cx, |editor, window, cx| editor.set_text("with the Failed lane", window, cx));
         cx.run_until_parked();
-        assert!(rendered.get() > 0);
-        assert!(view
-            .read_with(cx, |view, cx| view.preview(cx))
-            .is_some_and(|preview| preview.contains("Go: 2 Add tests — Note: with the Failed lane")));
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.notes(cx)).get(&go_id).map(String::as_str),
+            Some("with the Failed lane")
+        );
 
-        // The agent replaces its list: the surviving item keeps its note.
-        let mut next_id = 10;
-        todos.update(cx, |todos, cx| {
-            todos.set_items(
-                owner.entity_id(),
-                owner_tab(&arena, &left, &owner),
-                None,
-                test_owner(),
-                vec![item(InboxTodoKind::Proposal, "Add tests")],
-                &mut next_id,
-                cx,
-            );
-        });
+        // Clearing one choice drops its editor and keeps the other.
+        todos.update(cx, |todos, cx| todos.clear_choices(&[done_id], cx));
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert_eq!(view.note_editors.get("Add tests"), Some(&editor));
-            assert!(!view.note_editors.contains_key("Open a PR"));
-        });
-
-        // Owner unbound, then back.
-        todos.update(cx, |todos, cx| todos.rebind(vec![(todo_id, None)], cx));
-        assert_eq!(view.read_with(cx, |view, cx| view.owner_item_id(cx)), None);
-        todos.update(cx, |todos, cx| {
-            todos.rebind(vec![(todo_id, Some(owner_tab(&arena, &left, &owner)))], cx)
-        });
-        assert_eq!(view.read_with(cx, |view, cx| view.owner_item_id(cx)), Some(owner.entity_id()));
-
-        // Dismissed from the sidebar while open.
-        todos.update(cx, |todos, cx| todos.dismiss(todo_id, cx));
-        cx.run_until_parked();
-        view.read_with(cx, |view, cx| {
-            assert!(view.preview(cx).is_none());
-            assert!(view.owner_item_id(cx).is_none());
-            assert!(view.note_editors.is_empty());
+            assert_eq!(view.note_editors.get(&go_id), Some(&editor));
+            assert!(!view.note_editors.contains_key(&done_id));
         });
     }
 
     #[gpui::test]
-    async fn clearing_a_list_updates_the_embedded_todo(cx: &mut TestAppContext) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
-        let view = cx.new_window_entity(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
-        todos.update(cx, |todos, cx| todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx));
-        cx.run_until_parked();
-        let cleared = todos.update(cx, |todos, cx| todos.clear_for(owner.entity_id(), None, cx));
-        assert_eq!(cleared, 3);
-        cx.run_until_parked();
-        view.read_with(cx, |view, cx| {
-            assert!(view.preview(cx).is_none());
-            assert!(view.note_editors.is_empty());
-        });
-    }
-
-    #[gpui::test]
-    async fn choices_can_be_cleared_and_sent_from_the_keyboard(cx: &mut TestAppContext) {
-        let (arena, left, _right, owner, cx) = arena_with_owner(cx).await;
-        let (todos, todo_id) = todos_with_list(owner_tab(&arena, &left, &owner), owner.entity_id(), cx);
+    async fn choices_can_be_sent_from_the_keyboard(cx: &mut TestAppContext) {
+        let (todos, go_id, _done_id, view, cx) = scoped_view(cx);
         cx.update(|_, cx| {
             cx.bind_keys([
                 gpui::KeyBinding::new("cmd-enter", SendAnswers, Some(super::KEY_CONTEXT)),
@@ -1408,14 +2342,14 @@ mod tests {
                 ),
             ])
         });
-        let (view, cx) = cx.add_window_view(|window, cx| InboxTodoView::new(todos.clone(), todo_id, window, cx));
         let sent = Rc::new(Cell::new(0));
         let _subscription = cx.update({
             let sent = sent.clone();
             |_, cx| {
                 cx.subscribe(&view, move |_, event: &InboxTodoViewEvent, _| {
-                    let InboxTodoViewEvent::Send { .. } = event;
-                    sent.set(sent.get() + 1);
+                    if let InboxTodoViewEvent::Send { .. } = event {
+                        sent.set(sent.get() + 1);
+                    }
                 })
             }
         });
@@ -1429,17 +2363,10 @@ mod tests {
         assert_eq!(sent.get(), 0);
         assert!(view.read_with(cx, |view, _| view.error.is_some()));
 
-        todos.update(cx, |todos, cx| {
-            todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx);
-            todos.set_choice(todo_id, "Check the lane", Some(TodoChoice::Done), cx);
-        });
-        todos.update(cx, |todos, cx| todos.clear_choices(todo_id, cx));
-        assert!(todos.read_with(cx, |todos, _| todos.list(todo_id).is_some_and(|list| list.choices.is_empty())));
-
-        todos.update(cx, |todos, cx| todos.set_choice(todo_id, "Add tests", Some(TodoChoice::Go), cx));
+        todos.update(cx, |todos, cx| todos.set_choice(go_id, Some(TodoChoice::Go), cx));
         cx.run_until_parked();
         // From inside a note editor too, which binds cmd-enter itself.
-        let editor = view.read_with(cx, |view, _| view.note_editors.get("Add tests").cloned()).expect("note editor");
+        let editor = view.read_with(cx, |view, _| view.note_editors.get(&go_id).cloned()).expect("note editor");
         cx.update(|window, cx| {
             let handle = editor.read(cx).focus_handle(cx);
             handle.focus(window, cx);
@@ -1448,28 +2375,8 @@ mod tests {
         assert_eq!(sent.get(), 1);
     }
 
-    fn unbound_list(asker: Option<InboxAsker>, arena_path: Option<&str>) -> InboxTodoList {
-        InboxTodoList {
-            id: 4,
-            title: "Fix the Inbox".to_string(),
-            arena_name: "zed".to_string(),
-            updated_at: chrono::Utc::now(),
-            asker,
-            items: sample_items(),
-            branch: None,
-            arena_path: arena_path.map(PathBuf::from),
-            tab: None,
-            choices: HashMap::new(),
-        }
-    }
-
     #[test]
-    fn a_closed_owner_is_restored_only_where_it_unambiguously_lived() {
-        let claude = || {
-            Some(InboxAsker::ClaudeSession {
-                session_id: "c8832ec2".to_string(),
-            })
-        };
+    fn a_closed_assignee_is_restored_only_where_it_unambiguously_lived() {
         let open = |names: &[(&str, &str)]| {
             names
                 .iter()
@@ -1477,7 +2384,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            todo_restore_plan(&unbound_list(claude(), Some("/src/zed")), &[]),
+            todo_restore_plan(&assignee("c8832ec2", Some("/src/zed")), &[]),
             RestorePlan::ResumeClaude {
                 arena_path: PathBuf::from("/src/zed"),
                 session_id: "c8832ec2".to_string()
@@ -1485,25 +2392,20 @@ mod tests {
         );
         assert_eq!(
             todo_restore_plan(
-                &unbound_list(
-                    Some(InboxAsker::CodexAcp {
-                        saved_id: uuid::Uuid::nil()
-                    }),
-                    Some("/src/zed")
-                ),
+                &Assignee {
+                    asker: InboxAsker::CodexAcp { saved_id: Uuid::nil() },
+                    arena_path: Some(PathBuf::from("/src/zed")),
+                    arena_name: "zed".to_string(),
+                },
                 &[]
             ),
             RestorePlan::OpenArena {
                 arena_path: PathBuf::from("/src/zed")
             }
         );
-        assert!(matches!(
-            todo_restore_plan(&unbound_list(None, Some("/src/zed")), &[]),
-            RestorePlan::Fallback(_)
-        ));
 
-        // Lists written before arena_path: the name must be unique.
-        let legacy = unbound_list(claude(), None);
+        // Recorded before arena_path: the name must be unique.
+        let legacy = assignee("c8832ec2", None);
         assert_eq!(
             todo_restore_plan(&legacy, &open(&[("zed", "/src/zed"), ("scala", "/src/scala")])),
             RestorePlan::ResumeClaude {
@@ -1524,7 +2426,8 @@ mod tests {
     #[test]
     fn restorations_settle_on_bind_failure_or_closure() {
         let tab = gpui::EntityId::from(9u64);
-        let mut pending = HashMap::from([(1, PendingRestore::Launching)]);
+        let asker = claude("s1");
+        let mut pending = HashMap::from([(1, PendingRestore::Launching { asker: asker.clone() })]);
 
         // The launch fails: forgotten, with a reason for the row.
         let error = record_restore_launch(&mut pending, 1, Err(anyhow::anyhow!("no claude")));
@@ -1532,14 +2435,17 @@ mod tests {
         assert!(pending.is_empty());
 
         // Retry: nothing stale blocks a new attempt.
-        pending.insert(1, PendingRestore::Launching);
+        pending.insert(1, PendingRestore::Launching { asker: asker.clone() });
         assert_eq!(record_restore_launch(&mut pending, 1, Ok(tab)), None);
-        assert_eq!(pending.get(&1), Some(&PendingRestore::Launched { item_id: tab }));
+        assert_eq!(
+            pending.get(&1),
+            Some(&PendingRestore::Launched { asker: asker.clone(), item_id: tab })
+        );
 
         let observe = |exists: bool, bound: bool, tab_open: bool| {
             move |_: u64, _: &PendingRestore| RestoreObservation {
-                list_exists: exists,
-                list_bound: bound,
+                item_exists: exists,
+                assignee_open: bound,
                 launched_tab_open: tab_open,
             }
         };
@@ -1551,23 +2457,26 @@ mod tests {
         assert!(matches!(outcomes.as_slice(), [(1, RestoreOutcome::Failed(_))]));
         assert!(pending.is_empty());
 
-        pending.insert(1, PendingRestore::Launched { item_id: tab });
-        pending.insert(2, PendingRestore::Restored);
-        pending.insert(3, PendingRestore::Launching);
+        pending.insert(1, PendingRestore::Launched { asker: asker.clone(), item_id: tab });
+        pending.insert(2, PendingRestore::Restored { asker: asker.clone() });
+        pending.insert(3, PendingRestore::Launching { asker: asker.clone() });
         let outcomes = advance_pending_restores(&mut pending, |todo_id, _| RestoreObservation {
-            list_exists: todo_id != 3,
-            list_bound: todo_id == 1,
+            item_exists: todo_id != 3,
+            assignee_open: todo_id == 1,
             launched_tab_open: true,
         });
         assert_eq!(outcomes, vec![(1, RestoreOutcome::Open)]);
-        assert_eq!(pending, HashMap::from([(2, PendingRestore::Restored)]));
+        assert_eq!(pending, HashMap::from([(2, PendingRestore::Restored { asker })]));
     }
 
     #[test]
     fn an_acp_owner_comes_back_only_if_its_arena_still_saves_it() {
-        assert_eq!(acp_restore_outcome(true, true), Ok(PendingRestore::Restored));
-        assert!(acp_restore_outcome(true, false).is_err());
-        assert!(acp_restore_outcome(false, false).is_err());
+        let asker = InboxAsker::CodexAcp { saved_id: Uuid::nil() };
+        assert_eq!(
+            acp_restore_outcome(true, true, asker.clone()),
+            Ok(PendingRestore::Restored { asker: asker.clone() })
+        );
+        assert!(acp_restore_outcome(true, false, asker.clone()).is_err());
+        assert!(acp_restore_outcome(false, false, asker).is_err());
     }
 }
-

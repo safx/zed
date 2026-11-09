@@ -227,22 +227,65 @@ enum TodoAction {
         #[arg(long, requires = "recommended")]
         assume: bool,
     },
-    /// Replace this tab's whole list. Pass every item that still applies, not
-    /// only new ones; the output names unanswered items that were dropped.
-    Set {
+    /// Add one item to this task's To do. From an agent tab the item is
+    /// assigned to that agent and already requested; `--unassigned` leaves it
+    /// open for someone else. From a plain shell it is the user's own item.
+    Add {
         /// Something the user does (verify, configure), as `TITLE` or
-        /// `TITLE :: DETAIL`; repeatable
-        #[arg(long = "user-task", allow_hyphen_values = true)]
-        user_tasks: Vec<String>,
-        /// Work you propose and the user picks or skips, as `TITLE` or
-        /// `TITLE :: DETAIL`; repeatable
-        #[arg(long = "proposal", allow_hyphen_values = true)]
-        proposals: Vec<String>,
+        /// `TITLE :: DETAIL`
+        #[arg(long = "user-task", allow_hyphen_values = true, conflicts_with = "proposal")]
+        user_task: Option<String>,
+        /// Work an agent does once the user says Go, as `TITLE` or
+        /// `TITLE :: DETAIL`
+        #[arg(long, allow_hyphen_values = true)]
+        proposal: Option<String>,
+        /// Leave the item unassigned: it is not yours to do
+        #[arg(long)]
+        unassigned: bool,
     },
-    /// Print this tab's list, and the lists of the other tabs in this arena
-    List,
-    /// Empty this tab's list
-    Clear,
+    /// Assign the item to this tab's agent and start on it
+    Take {
+        /// The item id from `todo list`
+        id: u64,
+    },
+    /// Change who works on the item. Anyone may do this; only assigned
+    /// agents may `done` or `update` it.
+    Assign {
+        /// The item id from `todo list`
+        id: u64,
+        /// `self`, or the title of a tab (`agentium tab list`)
+        #[arg(long = "to", conflicts_with = "unassign")]
+        to: Option<String>,
+        /// The arena of the `--to` tab, when it is not this one
+        #[arg(long, requires = "to")]
+        arena: Option<PathBuf>,
+        /// Remove this tab's agent from the item
+        #[arg(long)]
+        unassign: bool,
+    },
+    /// Close the item once it is finished (assigned agents only)
+    Done {
+        /// The item id from `todo list`
+        id: u64,
+        /// What was done, or why it needed no change
+        #[arg(long, allow_hyphen_values = true)]
+        note: Option<String>,
+    },
+    /// Edit the item's title or detail (assigned agents only)
+    Update {
+        /// The item id from `todo list`
+        id: u64,
+        #[arg(long, allow_hyphen_values = true)]
+        title: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        detail: Option<String>,
+    },
+    /// Print this task's open items and this arena's pending questions
+    List {
+        /// Include done items
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -942,32 +985,53 @@ fn inbox_option_json(option: &str) -> serde_json::Value {
     }
 }
 
-fn todo_set_request(user_tasks: &[String], proposals: &[String]) -> serde_json::Value {
-    let entries = |items: &[String]| {
-        items
-            .iter()
-            .map(|item| {
-                let option = inbox_option_json(item);
-                serde_json::json!({ "title": option["label"], "detail": option["description"] })
-            })
-            .collect::<Vec<_>>()
-    };
+/// `TITLE :: DETAIL` into a `todo_add` request; the split is the one
+/// `todo ask --option` uses.
+fn todo_add_request(
+    kind: agentium::InboxTodoKind,
+    text: &str,
+    unassigned: bool,
+) -> serde_json::Value {
+    let option = inbox_option_json(text);
     serde_json::json!({
-        "type": "todo_set",
-        "user_tasks": entries(user_tasks),
-        "proposals": entries(proposals),
+        "type": "todo_add",
+        "kind": kind,
+        "title": option["label"],
+        "detail": option["description"],
+        "unassigned": unassigned,
     })
 }
 
-fn print_todo_items(items: &[agentium::InboxTodoItem], indent: &str) {
-    for (index, item) in items.iter().enumerate() {
+fn print_todo_entries(items: &[agentium::TodoListEntry]) {
+    for item in items {
         let kind = match item.kind {
             agentium::InboxTodoKind::UserTask => "user task",
             agentium::InboxTodoKind::Proposal => "proposal",
         };
+        let state = match item.state {
+            agentium::TodoState::Open => "open",
+            agentium::TodoState::Assigned => "assigned",
+            agentium::TodoState::Requested => "requested",
+            agentium::TodoState::Done => "done",
+        };
+        let assignees = if item.assignees.is_empty() {
+            "unassigned".to_string()
+        } else {
+            item.assignees.join(", ")
+        };
+        let mine = if item.mine { " (yours)" } else { "" };
         match &item.detail {
-            Some(detail) => println!("{indent}{}. [{kind}] {} :: {detail}", index + 1, item.title),
-            None => println!("{indent}{}. [{kind}] {}", index + 1, item.title),
+            Some(detail) => println!(
+                "#{} [{kind}, {state}] {} :: {detail} — {assignees}{mine}",
+                item.id, item.title
+            ),
+            None => println!(
+                "#{} [{kind}, {state}] {} — {assignees}{mine}",
+                item.id, item.title
+            ),
+        }
+        if let Some(condition) = &item.condition {
+            println!("    Condition: {condition}");
         }
     }
 }
@@ -1007,45 +1071,80 @@ fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        TodoAction::Set {
-            user_tasks,
-            proposals,
+        TodoAction::Add {
+            user_task,
+            proposal,
+            unassigned,
         } => {
-            let request = todo_set_request(&user_tasks, &proposals);
-            // Fails before contacting the app, with the same rules it applies.
-            agentium::parse_todo_set_request(&request)?;
-            let response = cli_request(request)?;
-            let count = response["count"].as_u64().unwrap_or_default();
-            println!("To do: {count} {}.", if count == 1 { "item" } else { "items" });
-            let dropped: Vec<&str> = response["dropped"]
-                .as_array()
-                .map(|dropped| dropped.iter().filter_map(|title| title.as_str()).collect())
-                .unwrap_or_default();
-            if !dropped.is_empty() {
-                println!(
-                    "Dropped {} unanswered {}: {}. If they still apply, run todo set again including them.",
-                    dropped.len(),
-                    if dropped.len() == 1 { "item" } else { "items" },
-                    dropped.join("; ")
-                );
+            let (kind, text) = match (user_task, proposal) {
+                (Some(text), None) => (agentium::InboxTodoKind::UserTask, text),
+                (None, Some(text)) => (agentium::InboxTodoKind::Proposal, text),
+                _ => anyhow::bail!("give exactly one of --user-task or --proposal"),
+            };
+            agentium::validate_todo_title(inbox_option_json(&text)["label"].as_str().unwrap_or_default())?;
+            let response = cli_request(todo_add_request(kind, &text, unassigned))?;
+            println!(
+                "To do #{} added{}.",
+                response["id"],
+                if unassigned { " (unassigned)" } else { "" }
+            );
+            Ok(())
+        }
+        TodoAction::Take { id } => {
+            cli_request(serde_json::json!({ "type": "todo_take", "id": id }))?;
+            println!("To do #{id} is yours; run `agentium todo done {id}` when finished.");
+            Ok(())
+        }
+        TodoAction::Assign {
+            id,
+            to,
+            arena,
+            unassign,
+        } => {
+            if to.is_none() && !unassign {
+                anyhow::bail!("give --to self, --to <tab title>, or --unassign");
+            }
+            cli_request(serde_json::json!({
+                "type": "todo_assign",
+                "id": id,
+                "to": to,
+                "arena": arena,
+                "unassign": unassign,
+            }))?;
+            if unassign {
+                println!("To do #{id}: this tab's agent is no longer assigned.");
+            } else {
+                println!("To do #{id} assigned.");
             }
             Ok(())
         }
-        TodoAction::List => {
-            let response = cli_request(serde_json::json!({ "type": "todo_list" }))?;
-            let own: Vec<agentium::InboxTodoItem> =
-                serde_json::from_value(response["own"].clone())?;
-            let others: Vec<(String, Vec<agentium::InboxTodoItem>)> =
-                serde_json::from_value(response["others"].clone())?;
-            if own.is_empty() {
-                println!("This tab: no to-do list.");
-            } else {
-                println!("This tab:");
-                print_todo_items(&own, "  ");
+        TodoAction::Done { id, note } => {
+            cli_request(serde_json::json!({ "type": "todo_done", "id": id, "note": note }))?;
+            println!("To do #{id} done.");
+            Ok(())
+        }
+        TodoAction::Update { id, title, detail } => {
+            if title.is_none() && detail.is_none() {
+                anyhow::bail!("give --title and/or --detail");
             }
-            for (title, items) in others {
-                println!("{title} (read-only):");
-                print_todo_items(&items, "  ");
+            cli_request(serde_json::json!({
+                "type": "todo_update",
+                "id": id,
+                "title": title,
+                "detail": detail,
+            }))?;
+            println!("To do #{id} updated.");
+            Ok(())
+        }
+        TodoAction::List { all } => {
+            let response = cli_request(serde_json::json!({ "type": "todo_list", "all": all }))?;
+            let items: Vec<agentium::TodoListEntry> =
+                serde_json::from_value(response["items"].clone())?;
+            if items.is_empty() {
+                println!("This task: no To do items.");
+            } else {
+                println!("This task:");
+                print_todo_entries(&items);
             }
             if let Some(questions) = response["questions"].as_array() {
                 for question in questions {
@@ -1063,11 +1162,6 @@ fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
                     if question["assumed"].as_bool() == Some(true) { println!("  Continuing with the recommended option"); }
                 }
             }
-            Ok(())
-        }
-        TodoAction::Clear => {
-            let response = cli_request(serde_json::json!({ "type": "todo_clear" }))?;
-            println!("To do cleared ({} items).", response["count"]);
             Ok(())
         }
     }
@@ -1664,7 +1758,7 @@ mod peer_pid_tests {
 
 #[cfg(test)]
 mod inbox_cli_tests {
-    use super::{Args, Command, TodoAction, inbox_option_json, todo_set_request};
+    use super::{Args, Command, TodoAction, inbox_option_json, todo_add_request};
     use clap::Parser as _;
 
     #[test]
@@ -1705,57 +1799,66 @@ mod inbox_cli_tests {
         assert_eq!(inbox_option_json(&options[2])["label"], "--assume");
     }
 
-    fn todo_set_items(arguments: &[&str]) -> anyhow::Result<Vec<agentium::InboxTodoItem>> {
-        let args = Args::try_parse_from(
-            ["agentium", "todo", "set"].iter().chain(arguments).copied(),
-        )?;
-        let Some(Command::Todo {
-            action: TodoAction::Set { user_tasks, proposals },
-        }) = args.command
-        else {
-            anyhow::bail!("expected todo set");
-        };
-        agentium::parse_todo_set_request(&todo_set_request(&user_tasks, &proposals))
+    #[test]
+    fn todo_set_and_clear_are_gone() {
+        assert!(Args::try_parse_from(["agentium", "todo", "set", "--proposal", "x"]).is_err());
+        assert!(Args::try_parse_from(["agentium", "todo", "clear"]).is_err());
     }
 
     #[test]
-    fn todo_set_lists_user_tasks_before_proposals() {
-        use agentium::InboxTodoKind::{Proposal, UserTask};
-        let items = todo_set_items(&[
+    fn todo_add_splits_title_from_detail_and_takes_one_kind() {
+        let args = Args::try_parse_from([
+            "agentium",
+            "todo",
+            "add",
             "--proposal",
             "Add GPUI tests :: rebinding, aging, badge",
-            "--user-task",
-            "Check the Failed lane",
-            "--proposal",
-            "--assume support",
+            "--unassigned",
         ])
-        .expect("todo set");
-        let summary: Vec<_> = items
-            .iter()
-            .map(|item| (item.kind, item.title.as_str(), item.detail.as_deref()))
-            .collect();
-        assert_eq!(
-            summary,
-            vec![
-                (UserTask, "Check the Failed lane", None),
-                (Proposal, "Add GPUI tests", Some("rebinding, aging, badge")),
-                (Proposal, "--assume support", None),
-            ]
+        .expect("todo add arguments");
+        let Some(Command::Todo {
+            action: TodoAction::Add { user_task, proposal, unassigned },
+        }) = args.command
+        else {
+            panic!("expected todo add");
+        };
+        assert!(user_task.is_none() && unassigned);
+        let request = todo_add_request(
+            agentium::InboxTodoKind::Proposal,
+            proposal.as_deref().unwrap_or_default(),
+            unassigned,
         );
+        assert_eq!(request["type"], "todo_add");
+        assert_eq!(request["kind"], "proposal");
+        assert_eq!(request["title"], "Add GPUI tests");
+        assert_eq!(request["detail"], "rebinding, aging, badge");
+        assert_eq!(request["unassigned"], true);
+        let request = todo_add_request(agentium::InboxTodoKind::UserTask, "--assume support", false);
+        assert_eq!(request["title"], "--assume support");
+        assert!(request["detail"].is_null());
+
+        assert!(Args::try_parse_from([
+            "agentium", "todo", "add", "--proposal", "a", "--user-task", "b",
+        ])
+        .is_err());
     }
 
     #[test]
-    fn todo_set_rejects_empty_oversized_and_ambiguous_lists() {
-        assert!(todo_set_items(&[]).is_err());
-        assert!(todo_set_items(&["--user-task", " :: only a detail"]).is_err());
-        assert!(todo_set_items(&["--user-task", "Same", "--proposal", "Same :: other"]).is_err());
-        let nine: Vec<String> = (1..=9).map(|n| format!("Item {n}")).collect();
-        let arguments: Vec<&str> = nine
-            .iter()
-            .flat_map(|title| ["--proposal", title.as_str()])
-            .collect();
-        assert!(todo_set_items(&arguments).is_err());
-        assert_eq!(todo_set_items(&arguments[..16]).map(|items| items.len()).ok(), Some(8));
+    fn todo_assign_names_a_target_or_unassigns() {
+        let args = Args::try_parse_from([
+            "agentium", "todo", "assign", "7", "--to", "Codex", "--arena", "/src/zed",
+        ])
+        .expect("todo assign arguments");
+        assert!(matches!(
+            args.command,
+            Some(Command::Todo {
+                action: TodoAction::Assign { id: 7, to: Some(_), arena: Some(_), unassign: false }
+            })
+        ));
+        assert!(Args::try_parse_from(["agentium", "todo", "assign", "7", "--to", "self", "--unassign"]).is_err());
+        assert!(Args::try_parse_from(["agentium", "todo", "assign", "7", "--arena", "/src/zed"]).is_err());
+        assert!(Args::try_parse_from(["agentium", "todo", "done", "7", "--note", "pushed"]).is_ok());
+        assert!(Args::try_parse_from(["agentium", "todo", "list", "--all"]).is_ok());
     }
 
     #[test]
@@ -2267,22 +2370,79 @@ fn handle_cli_request(
             )
             .map(|id| serde_json::json!({ "ok": true, "id": id }))
         }
-        Some("todo_set") => agentium::parse_todo_set_request(&request)
-            .and_then(|items| app.todo_set(peer_ancestor_pids, items, cx))
-            .and_then(|reply| Ok(serde_json::to_value(reply)?))
-            .map(with_ok),
+        Some("todo_add") => serde_json::from_value::<agentium::InboxTodoKind>(request["kind"].clone())
+            .map_err(|error| anyhow::anyhow!("malformed todo_add request: {error}"))
+            .and_then(|kind| {
+                app.todo_add(
+                    peer_ancestor_pids,
+                    kind,
+                    request["title"].as_str().unwrap_or_default().to_string(),
+                    request["detail"].as_str().map(String::from),
+                    request["unassigned"].as_bool().unwrap_or(false),
+                    cx,
+                )
+            })
+            .map(|id| serde_json::json!({ "ok": true, "id": id })),
+        Some("todo_take") => todo_id(&request)
+            .and_then(|id| app.todo_take(peer_ancestor_pids, id, cx))
+            .map(|()| serde_json::json!({ "ok": true })),
+        Some("todo_assign") => todo_id(&request)
+            .and_then(|id| {
+                let target = if request["unassign"].as_bool().unwrap_or(false) {
+                    agentium::AssignTarget::Unassign
+                } else {
+                    match request["to"].as_str() {
+                        Some("self") => agentium::AssignTarget::Caller,
+                        Some(title) => agentium::AssignTarget::Tab {
+                            title: title.to_string(),
+                            arena: selector,
+                        },
+                        None => anyhow::bail!("todo_assign needs `to` or `unassign`"),
+                    }
+                };
+                app.todo_assign(peer_ancestor_pids, id, target, cx)
+            })
+            .map(|()| serde_json::json!({ "ok": true })),
+        Some("todo_done") => todo_id(&request)
+            .and_then(|id| {
+                app.todo_done(
+                    peer_ancestor_pids,
+                    id,
+                    request["note"].as_str().map(String::from),
+                    cx,
+                )
+            })
+            .map(|()| serde_json::json!({ "ok": true })),
+        Some("todo_update") => todo_id(&request)
+            .and_then(|id| {
+                app.todo_update(
+                    peer_ancestor_pids,
+                    id,
+                    request["title"].as_str().map(String::from),
+                    request["detail"].as_str().map(String::from),
+                    cx,
+                )
+            })
+            .map(|()| serde_json::json!({ "ok": true })),
         Some("todo_list") => app
-            .todo_list(peer_ancestor_pids, cx)
+            .todo_list(
+                peer_ancestor_pids,
+                request["all"].as_bool().unwrap_or(false),
+                cx,
+            )
             .and_then(|reply| Ok(serde_json::to_value(reply)?))
             .map(with_ok),
-        Some("todo_clear") => app
-            .todo_clear(peer_ancestor_pids, cx)
-            .map(|count| serde_json::json!({ "ok": true, "count": count })),
         other => Err(anyhow::anyhow!("unknown request type {other:?}")),
     };
     Task::ready(
         result.unwrap_or_else(|error| serde_json::json!({ "ok": false, "error": format!("{error:#}") })),
     )
+}
+
+fn todo_id(request: &serde_json::Value) -> anyhow::Result<u64> {
+    request["id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("the request names no To do item id"))
 }
 
 fn with_ok(mut reply: serde_json::Value) -> serde_json::Value {

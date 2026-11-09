@@ -17,11 +17,11 @@ pub(crate) struct TaskOverview {
     pub(crate) scope: Option<OverviewScope>,
     app: WeakEntity<AgentiumApp>,
     focus_handle: FocusHandle,
-    pub(crate) todos: HashMap<u64, Entity<InboxTodoView>>,
-    pub(crate) todo_owners: HashMap<u64, EntityId>,
-    pub(crate) expanded: std::collections::HashSet<u64>,
+    /// The task's To do list; rebuilt when the scope changes.
+    pub(crate) todo_view: Option<Entity<InboxTodoView>>,
     pub(crate) show_context: std::collections::HashSet<EntityId>,
-    pub(crate) collapsed_todos: std::collections::HashSet<u64>,
+    /// Question sections the user folded, by their first question id.
+    pub(crate) collapsed_questions: std::collections::HashSet<u64>,
     expanded_messages: HashMap<(EntityId, &'static str), String>,
     _subscription: Subscription,
 }
@@ -33,11 +33,9 @@ impl TaskOverview {
             scope: None,
             app: app.downgrade(),
             focus_handle: cx.focus_handle(),
-            todos: HashMap::new(),
-            expanded: Default::default(),
-            collapsed_todos: Default::default(),
+            todo_view: None,
+            collapsed_questions: Default::default(),
             show_context: Default::default(),
-            todo_owners: HashMap::new(),
             expanded_messages: HashMap::new(),
             _subscription: subscription,
         }
@@ -136,87 +134,3 @@ impl Focusable for TaskOverview {
     }
 }
 
-pub(crate) fn todo_matches_scope(
-    live_in_scope: Option<bool>,
-    saved_path: Option<&std::path::Path>,
-    saved_name: &str,
-    paths: &[std::path::PathBuf],
-    names: &[String],
-) -> bool {
-    if let Some(in_scope) = live_in_scope {
-        return in_scope;
-    }
-    match saved_path {
-        Some(path) => paths.iter().any(|candidate| candidate == path),
-        None => names.iter().any(|name| name == saved_name),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::todo_matches_scope;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn overview_follows_live_owner_after_move() {
-        let paths = vec![PathBuf::from("/task/a")];
-        assert!(!todo_matches_scope(
-            Some(false),
-            Some(Path::new("/task/a")),
-            "a",
-            &paths,
-            &[]
-        ));
-        assert!(todo_matches_scope(
-            Some(true),
-            Some(Path::new("/other")),
-            "other",
-            &paths,
-            &[]
-        ));
-    }
-
-    #[test]
-    fn overview_includes_closed_owners_across_task_worktrees() {
-        let paths = vec![PathBuf::from("/task/a"), PathBuf::from("/task/b")];
-        assert!(todo_matches_scope(
-            None,
-            Some(Path::new("/task/b")),
-            "b",
-            &paths,
-            &[]
-        ));
-        assert!(!todo_matches_scope(
-            None,
-            Some(Path::new("/other/b")),
-            "b",
-            &paths,
-            &["b".into()]
-        ));
-        assert!(!todo_matches_scope(
-            None,
-            Some(Path::new("/task/b/nested")),
-            "b",
-            &paths,
-            &[]
-        ));
-    }
-
-    #[test]
-    fn overview_uses_name_only_for_legacy_lists_without_paths() {
-        assert!(todo_matches_scope(
-            None,
-            None,
-            "legacy",
-            &[],
-            &["legacy".into()]
-        ));
-        assert!(!todo_matches_scope(
-            None,
-            None,
-            "other",
-            &[],
-            &["legacy".into()]
-        ));
-    }
-}

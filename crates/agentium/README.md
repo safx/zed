@@ -118,9 +118,11 @@ The sidebar shows one line per task with a dot per agent state present (permissi
 
 Keyboard shortcuts that create tabs (`Cmd+T`, `Cmd+Shift+T`, `Ctrl+~`) work while the overview column has focus and target the active arena.
 
-Each agent card links to its original tab. Request and Response initially show the first sentence (ending at `.` or `。`); Show more / Show less toggles the received text. New text starts collapsed. The status button opens its activity, including questions and permission responses. Expand **To do** to choose Done / Go / Skip, add notes, and send directly to that agent. Drafts survive switching tabs; successfully sent items appear in a collapsed Processed items section, marked Done, Skipped, or Requested and only delivered items leave the list. Closed owners retain their items and can be restored from the overview before sending.
+Each agent card links to its original tab. Request and Response initially show the first sentence (ending at `.` or `。`); Show more / Show less toggles the received text. New text starts collapsed. The status button opens its activity, including questions and permission responses. The card's **Questions** section holds the agent's pending `todo ask` questions with answered ones folded below.
 
-Claude requests come from UserPromptSubmit. The Stop hook derives the result title from `last_assistant_message` without an LLM: it takes the first nonempty line, removes basic Markdown markers, and limits it to 120 characters. Codex ACP shows the latest user message and assistant response, excluding reasoning. Terminals without these sources show an unavailable message and a link to the original tab. Results and processed items are session-local.
+The **To do** section below the cards is the task's own list (see *To do items* under *CLI*): choose Done / Go / Skip per item, add a note, and Send. Go items stay listed as Requested until the assigned agent closes them with `todo done`; Done and Skip close them at once and they move to the folded Done history, which is persisted. Choices and note drafts survive switching tasks. A closed assignee is restored from its row before sending.
+
+Claude requests come from UserPromptSubmit. The Stop hook derives the result title from `last_assistant_message` without an LLM: it takes the first nonempty line, removes basic Markdown markers, and limits it to 120 characters. Codex ACP shows the latest user message and assistant response, excluding reasoning. Terminals without these sources show an unavailable message and a link to the original tab. Results are session-local.
 
 PRs include cached entries for closed arenas and manually linked task PRs.
 
@@ -130,7 +132,7 @@ Each arena in Task Overview has a **Task Coordinator · Experimental** control. 
 
 The coordinator’s Overview card is labeled **Task Coordinator** and shows the latest reported model, falling back to its explicitly labeled configured provider/model until model information is available. Its routine completion notifications and sounds are suppressed; ACP error and permission notifications remain enabled.
 
-The coordinator summarizes the latest request and response of each agent in its arena. Task Overview shows the summary beside the user/bot icon; **Show original** opens the full source text. While a summary is pending or unavailable, the original text remains visible. A new turn or a newly received response invalidates the previous summary. The coordinator excludes its own messages, never edits another agent’s Todo list, and does not assign or execute implementation work.
+The coordinator summarizes the latest request and response of each agent in its arena. Task Overview shows the summary beside the user/bot icon; **Show original** opens the full source text. While a summary is pending or unavailable, the original text remains visible. A new turn or a newly received response invalidates the previous summary. The coordinator excludes its own messages and does not execute implementation work. It is an ordinary session for the task's To do: it may add items and change assignees like any agent, and may close only items assigned to it.
 
 Claude’s UserPromptSubmit and Stop hooks additionally send full source text over the CLI stream socket. Existing short terminal/status titles remain unchanged. Codex source text comes from ACP messages; partial assistant responses are not summarized while a turn runs. Ordinary Codex terminal tabs, including `codex resume`, do not provide request/result capture and are not summarized by this MVP. Their running state alone is not enough to create a summary job.
 
@@ -325,6 +327,12 @@ if command -v agentium >/dev/null 2>&1; then eval "$(command agentium completion
 
 Use `agentium todo ask "Question" --option "Choice::Explanation" --recommended 1` to request a decision. Omit options for a free-text answer. `--assume` continues with the recommended option; confirming it without a note does not send a message. The former `agentium inbox` command has been removed.
 
-Task Overview puts questions before tasks and proposals in each agent’s To do section. Choose an option, add an optional note, then confirm the answer. Successful answers and skipped questions move to the collapsible processed items; delivery failures remain pending. Questions contribute to the sidebar’s To do count. Request and response are collapsed by default.
+Task Overview shows each agent's pending questions in its card, with answered ones folded below. Choose an option, add an optional note, then confirm the answer; delivery failures remain pending. Questions contribute to the sidebar’s To do count. Request and response are collapsed by default.
 
-`todo list` includes pending questions in the current arena. `todo set` and `todo clear` affect only tasks and proposals, never unanswered questions. Saved questions from earlier versions are retained. Answers to questions are persisted; ordinary processed task/proposal history retains its existing lifetime.
+`todo list` includes pending questions in the current arena. Saved questions from earlier versions are retained, and answers are persisted.
+
+### To do items
+
+The To do list belongs to the task, not to a tab. `agentium todo add --proposal "TITLE :: DETAIL"` or `--user-task` adds one item; from an agent tab it is assigned to that agent and requested, `--unassigned` leaves it open, and from a plain shell it is the user's own item. `todo take <id>` assigns the calling agent and requests the item; `todo assign <id> --to self | --to "<tab title>" [--arena <path>] | --unassign` changes assignees (anyone may); `todo done <id> [--note]` and `todo update <id>` are accepted only from an assigned agent, which is a guard against accidents rather than a permission boundary. `todo list [--all]` prints the task's items with ids, states and assignees. `todo set` and `todo clear` have been removed.
+
+Task Overview lists the task's open items, Pick (proposals) before You do (user tasks), each with its assignees and their agent state; Unassigned items get an Assign… menu of the task's open agent tabs, and a closed assignee is restored with a click. Go sends one `[from: Task Overview]` message per assigned agent naming the items by id, keeps the item as Requested with the note as its condition, and the agent closes it with `todo done`. Done and Skip close the item directly. Done items stay folded under the list for 30 days. Items are stored in `todo.json`; per-tab lists written by earlier versions are migrated once, with the tab as the assignee.

@@ -28,6 +28,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use editor::{Editor, EditorEvent};
@@ -350,151 +351,42 @@ pub struct InboxOption {
     pub description: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InboxTodoKind {
-    /// The user does something, then answers "Done".
-    UserTask,
-    /// The user decides whether the agent does it ("Go" / "Skip").
-    Proposal,
-}
+pub use inbox_todo_view::{
+    Assignee, InboxTodoKind, TodoCreator, TodoItem, TodoOutcome, TodoRequest, TodoResolution,
+    TodoState, validate_todo_title,
+};
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct InboxTodoItem {
-    pub kind: InboxTodoKind,
-    pub title: String,
-    pub detail: Option<String>,
-}
-
-pub const MAX_TODO_ITEMS: usize = 8;
-
-/// Shared by the CLI and the app. Titles must be unique because answers
-/// refer to items by title once the agent has replaced its list.
-pub fn validate_todo_items(items: &[InboxTodoItem]) -> anyhow::Result<()> {
-    if items.is_empty() {
-        anyhow::bail!("give at least one --user-task or --proposal; use `todo clear` to empty the list");
-    }
-    if items.len() > MAX_TODO_ITEMS {
-        anyhow::bail!(
-            "{} items is more than {MAX_TODO_ITEMS}; drop the least important ones",
-            items.len()
-        );
-    }
-    let mut titles = HashSet::new();
-    for item in items {
-        if item.title.trim().is_empty() {
-            anyhow::bail!("an item has an empty title");
-        }
-        if !titles.insert(item.title.as_str()) {
-            anyhow::bail!("the title {:?} is used twice", item.title);
-        }
-    }
-    Ok(())
-}
-
-/// Decodes a `todo_set` request strictly: one malformed entry fails the whole
-/// request, because the list is replaced wholesale and a silently skipped
-/// item would be lost.
-pub fn parse_todo_set_request(request: &serde_json::Value) -> anyhow::Result<Vec<InboxTodoItem>> {
-    #[derive(serde::Deserialize)]
-    struct Entry {
-        title: String,
-        detail: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Request {
-        user_tasks: Vec<Entry>,
-        proposals: Vec<Entry>,
-    }
-    let request: Request = serde_json::from_value(request.clone())
-        .map_err(|error| anyhow::anyhow!("malformed todo_set request: {error}"))?;
-    let entries = |entries: Vec<Entry>, kind| {
-        entries.into_iter().map(move |entry| InboxTodoItem {
-            kind,
-            title: entry.title.trim().to_string(),
-            detail: entry
-                .detail
-                .map(|detail| detail.trim().to_string())
-                .filter(|detail| !detail.is_empty()),
-        })
-    };
-    let items: Vec<InboxTodoItem> = entries(request.user_tasks, InboxTodoKind::UserTask)
-        .chain(entries(request.proposals, InboxTodoKind::Proposal))
-        .collect();
-    validate_todo_items(&items)?;
-    Ok(items)
-}
-
-/// `None` when the prompt is a message another tab or the Inbox pasted in
-/// (`[from: ...]`) and there is no earlier title to keep.
-fn headline_from_prompt(prompt: &str, previous: Option<String>) -> Option<String> {
-    if prompt.trim_start().starts_with("[from: ") {
-        previous
-    } else {
-        Some(prompt.to_string())
-    }
-}
-
-/// Titles of `old` items that `new` no longer has, in their old order.
-fn dropped_todo_titles(old: &[InboxTodoItem], new: &[InboxTodoItem]) -> Vec<String> {
-    old.iter()
-        .filter(|old| !new.iter().any(|new| new.title == old.title))
-        .map(|old| old.title.clone())
-        .collect()
-}
-
-#[derive(serde::Serialize)]
-pub struct TodoSetReply {
-    pub count: usize,
-    pub dropped: Vec<String>,
-}
-
+/// Reply payload for `todo list`: the items of the caller's task.
 #[derive(serde::Serialize)]
 pub struct TodoListReply {
-    pub own: Vec<InboxTodoItem>,
-    /// Other tabs of the caller's arena, by tab title.
-    pub others: Vec<(String, Vec<InboxTodoItem>)>,
+    pub items: Vec<TodoListEntry>,
     pub questions: Vec<serde_json::Value>,
 }
 
-/// Requests and proposals an agent handed to the user at the end of a turn.
-/// One list per tab; the agent replaces it wholesale with `todo set`.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct InboxTodoList {
-    id: u64,
-    /// The tab title at the last `todo set`.
-    title: String,
-    arena_name: String,
-    updated_at: DateTime<Utc>,
-    asker: Option<InboxAsker>,
-    items: Vec<InboxTodoItem>,
-    /// The owner arena's branch at the last `todo set`.
-    #[serde(default)]
-    branch: Option<String>,
-    /// The owner arena's directory, to restore the tab after a restart.
-    #[serde(default)]
-    arena_path: Option<PathBuf>,
-    #[serde(skip)]
-    tab: Option<InboxTab>,
-    /// The user's draft answers, by item title. Not persisted: cheap to redo.
-    #[serde(skip)]
-    choices: HashMap<String, inbox_todo_view::TodoChoice>,
+pub struct TodoListEntry {
+    pub id: u64,
+    pub kind: InboxTodoKind,
+    pub state: TodoState,
+    pub title: String,
+    pub detail: Option<String>,
+    /// The user's condition from Go, if any.
+    pub condition: Option<String>,
+    pub arena_name: String,
+    /// Tab titles of the assigned sessions; closed ones say so.
+    pub assignees: Vec<String>,
+    /// Assigned to the calling session.
+    pub mine: bool,
 }
 
-/// The list owned by the tab `item_id`, or by the same asker in a tab
-/// reopened after a restart.
-fn todo_list_index(
-    lists: &[InboxTodoList],
-    item_id: EntityId,
-    asker: Option<&InboxAsker>,
-) -> Option<usize> {
-    lists
-        .iter()
-        .position(|list| list.tab.as_ref().is_some_and(|tab| tab.item.id() == item_id))
-        .or_else(|| {
-            let asker = asker?;
-            lists.iter().position(|list| list.asker.as_ref() == Some(asker))
-        })
+/// Whom `todo assign` points an item at.
+pub enum AssignTarget {
+    /// The calling session (`--to self`).
+    Caller,
+    /// A tab by title, in the caller's arena unless `--arena` says otherwise.
+    Tab { title: String, arena: ArenaSelector },
+    /// Remove the calling session (`--unassign`).
+    Unassign,
 }
 
 /// The id to hand out next: every persisted kind of Inbox record shares one
@@ -502,13 +394,13 @@ fn todo_list_index(
 fn next_inbox_id(
     questions: &[InboxQuestion],
     completions: &[InboxCompletion],
-    todos: &[InboxTodoList],
+    max_todo_id: Option<u64>,
 ) -> u64 {
     questions
         .iter()
         .map(|question| question.id)
         .chain(completions.iter().map(|completion| completion.id))
-        .chain(todos.iter().map(|todo| todo.id))
+        .chain(max_todo_id)
         .max()
         .map_or(1, |id| id + 1)
 }
@@ -516,9 +408,9 @@ fn next_inbox_id(
 /// What survives an Agentium restart to find the asking tab again: tab
 /// entities and shell PIDs do not, but `claude --resume` keeps the session id
 /// and restored ACP tabs keep their saved id.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum InboxAsker {
+pub enum InboxAsker {
     ClaudeSession { session_id: String },
     CodexAcp { saved_id: Uuid },
 }
@@ -527,6 +419,36 @@ struct InboxTab {
     arena: WeakEntity<Arena>,
     pane: WeakEntity<Pane>,
     item: Box<dyn workspace::WeakItemHandle>,
+}
+
+/// The tab a `todo` CLI command was run from.
+struct TodoCaller {
+    arena: Entity<Arena>,
+    arena_index: Option<usize>,
+    arena_path: Option<PathBuf>,
+    arena_name: String,
+    /// `None` for a plain shell: the user, not an agent, ran the command.
+    asker: Option<InboxAsker>,
+    item: Box<dyn workspace::ItemHandle>,
+}
+
+impl TodoCaller {
+    fn creator(&self) -> TodoCreator {
+        match &self.asker {
+            Some(asker) => TodoCreator::Session {
+                asker: asker.clone(),
+            },
+            None => TodoCreator::Human,
+        }
+    }
+
+    fn assignee(&self) -> Option<Assignee> {
+        Some(Assignee {
+            asker: self.asker.clone()?,
+            arena_path: self.arena_path.clone(),
+            arena_name: self.arena_name.clone(),
+        })
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -902,11 +824,10 @@ struct InboxCompletionRow {
     todo_count: usize,
 }
 
+/// One task (or task-less arena) with open To do items.
 struct InboxTodoRow {
-    id: u64,
-    is_active: bool,
+    scope: task_overview::OverviewScope,
     title: String,
-    arena_name: String,
     item_count: usize,
     updated_at: DateTime<Utc>,
     note: Option<String>,
@@ -1542,8 +1463,23 @@ impl AgentiumApp {
         let inbox_questions: Vec<InboxQuestion> = load_inbox_file(INBOX_QUESTIONS_FILE);
         let mut inbox_completions: Vec<InboxCompletion> = load_inbox_file(INBOX_COMPLETIONS_FILE);
         inbox_completions.retain(|completion| completion.confirmed_at.is_none());
-        let inbox_todos = cx.new(|_| {
-            inbox_todo_view::InboxTodos::new(Some(paths::data_dir().join(INBOX_TODOS_FILE)))
+        let board = board::load_board();
+        // Lists written by earlier versions take fresh ids from the shared
+        // Inbox counter while they are migrated to items.
+        let mut next_inbox_question_id = next_inbox_id(&inbox_questions, &inbox_completions, None);
+        let inbox_todos = cx.new(|cx| {
+            let mut todos = inbox_todo_view::InboxTodos::load(
+                Some(paths::data_dir().join(INBOX_TODOS_FILE)),
+                &|path| {
+                    board
+                        .tasks_containing_worktree(path)
+                        .first()
+                        .map(|task| task.id)
+                },
+                &mut next_inbox_question_id,
+            );
+            todos.persist_migration(cx);
+            todos
         });
         let inbox_todos_subscription = cx.observe(&inbox_todos, |this, _, cx| {
             for arena in &this.arenas {
@@ -1551,11 +1487,11 @@ impl AgentiumApp {
             }
             cx.notify();
         });
-        let next_inbox_question_id = next_inbox_id(
-            &inbox_questions,
-            &inbox_completions,
-            inbox_todos.read(cx).lists(),
-        );
+        let next_inbox_question_id = next_inbox_question_id.max(next_inbox_id(
+            &[],
+            &[],
+            inbox_todos.read(cx).max_id(),
+        ));
         let overview = {
             let app = cx.entity();
             cx.new(|cx| task_overview::TaskOverview::new(app, cx))
@@ -1614,7 +1550,7 @@ impl AgentiumApp {
             _inbox_completions_write_task: None,
             pr_cache: load_pr_cache(),
             _pr_cache_write_task: None,
-            board: board::load_board(),
+            board,
             _board_write_task: None,
             bee_available: false,
             backlog_issue_ids: HashMap::new(),
@@ -3465,192 +3401,441 @@ impl AgentiumApp {
         Ok(id)
     }
 
-    /// Replaces the to-do list of the tab whose process tree contains
-    /// `peer_ancestor_pids` (kernel-verified, as for `inbox_ask`). `items` is
-    /// already validated by `parse_todo_set_request`.
-    pub fn todo_set(
-        &mut self,
-        peer_ancestor_pids: &[u32],
-        items: Vec<InboxTodoItem>,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<TodoSetReply> {
-        validate_todo_items(&items)?;
-        let (arena, pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
-        let asker = self.inbox_asker(item.as_ref(), cx);
-        let tab = InboxTab {
-            arena: arena.downgrade(),
-            pane: pane.downgrade(),
-            item: item.downgrade_item(),
-        };
-        let previous_title = todo_list_index(
-            self.inbox_todos.read(cx).lists(),
-            item.item_id(),
-            asker.as_ref(),
-        )
-        .map(|index| self.inbox_todos.read(cx).lists()[index].title.clone());
-        let owner = inbox_todo_view::TodoOwner {
-            title: self.tab_headline(item.as_ref(), previous_title, cx),
+    /// The caller's tab as a To do actor: the agent session in it, or the
+    /// user when the tab is a plain shell. Only the kernel-verified peer
+    /// ancestry is used, as for `todo_ask`.
+    fn todo_caller(&self, peer_ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TodoCaller> {
+        let (arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
+        let arena_index = self.arenas.iter().position(|candidate| *candidate == arena);
+        Ok(TodoCaller {
+            asker: self.inbox_asker(item.as_ref(), cx),
             arena_name: arena.read(cx).name.clone(),
             arena_path: arena.read(cx).working_directory.clone(),
-            branch: self.branch_name_for_arena(arena.entity_id(), cx),
-        };
-        let count = items.len();
-        let mut next_id = self.next_inbox_question_id;
-        let dropped = self.inbox_todos.update(cx, |todos, cx| {
-            todos.set_items(
-                item.item_id(),
-                tab,
-                asker,
-                owner,
-                items,
-                &mut next_id,
-                cx,
-            )
-        });
-        self.next_inbox_question_id = next_id;
-        Ok(TodoSetReply { count, dropped })
+            arena_index,
+            arena,
+            item,
+        })
     }
 
-    /// What the agent in the tab is working on: the prompt for a Claude
-    /// terminal (the tab title is just "Claude"), the terminal title for other
-    /// agents, the tab title otherwise.
-    /// The latest prompt can be the Inbox's own answer to this list; the
-    /// list keeps `previous` then rather than titling itself after it.
-    fn tab_headline(
+    /// The task a To do created in the arena belongs to: the selected task
+    /// when it contains the arena, else the first task that does.
+    fn todo_task_for_arena(&self, arena_index: usize) -> Option<Uuid> {
+        let tasks = self.tasks_with_live_arena(arena_index);
+        self.selected_task
+            .filter(|selected| tasks.contains(selected))
+            .or_else(|| tasks.first().copied())
+    }
+
+    fn todo_scope_for_task(&self, task_id: Uuid, cx: &App) -> inbox_todo_view::TodoScope {
+        let arena_paths = self
+            .board
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.worktrees.clone())
+            .unwrap_or_default();
+        let live_ids = self.live_arena_entity_ids_for_task(task_id);
+        let arena_names = self
+            .arenas
+            .iter()
+            .filter(|arena| live_ids.contains(&arena.entity_id()))
+            .map(|arena| arena.read(cx).name.clone())
+            .collect();
+        inbox_todo_view::TodoScope {
+            task_id: Some(task_id),
+            arena_paths,
+            arena_names,
+        }
+    }
+
+    fn todo_scope_for_arena(&self, arena_index: usize, cx: &App) -> inbox_todo_view::TodoScope {
+        if let Some(task_id) = self.todo_task_for_arena(arena_index) {
+            return self.todo_scope_for_task(task_id, cx);
+        }
+        let arena = self.arenas[arena_index].read(cx);
+        inbox_todo_view::TodoScope {
+            task_id: None,
+            arena_paths: arena.working_directory.clone().into_iter().collect(),
+            arena_names: vec![arena.name.clone()],
+        }
+    }
+
+    fn todo_scope_for_overview(
         &self,
-        item: &dyn workspace::ItemHandle,
-        previous: Option<String>,
+        scope: task_overview::OverviewScope,
         cx: &App,
-    ) -> String {
-        if let Some(view) = item.act_as::<TerminalView>(cx) {
-            let terminal = view.read(cx).terminal().read(cx);
-            if let Some(pid) = terminal.pid_getter().map(|getter| getter.fallback_pid().as_u32())
-                && let Some(session) = self
-                    .claude_sessions
-                    .values()
-                    .find(|session| session.ancestor_pids.contains(&pid))
-                && !session.user_prompt.trim().is_empty()
-            {
-                return headline_from_prompt(&session.user_prompt, previous)
-                    .unwrap_or_else(|| item.tab_content_text(0, cx).to_string());
-            }
-            if !terminal.breadcrumb_text.trim().is_empty() {
-                return terminal.breadcrumb_text.clone();
+    ) -> inbox_todo_view::TodoScope {
+        match scope {
+            task_overview::OverviewScope::Task(task_id) => self.todo_scope_for_task(task_id, cx),
+            task_overview::OverviewScope::Arena(entity_id) => {
+                let arena = self
+                    .arenas
+                    .iter()
+                    .find(|arena| arena.entity_id() == entity_id)
+                    .map(|arena| arena.read(cx));
+                inbox_todo_view::TodoScope {
+                    task_id: None,
+                    arena_paths: arena
+                        .and_then(|arena| arena.working_directory.clone())
+                        .into_iter()
+                        .collect(),
+                    arena_names: arena.map(|arena| arena.name.clone()).into_iter().collect(),
+                }
             }
         }
-        item.tab_content_text(0, cx).to_string()
     }
 
-    /// The caller's list, and read-only the lists of the other tabs in its arena.
-    pub fn todo_list(&self, peer_ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TodoListReply> {
-        let (arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
-        let asker = self.inbox_asker(item.as_ref(), cx);
-        let lists = self.inbox_todos.read(cx).lists();
-        let own_index = todo_list_index(lists, item.item_id(), asker.as_ref());
-        let own = own_index
-            .map(|index| lists[index].items.clone())
+    pub fn todo_add(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        kind: InboxTodoKind,
+        title: String,
+        detail: Option<String>,
+        unassigned: bool,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<u64> {
+        let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        let task_id = caller
+            .arena_index
+            .and_then(|index| self.todo_task_for_arena(index));
+        let branch = self.branch_name_for_arena(caller.arena.entity_id(), cx);
+        let draft = inbox_todo_view::TodoDraft {
+            task_id,
+            arena_path: caller.arena_path.clone(),
+            arena_name: caller.arena_name.clone(),
+            branch,
+            kind,
+            title,
+            detail,
+            created_by: caller.creator(),
+            assignee: if unassigned { None } else { caller.assignee() },
+        };
+        let mut next_id = self.next_inbox_question_id;
+        let id = self
+            .inbox_todos
+            .update(cx, |todos, cx| todos.add(draft, &mut next_id, cx))?;
+        self.next_inbox_question_id = next_id;
+        Ok(id)
+    }
+
+    pub fn todo_take(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        todo_id: u64,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        let assignee = caller
+            .assignee()
+            .context("a plain shell has no session to take an item; assign from Task Overview")?;
+        self.inbox_todos
+            .update(cx, |todos, cx| todos.take(todo_id, assignee, cx))
+    }
+
+    pub fn todo_assign(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        todo_id: u64,
+        target: AssignTarget,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        match target {
+            AssignTarget::Caller => {
+                let assignee = caller.assignee().context(
+                    "a plain shell has no session to assign; name a tab with --to <title>",
+                )?;
+                self.inbox_todos
+                    .update(cx, |todos, cx| todos.assign(todo_id, assignee, cx))
+            }
+            AssignTarget::Unassign => {
+                let asker = caller
+                    .asker
+                    .context("a plain shell has no session to unassign")?;
+                self.inbox_todos
+                    .update(cx, |todos, cx| todos.unassign(todo_id, &asker, cx))
+            }
+            AssignTarget::Tab { title, arena } => {
+                let item = self.unique_item_by_title(&title, &arena, cx)?;
+                let asker = self
+                    .inbox_asker(item.as_ref(), cx)
+                    .with_context(|| format!("tab {title:?} is not running a coding agent"))?;
+                let (tab_arena, _, _) =
+                    inbox_todo_view::find_item_location(&self.arenas, item.item_id(), cx)
+                        .with_context(|| format!("tab {title:?} is not open"))?;
+                let assignee = Assignee {
+                    asker,
+                    arena_path: tab_arena.read(cx).working_directory.clone(),
+                    arena_name: tab_arena.read(cx).name.clone(),
+                };
+                self.inbox_todos
+                    .update(cx, |todos, cx| todos.assign(todo_id, assignee, cx))
+            }
+        }
+    }
+
+    pub fn todo_done(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        todo_id: u64,
+        note: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let by = self.todo_session_caller(peer_ancestor_pids, cx)?;
+        self.inbox_todos.update(cx, |todos, cx| {
+            todos.done(todo_id, by, TodoOutcome::Completed, note.as_deref(), cx)
+        })
+    }
+
+    /// Closing and editing from the CLI need an identified session: the
+    /// `Human` override is for the overview, where the user acts in person.
+    fn todo_session_caller(
+        &self,
+        peer_ancestor_pids: &[u32],
+        cx: &App,
+    ) -> anyhow::Result<TodoCreator> {
+        let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        let asker = caller.asker.context(
+            "this tab is not running Claude Code or Codex ACP; close or edit the item from Task Overview",
+        )?;
+        Ok(TodoCreator::Session { asker })
+    }
+
+    pub fn todo_update(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        todo_id: u64,
+        title: Option<String>,
+        detail: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let by = self.todo_session_caller(peer_ancestor_pids, cx)?;
+        self.inbox_todos.update(cx, |todos, cx| {
+            todos.update(todo_id, &by, title.as_deref(), detail.as_deref(), cx)
+        })
+    }
+
+    /// The items of the caller's task (open ones unless `all`), and the
+    /// pending questions of its arena.
+    pub fn todo_list(
+        &self,
+        peer_ancestor_pids: &[u32],
+        all: bool,
+        cx: &App,
+    ) -> anyhow::Result<TodoListReply> {
+        let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        let scope = caller
+            .arena_index
+            .map(|index| self.todo_scope_for_arena(index, cx))
             .unwrap_or_default();
-        let others = lists
+        let todos = self.inbox_todos.read(cx);
+        let mut items: Vec<&TodoItem> = todos
+            .items()
             .iter()
-            .enumerate()
-            .filter(|(index, _)| Some(*index) != own_index)
-            .filter_map(|(_, list)| {
-                let item_id = list.tab.as_ref()?.item.id();
-                let (list_arena, _, list_item) =
-                    inbox_todo_view::find_item_location(&self.arenas, item_id, cx)?;
-                (list_arena == arena).then(|| {
-                    (
-                        list_item.tab_content_text(0, cx).to_string(),
-                        list.items.clone(),
-                    )
-                })
+            .filter(|item| scope.contains(item) && (all || item.is_open()))
+            .collect();
+        items.sort_by_key(|item| item.id);
+        let items = items
+            .into_iter()
+            .map(|item| TodoListEntry {
+                id: item.id,
+                kind: item.kind,
+                state: item.state,
+                title: item.title.clone(),
+                detail: item.detail.clone(),
+                condition: item.request.as_ref().and_then(|request| request.note.clone()),
+                arena_name: item.arena_name.clone(),
+                assignees: item
+                    .assigned
+                    .iter()
+                    .map(|assignee| self.assignee_label(assignee, cx))
+                    .collect(),
+                mine: caller
+                    .asker
+                    .as_ref()
+                    .is_some_and(|asker| item.is_assigned_to(asker)),
             })
             .collect();
+        let arena = &caller.arena;
         let questions = self.inbox_questions.iter()
             .filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[arena.entity_id()], &[], cx))
             .map(|question| serde_json::json!({
                 "id": question.id, "question": question.question, "context": question.context,
                 "options": question.options, "recommended": question.recommended, "assumed": question.assumed,
                 "owner": question.live_tab().map(|(_, _, item)| item.tab_content_text(0, cx).to_string()).unwrap_or_else(|| "Agent (not restored)".into()),
-                "own": question.belongs_to(item.item_id(), asker.as_ref()),
+                "own": question.belongs_to(caller.item.item_id(), caller.asker.as_ref()),
             })).collect();
-        Ok(TodoListReply { own, others, questions })
+        Ok(TodoListReply { items, questions })
     }
 
-    pub fn todo_clear(
+    /// The tab title of an assigned session, or its kind when the tab is
+    /// closed.
+    fn assignee_label(&self, assignee: &Assignee, cx: &App) -> String {
+        match self
+            .tab_for_asker(&assignee.asker, cx)
+            .and_then(|tab| tab.item.upgrade())
+        {
+            Some(item) => item.tab_content_text(0, cx).to_string(),
+            None => match &assignee.asker {
+                InboxAsker::ClaudeSession { .. } => "Claude (closed)".to_string(),
+                InboxAsker::CodexAcp { .. } => "Codex (closed)".to_string(),
+            },
+        }
+    }
+
+    /// Lets the user attach one of the task's open agent tabs to the item.
+    fn deploy_assign_menu(
         &mut self,
-        peer_ancestor_pids: &[u32],
+        todo_id: u64,
+        position: Point<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<usize> {
-        let (_arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
-        let asker = self.inbox_asker(item.as_ref(), cx);
-        Ok(self.inbox_todos.update(cx, |todos, cx| {
-            todos.clear_for(item.item_id(), asker.as_ref(), cx)
-        }))
-    }
-
-    fn dismiss_inbox_todo(&mut self, todo_id: u64, cx: &mut Context<Self>) {
-        self.inbox_todos
-            .update(cx, |todos, cx| todos.dismiss(todo_id, cx));
-    }
-
-    /// Restores the owner before the user sends answers from Overview.
-    fn restore_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(list) = self.inbox_todos.read(cx).list(todo_id) else {
+    ) {
+        let Some(item) = self.inbox_todos.read(cx).item(todo_id).cloned() else {
             return;
         };
-        let owner_open = list.tab.as_ref().is_some_and(|tab| {
-            inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx).is_some()
-        });
-        if !owner_open {
-            match self.pending_todo_restores.get(&todo_id).copied() {
-                Some(inbox_todo_view::PendingRestore::Launched { item_id }) => {
-                    // Show what the resumed session is doing (asking
-                    // something, or failing) instead of starting another.
-                    if let Some((arena, pane, item)) =
-                        inbox_todo_view::find_item_location(&self.arenas, item_id, cx)
-                        && let Some(index) =
-                            self.arenas.iter().position(|candidate| *candidate == arena)
-                    {
-                        self.navigate_to_item(index, &pane, item.as_ref(), window, cx);
-                    }
-                    return;
-                }
-                Some(_) => return,
-                None => {}
+        let arena_indices: Vec<usize> = match item.task_id {
+            Some(task_id) => {
+                let live_ids = self.live_arena_entity_ids_for_task(task_id);
+                self.arenas
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, arena)| live_ids.contains(&arena.entity_id()))
+                    .map(|(index, _)| index)
+                    .collect()
             }
-            let open_arenas: Vec<(String, PathBuf)> = self
+            None => self
                 .arenas
                 .iter()
-                .filter_map(|arena| {
-                    let arena = arena.read(cx);
-                    Some((arena.name.clone(), arena.working_directory.clone()?))
+                .enumerate()
+                .filter(|(_, arena)| {
+                    arena.read(cx).working_directory == item.arena_path && item.arena_path.is_some()
                 })
-                .collect();
-            let plan = inbox_todo_view::todo_restore_plan(list, &open_arenas);
-            let asker = list.asker.clone();
-            self.todo_restore_errors.remove(&todo_id);
-            match plan {
-                inbox_todo_view::RestorePlan::Fallback(reason) => {
-                    self.todo_restore_errors.insert(todo_id, reason);
-                }
-                plan => {
-                    self.restore_todo_owner(todo_id, plan, asker, window, cx);
-                    cx.notify();
-                    return;
+                .map(|(index, _)| index)
+                .collect(),
+        };
+        let mut candidates: Vec<(String, Assignee)> = Vec::new();
+        for index in arena_indices {
+            let arena = &self.arenas[index];
+            let arena_name = arena.read(cx).name.clone();
+            let arena_path = arena.read(cx).working_directory.clone();
+            for pane in arena.read(cx).center.panes() {
+                for tab in pane.read(cx).items() {
+                    let Some(asker) = self.inbox_asker(tab.as_ref(), cx) else {
+                        continue;
+                    };
+                    if item.is_assigned_to(&asker) {
+                        continue;
+                    }
+                    candidates.push((
+                        format!("{} · {arena_name}", tab.tab_content_text(0, cx)),
+                        Assignee {
+                            asker,
+                            arena_path: arena_path.clone(),
+                            arena_name: arena_name.clone(),
+                        },
+                    ));
                 }
             }
         }
-        self.open_inbox_todo(todo_id, window, cx);
+        let this = cx.entity();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |mut menu, window, _| {
+            if candidates.is_empty() {
+                menu = menu.header("No agent tab is open in this task");
+            }
+            for (label, assignee) in candidates {
+                menu = menu.entry(
+                    label,
+                    None,
+                    window.handler_for(&this, move |this, _window, cx| {
+                        let assignee = assignee.clone();
+                        this.inbox_todos
+                            .update(cx, |todos, cx| todos.assign(todo_id, assignee, cx))
+                            .log_err();
+                    }),
+                );
+            }
+            menu
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
-    /// Brings back the closed owner tab of a list: `claude --resume` for a
+    /// Restores the owner before the user sends answers from Overview.
+    /// Opens the tab of a session assigned to the item, or brings it back
+    /// when it is closed.
+    fn open_or_restore_assignee(
+        &mut self,
+        todo_id: u64,
+        asker: InboxAsker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((arena, pane, item)) = self
+            .tab_for_asker(&asker, cx)
+            .and_then(|tab| tab.item.upgrade())
+            .and_then(|item| inbox_todo_view::find_item_location(&self.arenas, item.item_id(), cx))
+            && let Some(index) = self.arenas.iter().position(|candidate| *candidate == arena)
+        {
+            self.navigate_to_item(index, &pane, item.as_ref(), window, cx);
+            return;
+        }
+        match self.pending_todo_restores.get(&todo_id).cloned() {
+            Some(inbox_todo_view::PendingRestore::Launched { item_id, .. }) => {
+                // Show what the resumed session is doing (asking something,
+                // or failing) instead of starting another.
+                if let Some((arena, pane, item)) =
+                    inbox_todo_view::find_item_location(&self.arenas, item_id, cx)
+                    && let Some(index) =
+                        self.arenas.iter().position(|candidate| *candidate == arena)
+                {
+                    self.navigate_to_item(index, &pane, item.as_ref(), window, cx);
+                }
+                return;
+            }
+            Some(_) => return,
+            None => {}
+        }
+        let Some(assignee) = self.inbox_todos.read(cx).item(todo_id).and_then(|item| {
+            item.assigned
+                .iter()
+                .find(|assignee| assignee.asker == asker)
+                .cloned()
+        }) else {
+            return;
+        };
+        let open_arenas: Vec<(String, PathBuf)> = self
+            .arenas
+            .iter()
+            .filter_map(|arena| {
+                let arena = arena.read(cx);
+                Some((arena.name.clone(), arena.working_directory.clone()?))
+            })
+            .collect();
+        let plan = inbox_todo_view::todo_restore_plan(&assignee, &open_arenas);
+        self.todo_restore_errors.remove(&todo_id);
+        match plan {
+            inbox_todo_view::RestorePlan::Fallback(reason) => {
+                self.todo_restore_errors.insert(todo_id, reason);
+            }
+            plan => self.restore_todo_owner(todo_id, plan, asker, window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Brings back the closed tab of an assignee: `claude --resume` for a
     /// Claude session, its arena (which restores saved ACP tabs) for Codex ACP.
     fn restore_todo_owner(
         &mut self,
         todo_id: u64,
         plan: inbox_todo_view::RestorePlan,
-        asker: Option<InboxAsker>,
+        asker: InboxAsker,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3684,8 +3869,10 @@ impl AgentiumApp {
                     );
                     return;
                 };
-                self.pending_todo_restores
-                    .insert(todo_id, inbox_todo_view::PendingRestore::Launching);
+                self.pending_todo_restores.insert(
+                    todo_id,
+                    inbox_todo_view::PendingRestore::Launching { asker },
+                );
                 let launch = arena.update(cx, |arena, cx| {
                     arena.resume_claude_session(session_id, window, cx)
                 });
@@ -3705,10 +3892,8 @@ impl AgentiumApp {
                 .detach_and_log_err(cx);
             }
             inbox_todo_view::RestorePlan::OpenArena { .. } => {
-                let asker_tab = asker
-                    .as_ref()
-                    .is_some_and(|asker| self.tab_for_asker(asker, cx).is_some());
-                match inbox_todo_view::acp_restore_outcome(arena.is_some(), asker_tab) {
+                let asker_tab = self.tab_for_asker(&asker, cx).is_some();
+                match inbox_todo_view::acp_restore_outcome(arena.is_some(), asker_tab, asker) {
                     Ok(pending) => {
                         self.pending_todo_restores.insert(todo_id, pending);
                     }
@@ -3728,32 +3913,50 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let inbox_todo_view::InboxTodoViewEvent::Send { todo_id, notes } = event;
-        // Located again now: the binding is only refreshed on render, and the
-        // tab may have been closed since.
-        let owner = self
-            .inbox_todos
-            .read(cx)
-            .list(*todo_id)
-            .and_then(|list| list.tab.as_ref().map(|tab| tab.item.id()))
-            .and_then(|item_id| inbox_todo_view::find_item_location(&self.arenas, item_id, cx))
-            .map(|(_, _, item)| item);
-        let processed = view.read(cx).selected_items(notes, cx);
-        let todos = self.inbox_todos.clone();
-        let result = todos.update(cx, |todos, cx| {
-            todos.send(
-                *todo_id,
-                notes,
-                owner.as_deref(),
-                |item, message, cx| self.send_message_to_item(item, true, message, window, cx),
-                cx,
-            )
-        });
-        if result.is_ok() {
-            view.update(cx, |view, cx| view.record_processed(processed, cx));
+        match event {
+            inbox_todo_view::InboxTodoViewEvent::Send { todo_ids, notes } => {
+                let todos = self.inbox_todos.clone();
+                let result = todos.update(cx, |todos, cx| {
+                    todos.send(
+                        todo_ids,
+                        notes,
+                        |asker, message, cx| {
+                            // Located now: the tab may have closed since the
+                            // overview rendered its assignees.
+                            let item = self
+                                .tab_for_asker(asker, cx)
+                                .and_then(|tab| tab.item.upgrade())
+                                .context("the assigned tab is not open")?;
+                            self.send_message_to_item(item.as_ref(), true, message, window, cx)
+                        },
+                        cx,
+                    )
+                });
+                match result {
+                    Ok(report) => view.update(cx, |view, cx| {
+                        view.set_error(None, cx);
+                        view.set_report(report, cx);
+                    }),
+                    Err(error) => {
+                        view.update(cx, |view, cx| view.set_error(Some(format!("{error:#}")), cx))
+                    }
+                }
+            }
+            inbox_todo_view::InboxTodoViewEvent::Assign { todo_id, position } => {
+                self.deploy_assign_menu(*todo_id, *position, window, cx);
+            }
+            inbox_todo_view::InboxTodoViewEvent::OpenAssignee { todo_id, asker } => {
+                self.open_or_restore_assignee(*todo_id, asker.clone(), window, cx);
+            }
+            inbox_todo_view::InboxTodoViewEvent::Unassign { todo_id, asker } => {
+                let result = self
+                    .inbox_todos
+                    .update(cx, |todos, cx| todos.unassign(*todo_id, asker, cx));
+                if let Err(error) = result {
+                    view.update(cx, |view, cx| view.set_error(Some(format!("{error:#}")), cx));
+                }
+            }
         }
-        let error = result.err().map(|error| format!("{error:#}"));
-        view.update(cx, |view, cx| view.set_error(error, cx));
     }
 
     fn inbox_asker(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<InboxAsker> {
@@ -3777,7 +3980,7 @@ impl AgentiumApp {
     /// not yet reopened after a restart) to the tab now hosting the same
     /// asker, and drops questions that have lost their tab and have no asker
     /// to wait for. Completions stay until dismissed.
-    fn bind_inbox_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn bind_inbox_tabs(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let mut found = Vec::new();
         for (index, question) in self.inbox_questions.iter().enumerate() {
             if question.live_tab().is_some() {
@@ -3819,63 +4022,30 @@ impl AgentiumApp {
             }
         }
 
-        // Ownership means being in a pane now: a closed tab's entity can
-        // outlive it, and a moved tab keeps its item but not its pane.
-        let bindings: Vec<(u64, Option<InboxTab>)> = self
-            .inbox_todos
-            .read(cx)
-            .lists()
-            .iter()
-            .map(|list| {
-                let current = list
-                    .tab
-                    .as_ref()
-                    .and_then(|tab| {
-                        inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx)
-                    })
-                    .map(|(arena, pane, item)| InboxTab {
-                        arena: arena.downgrade(),
-                        pane: pane.downgrade(),
-                        item: item.downgrade_item(),
-                    });
-                let tab = current.or_else(|| {
-                    list.asker
-                        .as_ref()
-                        .and_then(|asker| self.tab_for_asker(asker, cx))
-                });
-                (list.id, tab)
-            })
-            .collect();
-        self.inbox_todos
-            .update(cx, |todos, cx| todos.rebind(bindings, cx));
-
         let todos = self.inbox_todos.read(cx);
+        // Taken out so the observation can read the rest of `self`.
+        let mut pending = std::mem::take(&mut self.pending_todo_restores);
         let outcomes = inbox_todo_view::advance_pending_restores(
-            &mut self.pending_todo_restores,
-            |todo_id, restore| {
-                let list = todos.list(todo_id);
-                inbox_todo_view::RestoreObservation {
-                    list_exists: list.is_some(),
-                    list_bound: list.is_some_and(|list| list.tab.is_some()),
-                    launched_tab_open: match restore {
-                        inbox_todo_view::PendingRestore::Launched { item_id } => {
-                            inbox_todo_view::find_item_location(&self.arenas, *item_id, cx)
-                                .is_some()
-                        }
-                        _ => true,
-                    },
-                }
+            &mut pending,
+            |todo_id, restore| inbox_todo_view::RestoreObservation {
+                item_exists: todos.item(todo_id).is_some(),
+                assignee_open: self.tab_for_asker(restore.asker(), cx).is_some(),
+                launched_tab_open: match restore {
+                    inbox_todo_view::PendingRestore::Launched { item_id, .. } => {
+                        inbox_todo_view::find_item_location(&self.arenas, *item_id, cx).is_some()
+                    }
+                    _ => true,
+                },
             },
         );
+        self.pending_todo_restores = pending;
         self.todo_restore_errors
-            .retain(|todo_id, _| todos.list(*todo_id).is_some());
+            .retain(|todo_id, _| todos.item(*todo_id).is_some());
         for (todo_id, outcome) in outcomes {
             match outcome {
-                inbox_todo_view::RestoreOutcome::Open => {
-                    cx.defer_in(window, move |this, window, cx| {
-                        this.open_inbox_todo(todo_id, window, cx);
-                    });
-                }
+                // The overview column is always visible; the restored tab's
+                // row updates on the next render.
+                inbox_todo_view::RestoreOutcome::Open => cx.notify(),
                 inbox_todo_view::RestoreOutcome::Failed(error) => {
                     self.todo_restore_errors.insert(todo_id, error);
                 }
@@ -7426,66 +7596,6 @@ impl Focusable for AgentiumApp {
 }
 
 impl AgentiumApp {
-    fn overview_todo_ids(
-        &self,
-        arena_ids: &[EntityId],
-        additional_paths: &[PathBuf],
-        cx: &App,
-    ) -> Vec<u64> {
-        let arenas: Vec<_> = self
-            .arenas
-            .iter()
-            .filter(|arena| arena_ids.contains(&arena.entity_id()))
-            .collect();
-        let mut paths = additional_paths.to_vec();
-        paths.extend(
-            arenas
-                .iter()
-                .filter_map(|arena| arena.read(cx).working_directory.clone()),
-        );
-        let names: Vec<_> = arenas
-            .iter()
-            .map(|arena| arena.read(cx).name.clone())
-            .collect();
-        self.inbox_todos
-            .read(cx)
-            .lists()
-            .iter()
-            .filter(|list| {
-                let live_in_scope = list
-                    .tab
-                    .as_ref()
-                    .and_then(|tab| {
-                        inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx)
-                    })
-                    .map(|(arena, _, _)| arena_ids.contains(&arena.entity_id()));
-                task_overview::todo_matches_scope(
-                    live_in_scope,
-                    list.arena_path.as_deref(),
-                    &list.arena_name,
-                    &paths,
-                    &names,
-                )
-            })
-            .map(|list| list.id)
-            .collect()
-    }
-
-    fn overview_scope(&self, arena: &Entity<Arena>, cx: &App) -> task_overview::OverviewScope {
-        arena
-            .read(cx)
-            .working_directory
-            .as_ref()
-            .and_then(|path| {
-                self.board
-                    .tasks_containing_worktree(path)
-                    .first()
-                    .map(|task| task.id)
-            })
-            .map(task_overview::OverviewScope::Task)
-            .unwrap_or(task_overview::OverviewScope::Arena(arena.entity_id()))
-    }
-
     /// Shows the overview that contains `scope`: the task, or the arena when
     /// it belongs to no task.
     fn show_overview_scope(
@@ -7510,30 +7620,22 @@ impl AgentiumApp {
         cx.notify();
     }
 
-    fn open_inbox_todo(&mut self, todo_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(list) = self.inbox_todos.read(cx).list(todo_id) else {
-            return;
-        };
-        let scope = list
-            .tab
-            .as_ref()
-            .and_then(|tab| inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx))
-            .map(|(arena, _, _)| self.overview_scope(&arena, cx))
-            .or_else(|| {
-                list.arena_path.as_ref().and_then(|path| {
-                    self.board
-                        .tasks_containing_worktree(path)
-                        .first()
-                        .map(|task| task_overview::OverviewScope::Task(task.id))
-                })
-            })
-            .or_else(|| {
-                self.active_arena()
-                    .map(|arena| self.overview_scope(arena, cx))
-            });
-        if let Some(scope) = scope {
-            self.show_overview_scope(scope, window, cx);
+    /// The overview an item belongs to: its task, else the open arena it
+    /// was created in.
+    fn overview_scope_for_todo(&self, item: &TodoItem, cx: &App) -> Option<task_overview::OverviewScope> {
+        if let Some(task_id) = item.task_id {
+            return Some(task_overview::OverviewScope::Task(task_id));
         }
+        self.arenas
+            .iter()
+            .find(|arena| {
+                let arena = arena.read(cx);
+                match &item.arena_path {
+                    Some(path) => arena.working_directory.as_ref() == Some(path),
+                    None => arena.name == item.arena_name,
+                }
+            })
+            .map(|arena| task_overview::OverviewScope::Arena(arena.entity_id()))
     }
 
     fn render_task_overview(
@@ -7580,7 +7682,6 @@ impl AgentiumApp {
                 )
             }
         };
-        let todo_ids = self.overview_todo_ids(&arena_ids, &paths, cx);
         let mut content = v_flex()
             .id("task-overview")
             .size_full()
@@ -7696,7 +7797,6 @@ impl AgentiumApp {
             .filter(|(_, arena)| arena_ids.contains(&arena.entity_id()))
             .map(|(index, arena)| (index, arena.clone()))
             .collect();
-        let mut rendered_todos = HashSet::new();
         for (arena_index, arena) in arenas {
             content = content.child(self.render_overview_arena_row(arena_index, &arena, cx));
             content = content.child(self.render_coordinator(&arena, cx));
@@ -7853,27 +7953,11 @@ impl AgentiumApp {
                                     )
                                 })),
                         );
-                    let todo_id =
-                        todo_list_index(self.inbox_todos.read(cx).lists(), item_id, asker.as_ref())
-                            .and_then(|index| self.inbox_todos.read(cx).lists().get(index))
-                            .map(|list| list.id);
-                    let todo_id = todo_id.or_else(|| {
-                        overview
-                            .todo_owners
-                            .iter()
-                            .find_map(|(id, owner)| (*owner == item_id).then_some(*id))
-                    });
                     let question_ids: Vec<_> = self.inbox_questions.iter()
                         .filter(|question| question.belongs_to(item_id, asker.as_ref()))
                         .map(|question| question.id).collect();
-                    if let Some(todo_id) = todo_id {
-                        overview.todo_owners.insert(todo_id, item_id);
-                        rendered_todos.insert(todo_id);
-                    }
-                    if let Some(section_id) = todo_id.or_else(|| question_ids.first().copied()) {
-                        card = card.child(self.render_agent_todos(section_id, &question_ids, overview, &overview_entity, window, cx));
-                    } else {
-                        card = card.child(Label::new("No pending To do items.").color(Color::Muted));
+                    if !question_ids.is_empty() {
+                        card = card.child(self.render_agent_questions(&question_ids, overview, &overview_entity, cx));
                     }
                     content = content.child(card);
                 }
@@ -7895,24 +7979,15 @@ impl AgentiumApp {
                 content = content.child(self.render_closed_worktree_row(task_id, path, missing, &colors, cx));
             }
         }
-        for todo_id in todo_ids {
-            if !rendered_todos.contains(&todo_id) {
-                content = content.child(self.render_overview_todo(
-                    todo_id,
-                    overview,
-                    &overview_entity,
-                    window,
-                    cx,
-                ));
-            }
-        }
+        content = content.child(Label::new("To do"));
+        content = content.child(self.render_scope_todos(scope, overview, window, cx));
         let closed_questions: Vec<_> = self.inbox_questions.iter()
             .filter(|question| question.live_tab().is_none() && self.question_in_scope(question, &arena_ids, &paths, cx))
             .map(|question| (question.id, question.arena_name.clone())).collect();
         for (question_id, arena_name) in closed_questions {
             content = content.child(v_flex().min_w_0().flex_shrink_0().gap_2().p_3().border_1().border_color(colors.border).rounded_md()
                 .child(Label::new(format!("{arena_name} · Agent not restored")))
-                .child(self.render_agent_todos(question_id, &[question_id], overview, &overview_entity, window, cx)));
+                .child(self.render_agent_questions(&[question_id], overview, &overview_entity, cx)));
         }
         content.into_any_element()
     }
@@ -7930,219 +8005,143 @@ impl AgentiumApp {
         matching.next().is_none() && arena_ids.contains(&arena.entity_id())
     }
 
-    fn render_agent_todos(
+    /// One agent's pending questions, with its answered ones folded below.
+    fn render_agent_questions(
         &mut self,
-        section_id: u64,
         question_ids: &[u64],
         overview: &mut task_overview::TaskOverview,
         overview_entity: &Entity<task_overview::TaskOverview>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let Some(section_id) = question_ids.first().copied() else {
+            return div().into_any_element();
+        };
         let mut questions: Vec<_> = self.collect_inbox_entries(cx).questions.into_iter()
             .filter(|row| question_ids.contains(&row.id)).collect();
         questions.sort_by_key(|row| row.assumed);
-        let count = questions.len() + self.inbox_todos.read(cx).list(section_id).map_or(0, |list| list.items.len());
         let history: Vec<_> = self.inbox_questions.iter().filter(|question| question_ids.contains(&question.id))
             .filter_map(|question| question.resolution.as_ref().map(|resolution| (question.question.clone(), resolution.clone()))).collect();
-        let expanded = !overview.collapsed_todos.contains(&section_id);
+        let count = questions.len();
+        let expanded = !overview.collapsed_questions.contains(&section_id);
         let overview_entity = overview_entity.clone();
+        let colors = cx.theme().colors().clone();
         let mut section = v_flex().min_w_0().flex_shrink_0().gap_2().child(
-            Button::new(SharedString::from(format!("agent-todos-{section_id}")), format!("{} To do · {count}", if expanded { "▾" } else { "▸" }))
+            Button::new(SharedString::from(format!("agent-questions-{section_id}")), format!("{} Questions · {count}", if expanded { "▾" } else { "▸" }))
                 .on_click(move |_, _, cx| overview_entity.update(cx, |overview, cx| {
-                    if !overview.collapsed_todos.remove(&section_id) { overview.collapsed_todos.insert(section_id); }
+                    if !overview.collapsed_questions.remove(&section_id) { overview.collapsed_questions.insert(section_id); }
                     cx.notify();
                 }))
         );
         if expanded {
-            let has_questions = !questions.is_empty();
             section = section.children(questions.into_iter().map(|row| self.render_inbox_question(row, cx)));
-            let view = overview.todos.entry(section_id).or_insert_with(|| {
-                let todos = self.inbox_todos.clone();
-                let view = cx.new(|cx| inbox_todo_view::InboxTodoView::new(todos, section_id, window, cx));
-                cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event).detach();
-                view
-            }).clone();
-            view.update(cx, |view, cx| {
-                if view.question_history != history || view.pending_questions != has_questions {
-                    view.question_history = history;
-                    view.pending_questions = has_questions;
-                    cx.notify();
-                }
-            });
-            section = section.child(view);
+            section = section.children(history.into_iter().rev().map(|(question, resolution)| {
+                v_flex().gap_1().p_2().border_1().border_color(colors.border_variant).rounded_md()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(question))
+                    .child(div().text_sm().child(resolution))
+            }));
         }
         section.into_any_element()
     }
 
-    fn render_overview_todo(
+    /// The scope's To do list, created once per scope and fed the live state
+    /// of its assignees on every render.
+    fn render_scope_todos(
         &mut self,
-        todo_id: u64,
+        scope: task_overview::OverviewScope,
         overview: &mut task_overview::TaskOverview,
-        overview_entity: &Entity<task_overview::TaskOverview>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let list = self.inbox_todos.read(cx).list(todo_id);
-        let count = list.map_or(0, |list| list.items.len());
-        let title = list
-            .map(|list| list.title.clone())
-            .unwrap_or_else(|| "Processed items".into());
-        let closed = list.is_some_and(|list| {
-            list.tab
-                .as_ref()
-                .and_then(|tab| inbox_todo_view::find_item_location(&self.arenas, tab.item.id(), cx))
-                .is_none()
-        });
-        let metadata = list.map(|list| {
-            let location = match &list.branch {
-                Some(branch) => format!("{} · {branch}", list.arena_name),
-                None => list.arena_name.clone(),
-            };
-            let updated_at = list
-                .updated_at
-                .with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M");
-            format!("{location} · updated {updated_at}")
-        });
-        let (agent_name, agent_icon) = match list.and_then(|list| list.asker.as_ref()) {
-            Some(InboxAsker::ClaudeSession { .. }) => ("Claude", Some(IconName::AiClaude)),
-            Some(InboxAsker::CodexAcp { .. }) => ("Codex", Some(IconName::AiOpenAi)),
-            None => ("Agent", None),
+        let todo_scope = self.todo_scope_for_overview(scope, cx);
+        let view = match overview.todo_view.clone() {
+            Some(view) => {
+                view.update(cx, |view, cx| view.set_scope(todo_scope, window, cx));
+                view
+            }
+            None => {
+                let todos = self.inbox_todos.clone();
+                let view = cx.new(|cx| {
+                    inbox_todo_view::InboxTodoView::new(todos, todo_scope, window, cx)
+                });
+                cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event)
+                    .detach();
+                overview.todo_view = Some(view.clone());
+                view
+            }
         };
-        let preview_items: Vec<_> = list
-            .into_iter()
-            .flat_map(|list| list.items.iter())
-            .take(2)
-            .map(|item| item.title.clone())
-            .collect();
-        let restoring = self.pending_todo_restores.contains_key(&todo_id);
-        let expanded = overview.expanded.contains(&todo_id);
-        let overview_entity = overview_entity.clone();
+        let assignees = self.assignee_rows(&view, cx);
+        view.update(cx, |view, cx| view.set_assignees(assignees, cx));
+        view.into_any_element()
+    }
+
+    /// Where each assignee of the view's open items is now: its tab title
+    /// and agent state, or closed.
+    fn assignee_rows(
+        &self,
+        view: &Entity<inbox_todo_view::InboxTodoView>,
+        cx: &App,
+    ) -> HashMap<u64, Vec<inbox_todo_view::AssigneeRow>> {
         let colors = cx.theme().colors();
-        let mut section = v_flex().flex_shrink_0().min_w_0().gap_2().child(
-            h_flex()
-                .id(SharedString::from(format!("overview-todo-{todo_id}")))
-                .min_w_0()
-                .gap_1()
-                .cursor_pointer()
-                .child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .px_1p5()
-                        .rounded_md()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(inbox_todo_color())
-                        .bg(inbox_todo_color().opacity(0.15))
-                        .child(format!("To do · {count}")),
-                )
-                .when_some(metadata, |row, metadata| {
-                    row.child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_xs()
-                            .text_color(colors.text_muted)
-                            .child(metadata),
-                    )
-                })
-                .on_click(move |_, _, cx| {
-                    overview_entity.update(cx, |overview, cx| {
-                        if !overview.expanded.remove(&todo_id) {
-                            overview.expanded.insert(todo_id);
-                        }
-                        cx.notify();
-                    })
-                }),
-        );
-        if expanded {
-            let view = overview
-                .todos
-                .entry(todo_id)
-                .or_insert_with(|| {
-                    let todos = self.inbox_todos.clone();
-                    let view =
-                        cx.new(|cx| inbox_todo_view::InboxTodoView::new(todos, todo_id, window, cx));
-                    cx.subscribe_in(&view, window, Self::handle_inbox_todo_view_event)
-                        .detach();
-                    view
-                })
-                .clone();
-            section = section.child(view);
-        }
-        if closed {
-            let colors = cx.theme().colors();
-            let mut card = v_flex()
-                .flex_shrink_0()
-                .min_w_0()
-                .gap_2()
-                .p_3()
-                .border_1()
-                .border_color(colors.border)
-                .rounded_md()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .when_some(agent_icon, |row, icon| row.child(Icon::new(icon)))
-                        .child(div().flex_1().child(agent_name))
-                        .child(
-                            Label::new(if restoring {
-                                "Restoring…"
-                            } else {
-                                "Not restored"
-                            })
-                            .color(Color::Muted),
-                        ),
-                )
-                .child(div().text_sm().child(title))
-                .child(Label::new("Saved To do items · agent tab is closed").color(Color::Muted))
-                .child(
-                    Button::new(
-                        SharedString::from(format!("overview-restore-{todo_id}")),
-                        "Restore agent tab",
-                    )
-                    .disabled(restoring)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.restore_inbox_todo(todo_id, window, cx)
-                    })),
-                )
-                .child(section);
-            if !expanded {
-                for title in preview_items {
-                    card = card.child(div().text_sm().child(format!("• {title}")));
-                }
-                if count > 2 {
-                    card =
-                        card.child(Label::new(format!("And {} more", count - 2)).color(Color::Muted));
-                }
+        let status_colors = cx.theme().status();
+        let mut rows = HashMap::new();
+        for item in view.read(cx).open_items(cx) {
+            let restoring = self
+                .pending_todo_restores
+                .get(&item.id)
+                .map(|pending| pending.asker().clone());
+            let error = self.todo_restore_errors.get(&item.id).cloned();
+            let mut entries = Vec::new();
+            for assignee in &item.assigned {
+                let icon = match &assignee.asker {
+                    InboxAsker::ClaudeSession { .. } => Some(IconName::AiClaude),
+                    InboxAsker::CodexAcp { .. } => Some(IconName::AiOpenAi),
+                };
+                let live = self
+                    .tab_for_asker(&assignee.asker, cx)
+                    .and_then(|tab| Some((tab.arena.upgrade()?, tab.item.upgrade()?)));
+                let (label, state_color, state_label) = match live {
+                    Some((arena, tab)) => {
+                        let info = self.tab_info(tab.as_ref(), &arena, cx);
+                        let (color, label) = match info.state {
+                            Some("permission") => (status_colors.warning, "waiting for permission"),
+                            Some("running") => (status_colors.success, "running"),
+                            Some("ready") => (colors.text_accent, "completed"),
+                            Some("error") => (status_colors.error, "error"),
+                            _ => (colors.text, "idle"),
+                        };
+                        (info.title, Some(color), label)
+                    }
+                    None => (
+                        format!("{} · {}", self.assignee_label(assignee, cx), assignee.arena_name),
+                        None,
+                        "closed",
+                    ),
+                };
+                entries.push(inbox_todo_view::AssigneeRow {
+                    asker: assignee.asker.clone(),
+                    label,
+                    icon,
+                    state_color,
+                    state_label,
+                    restoring: restoring.as_ref() == Some(&assignee.asker),
+                    error: error.clone().filter(|_| restoring.is_none()),
+                });
             }
-            if let Some(error) = self.todo_restore_errors.get(&todo_id) {
-                card = card.child(Label::new(error.clone()).color(Color::Error));
-            }
-            return card.into_any_element();
+            rows.insert(item.id, entries);
         }
-        section.into_any_element()
+        rows
     }
 
     fn render_arena_row(&mut self, i: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(arena_entity) = self.arenas.get(i).cloned() else {
             return div().into_any_element();
         };
-        let todo_count = self.overview_todo_ids(&[arena_entity.entity_id()], &[], cx).iter()
-            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
-            .map(|list| list.items.len()).sum::<usize>()
-            + self.inbox_questions.iter().filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[arena_entity.entity_id()], &[], cx)).count();
+        let todo_count = self.pending_todo_count(
+            &self.todo_scope_for_arena(i, cx),
+            &[arena_entity.entity_id()],
+            &[],
+            cx,
+        );
         let arena_entity = &arena_entity;
         let colors = cx.theme().colors();
         let active_index = self.active_arena_index;
@@ -8759,7 +8758,7 @@ impl AgentiumApp {
                 error: question.error.clone(),
             });
         }
-        let todo_lists = self.inbox_todos.read(cx).lists();
+        let todos = self.inbox_todos.read(cx);
         for completion in &self.inbox_completions {
             let note = (completion.pull_request.is_none() && completion.live_tab().is_none())
                 .then_some("tab not open");
@@ -8780,39 +8779,57 @@ impl AgentiumApp {
                 confirmed: completion.confirmed_at.is_some(),
                 note,
                 failure: completion.failure.clone(),
-                todo_count: completion
-                    .tab
-                    .as_ref()
-                    .map(|tab| tab.item.id())
-                    .and_then(|item_id| {
-                        todo_list_index(todo_lists, item_id, completion.asker.as_ref())
-                    })
-                    .or_else(|| {
-                        let asker = completion.asker.as_ref()?;
-                        todo_lists
-                            .iter()
-                            .position(|list| list.asker.as_ref() == Some(asker))
-                    })
-                    .map_or(0, |index| todo_lists[index].items.len()),
-            });
-        }
-        for list in todo_lists {
-            entries.todos.push(InboxTodoRow {
-                id: list.id,
-                is_active: false,
-                title: list.title.clone(),
-                arena_name: list.arena_name.clone(),
-                item_count: list.items.len(),
-                updated_at: list.updated_at,
-                note: self.todo_restore_errors.get(&list.id).cloned().or_else(|| {
-                    if self.pending_todo_restores.contains_key(&list.id) {
-                        Some("restoring the tab…".to_string())
-                    } else {
-                        list.tab.is_none().then(|| "tab not open · restore from Task Overview".to_string())
-                    }
+                todo_count: completion.asker.as_ref().map_or(0, |asker| {
+                    todos
+                        .items()
+                        .iter()
+                        .filter(|item| item.is_open() && item.is_assigned_to(asker))
+                        .count()
                 }),
             });
         }
+        // One row per task (or task-less arena) that has open items.
+        let mut todo_rows: Vec<(task_overview::OverviewScope, InboxTodoRow)> = Vec::new();
+        for item in todos.items().iter().filter(|item| item.is_open()) {
+            let Some(scope) = self.overview_scope_for_todo(item, cx) else {
+                continue;
+            };
+            let note = self.todo_restore_errors.get(&item.id).cloned().or_else(|| {
+                self.pending_todo_restores
+                    .contains_key(&item.id)
+                    .then(|| "restoring a tab…".to_string())
+            });
+            match todo_rows.iter_mut().find(|(candidate, _)| *candidate == scope) {
+                Some((_, row)) => {
+                    row.item_count += 1;
+                    row.updated_at = row.updated_at.max(item.updated_at);
+                    row.note = row.note.take().or(note);
+                }
+                None => {
+                    let title = match scope {
+                        task_overview::OverviewScope::Task(task_id) => self
+                            .board
+                            .tasks
+                            .iter()
+                            .find(|task| task.id == task_id)
+                            .map(|task| task.title.clone())
+                            .unwrap_or_else(|| item.arena_name.clone()),
+                        task_overview::OverviewScope::Arena(_) => item.arena_name.clone(),
+                    };
+                    todo_rows.push((
+                        scope,
+                        InboxTodoRow {
+                            scope,
+                            title,
+                            item_count: 1,
+                            updated_at: item.updated_at,
+                            note,
+                        },
+                    ));
+                }
+            }
+        }
+        entries.todos.extend(todo_rows.into_iter().map(|(_, row)| row));
         for (arena_index, arena_entity) in self.arenas.iter().enumerate() {
             let arena_name = arena_entity.read(cx).name.clone();
             let to_entry = |info: BadgeEntryInfo| InboxEntry {
@@ -9072,31 +9089,26 @@ impl AgentiumApp {
 
     fn render_inbox_todo(&self, row: InboxTodoRow, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let todo_id = row.id;
-        let title = if row.title.is_empty() {
-            row.arena_name.clone()
-        } else {
-            truncate_for_menu(&row.title)
-        };
+        let scope = row.scope;
+        let title = truncate_for_menu(&row.title);
         let detail = format!(
-            "{} · {} {} · {}",
-            row.arena_name,
+            "{} {} · {}",
             row.item_count,
             if row.item_count == 1 { "item" } else { "items" },
             row.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
         );
+        let row_id = match scope {
+            task_overview::OverviewScope::Task(task_id) => format!("inbox-todo-task-{task_id}"),
+            task_overview::OverviewScope::Arena(entity_id) => format!("inbox-todo-arena-{entity_id:?}"),
+        };
         h_flex()
-            .id(SharedString::from(format!("inbox-todo-{todo_id}")))
+            .id(SharedString::from(row_id))
             .mx_1()
             .px_2()
             .py_1()
             .gap_1()
             .rounded_md()
-            .bg(if row.is_active {
-                colors.element_selected
-            } else {
-                colors.element_background
-            })
+            .bg(colors.element_background)
             .cursor_pointer()
             .hover(|d| d.bg(colors.element_hover))
             .child(
@@ -9121,20 +9133,8 @@ impl AgentiumApp {
                         d.child(div().text_xs().text_color(colors.text_accent).child(note))
                     }),
             )
-            .child(
-                IconButton::new(
-                    SharedString::from(format!("inbox-todo-{todo_id}-dismiss")),
-                    IconName::Close,
-                )
-                .icon_size(IconSize::Small)
-                .tooltip(Tooltip::text("Dismiss"))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.dismiss_inbox_todo(todo_id, cx);
-                })),
-            )
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open_inbox_todo(todo_id, window, cx);
+                this.show_overview_scope(scope, window, cx);
             }))
             .into_any_element()
     }
@@ -9485,14 +9485,21 @@ impl AgentiumApp {
             }))
     }
 
-    /// Pending To do items plus unanswered questions in the given scope; the
-    /// same count the per-arena badge shows.
-    fn pending_todo_count(&self, arena_ids: &[EntityId], paths: &[PathBuf], cx: &App) -> usize {
-        self.overview_todo_ids(arena_ids, paths, cx)
+    /// Open To do items in `todo_scope` plus unanswered questions of the
+    /// arenas; the same count the per-arena badge shows.
+    fn pending_todo_count(
+        &self,
+        todo_scope: &inbox_todo_view::TodoScope,
+        arena_ids: &[EntityId],
+        paths: &[PathBuf],
+        cx: &App,
+    ) -> usize {
+        self.inbox_todos
+            .read(cx)
+            .items()
             .iter()
-            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
-            .map(|list| list.items.len())
-            .sum::<usize>()
+            .filter(|item| item.is_open() && todo_scope.contains(item))
+            .count()
             + self
                 .inbox_questions
                 .iter()
@@ -9755,7 +9762,12 @@ impl AgentiumApp {
                 })
                 .collect();
             let dots = self.task_status_dots(&task.worktrees, cx);
-            let todo_count = self.pending_todo_count(&live_arena_ids, &task.worktree_paths, cx);
+            let todo_count = self.pending_todo_count(
+                &self.todo_scope_for_task(task_id, cx),
+                &live_arena_ids,
+                &task.worktree_paths,
+                cx,
+            );
             let header = h_flex()
                 .id(SharedString::from(format!("task-header-{task_id}")))
                 .px_2()
@@ -9965,10 +9977,6 @@ impl AgentiumApp {
             .unwrap_or_else(|| path.display().to_string());
         let element_id = SharedString::from(format!("task-worktree-{task_id}-{}", path.display()));
         let path_for_open = path.clone();
-        let todo_count: usize = self.overview_todo_ids(&[], std::slice::from_ref(&path), cx).iter()
-            .filter_map(|id| self.inbox_todos.read(cx).list(*id))
-            .map(|list| list.items.len()).sum::<usize>()
-            + self.inbox_questions.iter().filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[], std::slice::from_ref(&path), cx)).count();
         let path_for_menu = path;
 
         h_flex()
@@ -9989,15 +9997,8 @@ impl AgentiumApp {
                     .min_w_0()
                     .truncate()
                     .text_color(colors.text_muted)
-                    .child(name.clone()),
+                    .child(name),
             )
-            .when(todo_count > 0, |row| row.child(
-                render_arena_pill(SharedString::from(format!("closed-todo-{task_id}-{name}")), todo_count, inbox_todo_color(), colors.surface_background)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.select_task(task_id, window, cx);
-                    }))
-            ))
             .when(missing, |d| {
                 d.child(
                     div()
@@ -10759,9 +10760,9 @@ mod tests {
     use super::{
         CiCheckEntry, CiFetchGenerations, CiInfo, CiStatus, FinishKey, FinishedTab,
         InboxCompletion, InboxPullRequest,
-        InboxTab, InboxTodoItem, InboxTodoKind, InboxTodoList, RecordedTabState,
-        age_inbox_records, apply_ci_status, dropped_todo_titles, next_inbox_id,
-        parse_todo_set_request, record_finished_tabs, todo_list_index,
+        InboxTab, RecordedTabState,
+        age_inbox_records, apply_ci_status, next_inbox_id,
+        record_finished_tabs,
         ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line, resolve_selected_task, arena_to_open_for_task,
@@ -10819,7 +10820,8 @@ mod tests {
         assert!(saved.get("selected_option").is_none());
         let restored: InboxQuestion = serde_json::from_value(saved).expect("restore resolution");
         assert_eq!(restored.resolution, question.resolution);
-        assert_eq!(next_inbox_id(&[restored], &[], &[]), 43);
+        assert_eq!(next_inbox_id(&[restored], &[], None), 43);
+        assert_eq!(next_inbox_id(&[], &[], Some(50)), 51);
     }
 
     #[test]
@@ -11238,118 +11240,6 @@ mod tests {
         generations.forget_arena(key.0);
         assert!(!generations.accept(key, in_flight, &mut last_checked, now));
         assert!(last_checked.is_empty());
-    }
-
-    #[test]
-    fn a_todo_set_request_with_one_malformed_item_is_rejected_whole() {
-        let request = serde_json::json!({
-            "type": "todo_set",
-            "user_tasks": [{ "title": "Check the Failed lane", "detail": null }],
-            "proposals": [{ "title": "Add GPUI tests" }, { "detail": "no title" }],
-        });
-        assert!(parse_todo_set_request(&request).is_err());
-        assert!(parse_todo_set_request(&serde_json::json!({ "user_tasks": [] })).is_err());
-        assert!(
-            parse_todo_set_request(&serde_json::json!({ "user_tasks": "a", "proposals": [] }))
-                .is_err()
-        );
-        let items = parse_todo_set_request(&serde_json::json!({
-            "proposals": [{ "title": " Add GPUI tests ", "detail": "  " }],
-            "user_tasks": [{ "title": "Check the Failed lane", "detail": "red lane" }],
-        }))
-        .expect("valid request");
-        assert_eq!(
-            items,
-            vec![
-                InboxTodoItem {
-                    kind: InboxTodoKind::UserTask,
-                    title: "Check the Failed lane".to_string(),
-                    detail: Some("red lane".to_string()),
-                },
-                InboxTodoItem {
-                    kind: InboxTodoKind::Proposal,
-                    title: "Add GPUI tests".to_string(),
-                    detail: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_list_is_not_titled_after_a_pasted_message() {
-        assert_eq!(
-            super::headline_from_prompt("Fix the flaky test", Some("Old".to_string())),
-            Some("Fix the flaky test".to_string())
-        );
-        assert_eq!(
-            super::headline_from_prompt("[from: Agentium Inbox]\nTo do\nGo: 1 x", Some("Old".to_string())),
-            Some("Old".to_string())
-        );
-        assert_eq!(super::headline_from_prompt("[from: Codex]\nhello", None), None);
-    }
-
-    #[test]
-    fn todo_set_reports_the_items_it_dropped() {
-        let item = |kind, title: &str| InboxTodoItem {
-            kind,
-            title: title.to_string(),
-            detail: None,
-        };
-        let old = vec![
-            item(InboxTodoKind::UserTask, "Check the lane"),
-            item(InboxTodoKind::Proposal, "Add tests"),
-            item(InboxTodoKind::Proposal, "Open a PR"),
-        ];
-        // Only the new items, the mistake the output exists to catch.
-        let new = vec![item(InboxTodoKind::Proposal, "Fix the flaky test")];
-        assert_eq!(
-            dropped_todo_titles(&old, &new),
-            vec!["Check the lane", "Add tests", "Open a PR"]
-        );
-        // Reordered, or moved to the other kind: still there.
-        let new = vec![
-            item(InboxTodoKind::Proposal, "Open a PR"),
-            item(InboxTodoKind::UserTask, "Add tests"),
-            item(InboxTodoKind::UserTask, "Check the lane"),
-        ];
-        assert!(dropped_todo_titles(&old, &new).is_empty());
-    }
-
-    #[gpui::test]
-    fn a_todo_list_is_found_by_its_tab_or_by_its_asker_after_a_restart(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (item, tab) = test_tab(cx);
-        let (reopened, _) = test_tab(cx);
-        let asker = InboxAsker::ClaudeSession {
-            session_id: "c8832ec2".to_string(),
-        };
-        let list = |id, tab: Option<InboxTab>, asker: Option<InboxAsker>| InboxTodoList {
-            id,
-            title: "Fix the Inbox".to_string(),
-            arena_name: "zed".to_string(),
-            updated_at: chrono::Utc::now(),
-            asker,
-            items: Vec::new(),
-            branch: None,
-            arena_path: None,
-            tab,
-            choices: HashMap::new(),
-        };
-        let lists = vec![list(3, None, None), list(5, Some(tab), Some(asker.clone()))];
-        assert_eq!(todo_list_index(&lists, item, None), Some(1));
-
-        // After a restart the list is loaded without a tab.
-        let json = serde_json::to_value(&lists[1]).expect("serialize");
-        assert!(json.get("tab").is_none());
-        let restored: InboxTodoList = serde_json::from_value(json).expect("deserialize");
-        let lists = vec![restored];
-        assert_eq!(todo_list_index(&lists, reopened, Some(&asker)), Some(0));
-        assert_eq!(todo_list_index(&lists, reopened, None), None);
-
-        // Ids continue after the to-do lists even with nothing else saved.
-        assert_eq!(next_inbox_id(&[], &[], &lists), 6);
-        assert_eq!(next_inbox_id(&[], &[], &[]), 1);
     }
 
     #[test]
