@@ -6738,6 +6738,18 @@ fn argv0_name(process: &sysinfo::Process) -> Option<&str> {
         .and_then(|name| name.to_str())
 }
 
+/// A section heading in the Task Overview column: muted title followed by a
+/// rule, matching the sidebar's Unassigned section.
+fn overview_section_header(title: &'static str, colors: &theme::ThemeColors) -> impl IntoElement {
+    h_flex()
+        .pt_1()
+        .pb_0p5()
+        .gap_1()
+        .items_center()
+        .child(div().text_xs().text_color(colors.text_muted).child(title))
+        .child(div().flex_1().h_px().bg(colors.border))
+}
+
 fn arena_agent_icon(
     is_codex_acp: bool,
     has_claude_session: bool,
@@ -8050,7 +8062,7 @@ impl AgentiumApp {
             }
         }
         if !prs.is_empty() || !linked_prs.is_empty() {
-            content = content.child(Label::new("Pull requests"));
+            content = content.child(overview_section_header("Pull requests", &colors));
             for reference in linked_prs {
                 let url = reference.html_url();
                 if seen_prs.iter().any(|seen| seen.as_ref() == url) {
@@ -8121,35 +8133,47 @@ impl AgentiumApp {
                 }
             }
         }
+        let closed_rows: Vec<_> = match scope {
+            task_overview::OverviewScope::Task(task_id) => self
+                .board_cache
+                .task_worktrees
+                .get(&task_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| match row {
+                    WorktreeRow::Live { .. } => None,
+                    WorktreeRow::Closed { path } => Some((task_id, path.clone(), false)),
+                    WorktreeRow::Missing { path } => Some((task_id, path.clone(), true)),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !arenas.is_empty() || !closed_rows.is_empty() {
+            content = content.child(overview_section_header("Arenas", &colors));
+        }
         let mut cards = Vec::new();
         for (arena_index, arena) in arenas {
             content = content.child(self.render_overview_arena_row(arena_index, &arena, cx));
             cards.extend(self.session_cards(arena_index, &arena, cx));
         }
+        for (task_id, path, missing) in closed_rows {
+            content = content.child(self.render_closed_worktree_row(task_id, path, missing, &colors, cx));
+        }
+        let mut unassigned_cards = Vec::new();
         for card in &cards {
             if let Some(asker) = card.asker.clone().filter(|asker| assigned_askers.contains(asker)) {
                 contexts.insert(asker, card.context.clone());
-                continue;
+            } else {
+                unassigned_cards.push(card);
             }
+        }
+        if !unassigned_cards.is_empty() {
+            content = content.child(overview_section_header("Unassigned agents", &colors));
+        }
+        for card in unassigned_cards {
             content = content.child(self.render_session_card(card, overview, &overview_entity, window, cx));
         }
-        if let task_overview::OverviewScope::Task(task_id) = scope {
-            let rows = self
-                .board_cache
-                .task_worktrees
-                .get(&task_id)
-                .cloned()
-                .unwrap_or_default();
-            for row in rows {
-                let (path, missing) = match row {
-                    WorktreeRow::Live { .. } => continue,
-                    WorktreeRow::Closed { path } => (path, false),
-                    WorktreeRow::Missing { path } => (path, true),
-                };
-                content = content.child(self.render_closed_worktree_row(task_id, path, missing, &colors, cx));
-            }
-        }
-        content = content.child(Label::new("To do"));
+        content = content.child(overview_section_header("To do", &colors));
         content = content.child(self.render_scope_todos(scope, overview, &contexts, window, cx));
         // Questions stand on their own: a session with a pending question is
         // listed here whether or not an item is assigned to it.
@@ -8162,7 +8186,7 @@ impl AgentiumApp {
             .filter(|question| question.live_tab().is_none() && self.question_in_scope(question, &arena_ids, &paths, cx))
             .map(|question| (question.id, question.arena_name.clone())).collect();
         if !asking.is_empty() || !closed_questions.is_empty() {
-            content = content.child(Label::new("Questions"));
+            content = content.child(overview_section_header("Questions", &colors));
         }
         for (title, question_ids) in asking {
             content = content.child(v_flex().min_w_0().flex_shrink_0().gap_2().p_3().border_1().border_color(colors.border).rounded_md()
