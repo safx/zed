@@ -9962,20 +9962,25 @@ impl AgentiumApp {
             ("busy", dots.busy, colors.text),
         ];
         h_flex()
-            .gap_1()
             .items_center()
             .flex_shrink_0()
             .children(states.into_iter().filter_map(|(name, dot, color)| {
                 let arena_index = dot.first_arena?;
                 let entries = dot.entries;
                 let tooltip_entries = entries.clone();
+                // The hit area is larger than the dot: an 8px target was
+                // too small to click reliably.
                 Some(
                     div()
                         .id(SharedString::from(format!("task-dot-{name}-{task_id}")))
-                        .size(px(8.0))
-                        .rounded_full()
-                        .bg(color)
+                        .size(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .hover(|hit_area| hit_area.bg(colors.element_hover))
                         .cursor_pointer()
+                        .child(div().size(px(10.0)).rounded_full().bg(color))
                         .tooltip(Tooltip::element(move |_window, cx| {
                             render_badge_tooltip(&tooltip_entries, cx)
                         }))
