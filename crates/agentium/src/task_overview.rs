@@ -5,7 +5,7 @@ use ui::{Button, Clickable as _, Icon, IconSize, Tooltip, h_flex, v_flex};
 
 use crate::{AgentiumApp, inbox_todo_view::InboxTodoView};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum OverviewScope {
     Task(uuid::Uuid),
     Arena(EntityId),

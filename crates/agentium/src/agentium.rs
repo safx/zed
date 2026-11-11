@@ -1175,7 +1175,9 @@ pub struct AgentiumApp {
     /// so selecting a task again returns to where the user was.
     last_active_arena: HashMap<Uuid, EntityId>,
     overview: Entity<task_overview::TaskOverview>,
-    overview_collapsed: bool,
+    /// Scopes whose overview the user hid. Kept per task so switching tasks
+    /// restores each one's own state; not persisted.
+    collapsed_overviews: HashSet<Option<task_overview::OverviewScope>>,
     /// Dragged at the column's right edge; not persisted.
     overview_width: Pixels,
     agent_activity: Option<(EntityId, Point<Pixels>)>,
@@ -1608,7 +1610,7 @@ impl AgentiumApp {
             selected_task: None,
             last_active_arena: HashMap::new(),
             overview,
-            overview_collapsed: false,
+            collapsed_overviews: HashSet::new(),
             overview_width: px(OVERVIEW_COLUMN_WIDTH),
             agent_activity: None,
             next_inbox_question_id,
@@ -7928,7 +7930,22 @@ impl AgentiumApp {
                 }
             }
         }
-        self.overview_collapsed = false;
+        self.set_overview_collapsed(false, cx);
+    }
+
+    fn overview_collapsed(&self, cx: &App) -> bool {
+        self.collapsed_overviews
+            .contains(&self.overview.read(cx).scope)
+    }
+
+    /// Applies to the scope shown now, so other tasks keep their own state.
+    fn set_overview_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        let scope = self.overview.read(cx).scope;
+        if collapsed {
+            self.collapsed_overviews.insert(scope);
+        } else {
+            self.collapsed_overviews.remove(&scope);
+        }
         cx.notify();
     }
 
@@ -8020,8 +8037,7 @@ impl AgentiumApp {
                                     .map(|arena| arena.focus_handle(cx))
                                     .unwrap_or_else(|| this.focus_handle.clone());
                                 fallback.focus(window, cx);
-                                this.overview_collapsed = true;
-                                cx.notify();
+                                this.set_overview_collapsed(true, cx);
                             })),
                     ),
             );
@@ -8327,7 +8343,8 @@ impl AgentiumApp {
         cards
     }
 
-    /// The card of a session that no open item is assigned to.
+    /// The row of a session that no open item is assigned to: name, model
+    /// and status on one line, the rest behind its context menu.
     fn render_session_card(
         &mut self,
         card: &SessionCard,
@@ -8339,29 +8356,38 @@ impl AgentiumApp {
         let colors = cx.theme().colors().clone();
         let item_id = card.item.item_id();
         let arena_index = card.arena_index;
-        let target_pane = card.pane.clone();
-        let target_item = card.item.clone();
         let show_context = overview.show_context.contains(&item_id);
-        let context_view = overview_entity.clone();
+        let focused = window.is_window_active()
+            && self.is_active_tab(&card.arena, &card.pane, item_id, cx)
+            && card.item.item_focus_handle(cx).contains_focused(window, cx);
+        let menu_pane = card.pane.clone();
+        let menu_item = card.item.clone();
         v_flex()
             .flex_shrink_0()
             .min_w_0()
             .gap_2()
-            .p_3()
-            .border_1()
-            .border_color(colors.border)
-            .when(
-                window.is_window_active()
-                    && self.is_active_tab(&card.arena, &card.pane, item_id, cx)
-                    && card.item.item_focus_handle(cx).contains_focused(window, cx),
-                |card| card.border_2().border_color(colors.text_accent),
-            )
-            .rounded_md()
             .child(
                 h_flex()
+                    .id(("overview-session", item_id))
+                    .min_w_0()
                     .gap_2()
-                    .child(Icon::new(card.icon))
-                    .child(div().flex_1().min_w_0().truncate().child(card.title.clone()))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if focused { colors.text_accent } else { gpui::transparent_black() })
+                    .hover(|row| row.bg(colors.element_hover))
+                    .child(Icon::new(card.icon).size(IconSize::Small))
+                    .child(div().flex_shrink_0().max_w(px(160.)).truncate().child(card.title.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(colors.text_muted)
+                            .children(card.context.model.clone()),
+                    )
                     .child(
                         Button::new(("overview-status", item_id), card.status).on_click(cx.listener(
                             move |this, event: &ClickEvent, _, cx| {
@@ -8369,32 +8395,76 @@ impl AgentiumApp {
                                 cx.notify();
                             },
                         )),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.deploy_session_context_menu(
+                                arena_index,
+                                menu_pane.clone(),
+                                menu_item.clone(),
+                                show_context,
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        }),
                     ),
             )
-            .when_some(card.context.model.clone(), |card, label| {
-                card.child(Label::new(label).color(Color::Muted))
+            .when(show_context, |element| {
+                element.child(
+                    v_flex()
+                        .pl_6()
+                        .gap_2()
+                        .child(overview.render_message(item_id, "Request", card.context.request.clone(), card.context.request_summary.clone(), overview_entity.clone()))
+                        .child(overview.render_message(item_id, "Response", card.context.response.clone(), card.context.response_summary.clone(), overview_entity.clone())),
+                )
             })
-            .child(Button::new(("overview-context", item_id), if show_context { "▾ Request and response" } else { "▸ Request and response" })
-                .on_click(move |_, _, cx| context_view.update(cx, |overview, cx| {
-                    if !overview.show_context.remove(&item_id) { overview.show_context.insert(item_id); }
-                    cx.notify();
-                })))
-            .when(show_context, |element| element
-                .child(overview.render_message(item_id, "Request", card.context.request.clone(), card.context.request_summary.clone(), overview_entity.clone()))
-                .child(overview.render_message(item_id, "Response", card.context.response.clone(), card.context.response_summary.clone(), overview_entity.clone())))
-            .child(
-                Button::new(("overview-open-agent", item_id), "Open agent tab")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.navigate_to_item(
-                            arena_index,
-                            &target_pane,
-                            target_item.as_ref(),
-                            window,
-                            cx,
-                        )
-                    })),
-            )
             .into_any_element()
+    }
+
+    fn deploy_session_context_menu(
+        &mut self,
+        arena_index: usize,
+        pane: Entity<Pane>,
+        item: Box<dyn workspace::ItemHandle>,
+        showing_context: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        let item_id = item.item_id();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            menu.entry(
+                if showing_context { "Hide Request and Response" } else { "Show Request and Response" },
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    this.overview.update(cx, |overview, cx| {
+                        if !overview.show_context.remove(&item_id) {
+                            overview.show_context.insert(item_id);
+                        }
+                        cx.notify();
+                    });
+                }),
+            )
+            .entry(
+                "Open Agent Tab",
+                None,
+                window.handler_for(&this, move |this, window, cx| {
+                    this.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
+                }),
+            )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
     fn question_in_scope(&self, question: &InboxQuestion, arena_ids: &[EntityId], paths: &[PathBuf], cx: &App) -> bool {
@@ -8699,7 +8769,7 @@ impl AgentiumApp {
                                                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                                                 cx.stop_propagation();
                                                                 this.switch_arena(i, window, cx);
-                                                                this.overview_collapsed = false;
+                                                                this.set_overview_collapsed(false, cx);
                                                             })))
                                                     })
                                                     .when(!permission_infos.is_empty(), |d| {
@@ -10287,7 +10357,6 @@ impl AgentiumApp {
                         return;
                     }
                     this.select_task(task_id, window, cx);
-                    this.overview_collapsed = false;
                     cx.notify();
                 }))
                 .on_mouse_down(
@@ -10758,7 +10827,7 @@ impl Render for AgentiumApp {
                         .with_priority(1)
                     })),
             )
-            .child(if self.overview_collapsed {
+            .child(if self.overview_collapsed(cx) {
                 div()
                     .id("overview-collapsed")
                     .w(px(20.0))
@@ -10776,8 +10845,7 @@ impl Render for AgentiumApp {
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Show Task Overview"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.overview_collapsed = false;
-                                cx.notify();
+                                this.set_overview_collapsed(false, cx);
                             })),
                     )
                     .into_any_element()
