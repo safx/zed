@@ -779,53 +779,6 @@ impl Arena {
     /// Reopens a Claude Code session closed with its tab (e.g. by an Agentium
     /// restart) in a new terminal tab of the active pane. Resolves to the new
     /// tab, or to the error if the terminal could not be started.
-    pub(crate) fn start_coordinator_claude(
-        &mut self,
-        session_id: String,
-        resume: bool,
-        instructions: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<anyhow::Result<EntityId>> {
-        let shell = Shell::WithArguments {
-            program: "claude".into(),
-            args: vec![
-                if resume { "--resume" } else { "--session-id" }.into(),
-                session_id,
-                "--model".into(),
-                "haiku".into(),
-                "--append-system-prompt".into(),
-                instructions,
-                "--allowedTools".into(),
-                "Bash(agentium coordinator summary set *),Bash(agentium todo add *),Bash(agentium todo assign *),Bash(agentium todo list *)".into(),
-            ],
-            title_override: Some(crate::task_coordinator::TITLE.into()),
-        };
-        let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_with_shell(self.working_directory.clone(), shell, cx)
-        });
-        let workspace = self.workspace.clone();
-        let project = self.project.downgrade();
-        let ready_shell_pids = self.session_state.ready_shell_pids.clone();
-        let pane = self.active_pane.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            let terminal = terminal_task.await?;
-            cx.update(|window, cx| {
-                let view = cx.new(|cx| {
-                    let mut view = TerminalView::new(terminal, workspace, None, project, window, cx);
-                    view.set_prompt_waiting_pids(ready_shell_pids);
-                    view.set_custom_title(Some(crate::task_coordinator::TITLE.into()), cx);
-                    view
-                });
-                let item_id = view.entity_id();
-                pane.update(cx, |pane, cx| {
-                    pane.add_item(Box::new(view), true, false, None, window, cx);
-                });
-                item_id
-            })
-        })
-    }
-
     pub(crate) fn resume_claude_session(
         &mut self,
         session_id: String,
