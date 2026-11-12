@@ -111,6 +111,15 @@ pub fn init_acp_host(cx: &mut App) {
                 return false;
             };
             let application = application.read(cx);
+            if let Some((task_id, view)) =
+                application.coordinator_for_conversation(conversation_id, cx)
+            {
+                return !application.overview_collapsed(cx)
+                    && application.overview.read(cx).scope
+                        == Some(task_overview::OverviewScope::Task(task_id))
+                    && application.coordinator_tab_open.contains(&task_id)
+                    && view.focus_handle(cx).contains_focused(window, cx);
+            }
             application.active_arena().is_some_and(|arena| {
                 arena.read(cx).center.panes().iter().any(|pane| {
                     pane.read(cx)
@@ -128,6 +137,15 @@ pub fn init_acp_host(cx: &mut App) {
                 return;
             };
             application.update(cx, |application, cx| {
+                if let Some((task_id, view)) =
+                    application.coordinator_for_conversation(conversation_id, cx)
+                {
+                    application.select_task(task_id, window, cx);
+                    application.set_overview_collapsed(false, cx);
+                    application.coordinator_tab_open.insert(task_id);
+                    window.focus(&view.focus_handle(cx), cx);
+                    return;
+                }
                 let target =
                     application
                         .arenas
@@ -155,30 +173,48 @@ pub fn init_acp_host(cx: &mut App) {
             });
         },
         spawn_terminal_login: |conversation_id, mut login, project, window, cx| {
-            let target = window
-                .root::<AgentiumApp>()
-                .flatten()
-                .and_then(|application| {
-                    application.read(cx).arenas.iter().find_map(|arena| {
-                        arena
-                            .read(cx)
-                            .center
-                            .panes()
-                            .iter()
-                            .any(|pane| {
-                                pane.read(cx)
-                                    .items_of_type::<codex_acp_view::CodexAcpView>()
-                                    .any(|view| view.read(cx).conversation_id() == conversation_id)
-                            })
-                            .then(|| arena.clone())
-                    })
-                });
-            let Some(arena) = target else {
+            let Some(application) = window.root::<AgentiumApp>().flatten() else {
                 return Task::ready(Err(anyhow::anyhow!(
                     "The Codex (ACP) tab is no longer open"
                 )));
             };
-            login.cwd = arena.read(cx).working_directory.clone();
+            let application = application.read(cx);
+            let host = application.arenas.iter().find_map(|arena| {
+                arena
+                    .read(cx)
+                    .center
+                    .panes()
+                    .iter()
+                    .any(|pane| {
+                        pane.read(cx)
+                            .items_of_type::<codex_acp_view::CodexAcpView>()
+                            .any(|view| view.read(cx).conversation_id() == conversation_id)
+                    })
+                    .then(|| (arena.clone(), arena.read(cx).working_directory.clone()))
+            });
+            // A coordinator is in no arena: its login terminal opens in the
+            // active one, running where the coordinator runs.
+            let host = match host {
+                Some(host) => host,
+                None if application
+                    .coordinator_for_conversation(conversation_id, cx)
+                    .is_some() =>
+                {
+                    let Some(arena) = application.active_arena().cloned() else {
+                        return Task::ready(Err(anyhow::anyhow!(
+                            "Open an arena, then retry the Codex login"
+                        )));
+                    };
+                    (arena, Some(task_coordinator::coordinator_directory()))
+                }
+                None => {
+                    return Task::ready(Err(anyhow::anyhow!(
+                        "The Codex (ACP) tab is no longer open"
+                    )));
+                }
+            };
+            let (arena, cwd) = host;
+            login.cwd = cwd;
             let terminal =
                 project.update(cx, |project, cx| project.create_terminal_task(login, cx));
             let workspace = arena.read(cx).workspace.clone();
@@ -446,13 +482,16 @@ struct SessionCard {
 
 /// The tab a `todo` CLI command was run from.
 struct TodoCaller {
-    arena: Entity<Arena>,
+    /// `None` for a Task Coordinator, which runs in no arena.
+    arena: Option<Entity<Arena>>,
     arena_index: Option<usize>,
     arena_path: Option<PathBuf>,
     arena_name: String,
     /// `None` for a plain shell: the user, not an agent, ran the command.
     asker: Option<InboxAsker>,
     item: Box<dyn workspace::ItemHandle>,
+    /// The task of the Task Coordinator that ran the command.
+    coordinator_task: Option<Uuid>,
 }
 
 impl TodoCaller {
@@ -1095,7 +1134,10 @@ struct BoardCache {
 
 pub struct AgentiumApp {
     coordinators: Entity<task_coordinator::Store>,
-    coordinator_runtime: HashMap<PathBuf, task_coordinator::Runtime>,
+    coordinator_runtime: HashMap<Uuid, task_coordinator::Runtime>,
+    /// Tasks whose overview shows the Coordinator tab instead of the
+    /// overview itself; not persisted.
+    coordinator_tab_open: HashSet<Uuid>,
     coordinator_claude_sources: HashMap<String, task_coordinator::Source>,
     coordinator_poll: Option<Task<()>>,
     _coordinator_subscription: Subscription,
@@ -1236,6 +1278,7 @@ impl AgentiumApp {
         });
         let coordinator_subscription = cx.observe(&coordinators, |_, _, cx| cx.notify());
         let coordinator_quit_subscription = cx.on_app_quit(|this, cx| {
+            this.snapshot_all_coordinators(cx);
             let pending = this.coordinators.update(cx, |store, _| store.finish());
             async move {
                 if let Some(pending) = pending {
@@ -1550,6 +1593,7 @@ impl AgentiumApp {
         let mut this = Self {
             coordinators,
             coordinator_runtime: HashMap::new(),
+            coordinator_tab_open: HashSet::new(),
             coordinator_claude_sources: HashMap::new(),
             coordinator_poll: None,
             _coordinator_subscription: coordinator_subscription,
@@ -1762,10 +1806,7 @@ impl AgentiumApp {
         }
         let arena = arena.read(cx);
         if let Some(directory) = arena.working_directory.clone() {
-            let coordinator_id = self.coordinators.read(cx).get(&directory)
-                .and_then(|coordinator| coordinator.codex_id);
-            let tabs = arena.codex_tabs(cx).into_iter()
-                .filter(|tab| Some(tab.id) != coordinator_id).collect();
+            let tabs = arena.codex_tabs(cx);
             self.codex_tabs
                 .update(cx, |store, cx| store.replace(directory, tabs, cx));
         }
@@ -1875,6 +1916,9 @@ impl AgentiumApp {
     fn select_task(&mut self, task_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if !self.board.tasks.iter().any(|task| task.id == task_id) {
             return;
+        }
+        if let Some(previous) = self.selected_task.filter(|previous| *previous != task_id) {
+            self.release_coordinator_focus(previous, window, cx);
         }
         self.selected_task = Some(task_id);
         self.agent_activity = None;
@@ -2803,7 +2847,7 @@ impl AgentiumApp {
         // (the two hooks run as separate IPC processes with no ordering guarantee).
         let session = self
             .claude_sessions
-            .entry(session_id)
+            .entry(session_id.clone())
             .or_insert_with(|| ClaudeSession {
                 ancestor_pids: Vec::new(),
                 state: ClaudeSessionState::Idle,
@@ -2814,6 +2858,7 @@ impl AgentiumApp {
             });
         session.ancestor_pids = ancestor_pids;
         self.sync_session_derived_state();
+        self.note_coordinator_session_started(&session_id, cx);
         cx.notify();
     }
 
@@ -3205,7 +3250,22 @@ impl AgentiumApp {
                 arena: arena.read(cx).working_directory.clone(),
             };
         }
-        let state = self.terminal_shell_pid(item, cx).map(|pid| {
+        let is_terminal = item.act_as::<TerminalView>(cx).is_some();
+        TabInfo {
+            title: item.tab_content_text(0, cx).to_string(),
+            kind: if is_terminal { "terminal" } else { "other" },
+            state: self.item_state(item, cx),
+            arena: arena.read(cx).working_directory.clone(),
+        }
+    }
+
+    /// The `tab list` state of an agent tab, also for coordinators, which
+    /// live in no arena.
+    fn item_state(&self, item: &dyn workspace::ItemHandle, cx: &App) -> Option<&'static str> {
+        if let Some(view) = item.act_as::<codex_acp_view::CodexAcpView>(cx) {
+            return Some(view.read(cx).state().cli_state());
+        }
+        self.terminal_shell_pid(item, cx).map(|pid| {
             if self.session_state.permission_shell_pids.borrow().contains(&pid) {
                 "permission"
             } else if self.session_state.running_shell_pids.borrow().contains(&pid) {
@@ -3215,14 +3275,7 @@ impl AgentiumApp {
             } else {
                 "idle"
             }
-        });
-        let is_terminal = item.act_as::<TerminalView>(cx).is_some();
-        TabInfo {
-            title: item.tab_content_text(0, cx).to_string(),
-            kind: if is_terminal { "terminal" } else { "other" },
-            state,
-            arena: arena.read(cx).working_directory.clone(),
-        }
+        })
     }
 
     pub fn tab_self(&self, ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TabInfo> {
@@ -3460,6 +3513,18 @@ impl AgentiumApp {
     /// user when the tab is a plain shell. Only the kernel-verified peer
     /// ancestry is used, as for `todo_ask`.
     fn todo_caller(&self, peer_ancestor_pids: &[u32], cx: &App) -> anyhow::Result<TodoCaller> {
+        if let Some((task, view)) = self.coordinator_for_ancestors(peer_ancestor_pids, cx) {
+            let item = view.item();
+            return Ok(TodoCaller {
+                asker: self.inbox_asker(item.as_ref(), cx),
+                arena_name: task_coordinator::TITLE.to_string(),
+                arena_path: None,
+                arena_index: None,
+                arena: None,
+                item,
+                coordinator_task: Some(task),
+            });
+        }
         let (arena, _pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
         let arena_index = self.arenas.iter().position(|candidate| *candidate == arena);
         Ok(TodoCaller {
@@ -3467,9 +3532,46 @@ impl AgentiumApp {
             arena_name: arena.read(cx).name.clone(),
             arena_path: arena.read(cx).working_directory.clone(),
             arena_index,
-            arena,
+            arena: Some(arena),
             item,
+            coordinator_task: None,
         })
+    }
+
+    fn todo_caller_task(&self, caller: &TodoCaller) -> Option<Uuid> {
+        caller.coordinator_task.or_else(|| {
+            caller
+                .arena_index
+                .and_then(|index| self.todo_task_for_arena(index))
+        })
+    }
+
+    /// The single tab titled `title` among the task's open arenas, for a
+    /// Task Coordinator that names a tab without `--arena`.
+    fn unique_item_in_task(
+        &self,
+        task_id: Uuid,
+        title: &str,
+        cx: &App,
+    ) -> anyhow::Result<Box<dyn workspace::ItemHandle>> {
+        let arena_ids = self.live_arena_entity_ids_for_task(task_id);
+        let mut matches = Vec::new();
+        for arena in self.arenas.iter().filter(|arena| arena_ids.contains(&arena.entity_id())) {
+            for pane in arena.read(cx).center.panes() {
+                for item in pane.read(cx).items() {
+                    if &*item.tab_content_text(0, cx) == title {
+                        matches.push(item.boxed_clone());
+                    }
+                }
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => anyhow::bail!("no tab titled {title:?} in this task's arenas"),
+            count => anyhow::bail!(
+                "{count} tabs titled {title:?} in this task's arenas; pick one with --arena <path>"
+            ),
+        }
     }
 
     /// The task a To do created in the arena belongs to: the selected task
@@ -3550,10 +3652,14 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<u64> {
         let caller = self.todo_caller(peer_ancestor_pids, cx)?;
-        let task_id = caller
-            .arena_index
-            .and_then(|index| self.todo_task_for_arena(index));
-        let branch = self.branch_name_for_arena(caller.arena.entity_id(), cx);
+        let task_id = self.todo_caller_task(&caller);
+        let branch = caller
+            .arena
+            .as_ref()
+            .and_then(|arena| self.branch_name_for_arena(arena.entity_id(), cx));
+        // A coordinator only files work: being an assignee would let it close
+        // and edit the item, so it never becomes one.
+        let unassigned = unassigned || caller.coordinator_task.is_some();
         let draft = inbox_todo_view::TodoDraft {
             task_id,
             arena_path: caller.arena_path.clone(),
@@ -3580,6 +3686,10 @@ impl AgentiumApp {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        anyhow::ensure!(
+            caller.coordinator_task.is_none(),
+            "the Task Coordinator summarizes and cannot take items"
+        );
         let assignee = caller
             .assignee()
             .context("a plain shell has no session to take an item; assign from Task Overview")?;
@@ -3597,6 +3707,10 @@ impl AgentiumApp {
         let caller = self.todo_caller(peer_ancestor_pids, cx)?;
         match target {
             AssignTarget::Caller => {
+                anyhow::ensure!(
+                    caller.coordinator_task.is_none(),
+                    "the Task Coordinator summarizes and cannot be assigned items"
+                );
                 let assignee = caller.assignee().context(
                     "a plain shell has no session to assign; name a tab with --to <title>",
                 )?;
@@ -3611,7 +3725,12 @@ impl AgentiumApp {
                     .update(cx, |todos, cx| todos.unassign(todo_id, &asker, cx))
             }
             AssignTarget::Tab { title, arena } => {
-                let item = self.unique_item_by_title(&title, &arena, cx)?;
+                let item = match (caller.coordinator_task, &arena) {
+                    (Some(task_id), ArenaSelector::Caller { .. }) => {
+                        self.unique_item_in_task(task_id, &title, cx)?
+                    }
+                    _ => self.unique_item_by_title(&title, &arena, cx)?,
+                };
                 let asker = self
                     .inbox_asker(item.as_ref(), cx)
                     .with_context(|| format!("tab {title:?} is not running a coding agent"))?;
@@ -3679,10 +3798,16 @@ impl AgentiumApp {
         cx: &App,
     ) -> anyhow::Result<TodoListReply> {
         let caller = self.todo_caller(peer_ancestor_pids, cx)?;
-        let scope = caller
-            .arena_index
-            .map(|index| self.todo_scope_for_arena(index, cx))
-            .unwrap_or_default();
+        let scope = match (caller.coordinator_task, caller.arena_index) {
+            (Some(task_id), _) => self.todo_scope_for_task(task_id, cx),
+            (None, Some(index)) => self.todo_scope_for_arena(index, cx),
+            (None, None) => Default::default(),
+        };
+        let question_arenas = match (caller.coordinator_task, &caller.arena) {
+            (Some(task_id), _) => self.live_arena_entity_ids_for_task(task_id),
+            (None, Some(arena)) => vec![arena.entity_id()],
+            (None, None) => Vec::new(),
+        };
         let todos = self.inbox_todos.read(cx);
         let mut items: Vec<&TodoItem> = todos
             .items()
@@ -3711,9 +3836,8 @@ impl AgentiumApp {
                     .is_some_and(|asker| item.is_assigned_to(asker)),
             })
             .collect();
-        let arena = &caller.arena;
         let questions = self.inbox_questions.iter()
-            .filter(|question| question.resolution.is_none() && self.question_in_scope(question, &[arena.entity_id()], &[], cx))
+            .filter(|question| question.resolution.is_none() && self.question_in_scope(question, &question_arenas, &[], cx))
             .map(|question| serde_json::json!({
                 "id": question.id, "question": question.question, "context": question.context,
                 "options": question.options, "recommended": question.recommended, "assumed": question.assumed,
@@ -7967,6 +8091,39 @@ impl AgentiumApp {
             .map(|arena| task_overview::OverviewScope::Arena(arena.entity_id()))
     }
 
+    /// "Overview | Coordinator" under the heading of a task whose
+    /// coordinator is enabled.
+    fn render_overview_tabs(
+        &self,
+        task_id: Uuid,
+        showing_coordinator: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .child(
+                Button::new("overview-tab-overview", "Overview")
+                    .toggle_state(!showing_coordinator)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.release_coordinator_focus(task_id, window, cx);
+                        this.coordinator_tab_open.remove(&task_id);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("overview-tab-coordinator", "Coordinator")
+                    .toggle_state(showing_coordinator)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.coordinator_tab_open.insert(task_id);
+                        if let Some(view) = this.coordinator_view(task_id) {
+                            window.focus(&view.focus_handle(cx), cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_task_overview(
         &mut self,
         overview: &mut task_overview::TaskOverview,
@@ -8011,15 +8168,7 @@ impl AgentiumApp {
                 )
             }
         };
-        let mut content = v_flex()
-            .id("task-overview")
-            .size_full()
-            .overflow_y_scroll()
-            .p_4()
-            .gap_4()
-            .bg(colors.editor_background)
-            .child(
-                h_flex()
+        let heading = h_flex()
                     .gap_2()
                     .items_center()
                     .child(div().flex_1().min_w_0().truncate().text_xl().child(title))
@@ -8039,8 +8188,45 @@ impl AgentiumApp {
                                 fallback.focus(window, cx);
                                 this.set_overview_collapsed(true, cx);
                             })),
-                    ),
-            );
+                    );
+        let coordinator_task = match scope {
+            task_overview::OverviewScope::Task(task_id) => Some(task_id),
+            task_overview::OverviewScope::Arena(_) => None,
+        };
+        let coordinator_controls =
+            coordinator_task.map(|task_id| self.render_coordinator_controls(task_id, cx));
+        let coordinator_tabs = coordinator_task
+            .filter(|task_id| self.coordinator_enabled(*task_id, cx))
+            .map(|task_id| {
+                let showing_coordinator = self.coordinator_tab_open.contains(&task_id);
+                (task_id, showing_coordinator, self.render_overview_tabs(task_id, showing_coordinator, cx))
+            });
+        if let Some((task_id, true, tabs)) = coordinator_tabs {
+            return v_flex()
+                .id("task-overview")
+                .size_full()
+                .bg(colors.editor_background)
+                .child(
+                    v_flex()
+                        .p_4()
+                        .gap_4()
+                        .child(heading)
+                        .children(coordinator_controls)
+                        .child(tabs),
+                )
+                .child(self.render_coordinator_panel(task_id, cx))
+                .into_any_element();
+        }
+        let mut content = v_flex()
+            .id("task-overview")
+            .size_full()
+            .overflow_y_scroll()
+            .p_4()
+            .gap_4()
+            .bg(colors.editor_background)
+            .child(heading)
+            .children(coordinator_controls)
+            .children(coordinator_tabs.map(|(_, _, tabs)| tabs));
         let mut linked_prs = Vec::new();
         if let task_overview::OverviewScope::Task(task_id) = scope {
             if let Some(task) = self
@@ -8226,7 +8412,6 @@ impl AgentiumApp {
         cx: &App,
     ) -> Vec<SessionCard> {
         let mut cards = Vec::new();
-        let arena_path = arena.read(cx).working_directory.clone();
         for pane in arena.read(cx).center.panes() {
             for item in pane.read(cx).items().cloned() {
                 let asker = self.inbox_asker(item.as_ref(), cx);
@@ -8294,8 +8479,8 @@ impl AgentiumApp {
                             "No result received for this turn.".into()
                         }
                     });
-                let (request, request_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), false, prompt, cx);
-                let (response, response_summary) = self.coordinator_message(arena_path.as_deref(), item.as_ref(), true, result, cx);
+                let (request, request_summary) = self.coordinator_message(item.as_ref(), false, prompt, cx);
+                let (response, response_summary) = self.coordinator_message(item.as_ref(), true, result, cx);
                 let item_id = item.item_id();
                 let awaiting_answer = self.inbox_questions.iter().any(|question| {
                     question.resolution.is_none()
@@ -10166,7 +10351,6 @@ impl AgentiumApp {
                             .anchor(Anchor::TopRight)
                     }),
             )
-            .child(self.render_coordinator(arena_entity, cx))
             .child(
                 h_flex()
                     .gap_2()
