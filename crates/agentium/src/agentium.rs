@@ -42,8 +42,8 @@ use project::Project;
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::TerminalView;
 use ui::{
-    ActiveTheme, ButtonStyle, ContextMenu, ListItem, ListItemSpacing, PopoverMenu, Tooltip,
-    prelude::*,
+    ActiveTheme, ButtonStyle, CommonAnimationExt as _, ContextMenu, ListItem, ListItemSpacing,
+    PopoverMenu, Tooltip, prelude::*,
 };
 use ui_input::ErasedEditor;
 use util::{ResultExt as _, paths::PathExt};
@@ -1138,6 +1138,11 @@ pub struct AgentiumApp {
     /// Tasks whose overview shows the Coordinator tab instead of the
     /// overview itself; not persisted.
     coordinator_tab_open: HashSet<Uuid>,
+    /// Tasks whose overview refresh (`task info --update`) is in flight.
+    refreshing_tasks: HashSet<Uuid>,
+    /// Warnings or the error of each task's last overview refresh, shown
+    /// under its heading until dismissed or refreshed again.
+    task_refresh_notes: HashMap<Uuid, String>,
     coordinator_claude_sources: HashMap<String, task_coordinator::Source>,
     coordinator_poll: Option<Task<()>>,
     _coordinator_subscription: Subscription,
@@ -1594,6 +1599,8 @@ impl AgentiumApp {
             coordinators,
             coordinator_runtime: HashMap::new(),
             coordinator_tab_open: HashSet::new(),
+            refreshing_tasks: HashSet::new(),
+            task_refresh_notes: HashMap::new(),
             coordinator_claude_sources: HashMap::new(),
             coordinator_poll: None,
             _coordinator_subscription: coordinator_subscription,
@@ -5009,7 +5016,17 @@ impl AgentiumApp {
         if !update {
             return Task::ready(self.build_task_info_reply(task_id));
         }
+        self.update_task_info(task_id, cx)
+    }
 
+    /// Re-fetches the task's PR and issue metadata via `gh`/`bee` and applies
+    /// it through the same path as PR polling; `task info --update` and the
+    /// overview's refresh button.
+    pub(crate) fn update_task_info(
+        &mut self,
+        task_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<TaskInfoReply>> {
         let Some(task) = self.board.tasks.iter().find(|task| task.id == task_id) else {
             return Task::ready(Err(anyhow::anyhow!("resolved task id not found in board")));
         };
@@ -8091,6 +8108,76 @@ impl AgentiumApp {
             .map(|arena| task_overview::OverviewScope::Arena(arena.entity_id()))
     }
 
+    fn refresh_task(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
+        if !self.refreshing_tasks.insert(task_id) {
+            return;
+        }
+        self.task_refresh_notes.remove(&task_id);
+        let update = self.update_task_info(task_id, cx);
+        cx.spawn(async move |this, cx| {
+            let result = update.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.refreshing_tasks.remove(&task_id);
+                match result {
+                    Ok(reply) if reply.warnings.is_empty() => {}
+                    Ok(reply) => {
+                        this.task_refresh_notes
+                            .insert(task_id, reply.warnings.join("\n"));
+                    }
+                    Err(error) => {
+                        this.task_refresh_notes
+                            .insert(task_id, format!("Update failed: {error:#}"));
+                    }
+                }
+                cx.notify();
+            }) {
+                log::debug!("Agentium closed during a task refresh: {error:#}");
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_task_refresh_button(&self, task_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        if self.refreshing_tasks.contains(&task_id) {
+            return div()
+                .id("overview-refreshing")
+                .tooltip(Tooltip::text("Updating issues and pull requests…"))
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+                .into_any_element();
+        }
+        IconButton::new("overview-refresh", IconName::RotateCw)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text("Update issues and pull requests"))
+            .on_click(cx.listener(move |this, _, _, cx| this.refresh_task(task_id, cx)))
+            .into_any_element()
+    }
+
+    fn render_task_refresh_note(&self, task_id: Uuid, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let note = self.task_refresh_notes.get(&task_id)?.clone();
+        Some(
+            h_flex()
+                .items_start()
+                .gap_1()
+                .child(div().flex_1().min_w_0().child(Label::new(note).size(LabelSize::Small).color(Color::Warning)))
+                .child(
+                    IconButton::new("overview-refresh-note-dismiss", IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Dismiss"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.task_refresh_notes.remove(&task_id);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// "Overview | Coordinator" under the heading of a task whose
     /// coordinator is enabled.
     fn render_overview_tabs(
@@ -8168,10 +8255,18 @@ impl AgentiumApp {
                 )
             }
         };
+        let (refresh_button, refresh_note) = match scope {
+            task_overview::OverviewScope::Task(task_id) => (
+                Some(self.render_task_refresh_button(task_id, cx)),
+                self.render_task_refresh_note(task_id, cx),
+            ),
+            task_overview::OverviewScope::Arena(_) => (None, None),
+        };
         let heading = h_flex()
                     .gap_2()
                     .items_center()
                     .child(div().flex_1().min_w_0().truncate().text_xl().child(title))
+                    .children(refresh_button)
                     .child(
                         IconButton::new("overview-collapse", IconName::ChevronLeft)
                             .icon_size(IconSize::Small)
@@ -8211,6 +8306,7 @@ impl AgentiumApp {
                         .p_4()
                         .gap_4()
                         .child(heading)
+                        .children(refresh_note)
                         .children(coordinator_controls)
                         .child(tabs),
                 )
@@ -8225,6 +8321,7 @@ impl AgentiumApp {
             .gap_4()
             .bg(colors.editor_background)
             .child(heading)
+            .children(refresh_note)
             .children(coordinator_controls)
             .children(coordinator_tabs.map(|(_, _, tabs)| tabs));
         let mut linked_prs = Vec::new();
