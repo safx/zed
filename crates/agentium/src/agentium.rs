@@ -8394,8 +8394,7 @@ impl AgentiumApp {
                         .pl_5()
                         .gap_1()
                         .child(div().text_sm().child(pr.title.clone()))
-                        .child(status)
-                        .children(review),
+                        .child(h_flex().gap_1().child(status).children(review)),
                 );
             }
         } else {
