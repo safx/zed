@@ -8641,8 +8641,8 @@ impl AgentiumApp {
         let focused = window.is_window_active()
             && self.is_active_tab(&card.arena, &card.pane, item_id, cx)
             && card.item.item_focus_handle(cx).contains_focused(window, cx);
-        let menu_pane = card.pane.clone();
-        let menu_item = card.item.clone();
+        let open_pane = card.pane.clone();
+        let open_item = card.item.clone();
         v_flex()
             .flex_shrink_0()
             .min_w_0()
@@ -8657,7 +8657,11 @@ impl AgentiumApp {
                     .rounded_md()
                     .border_1()
                     .border_color(if focused { colors.text_accent } else { gpui::transparent_black() })
+                    .cursor_pointer()
                     .hover(|row| row.bg(colors.element_hover))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.navigate_to_item(arena_index, &open_pane, open_item.as_ref(), window, cx);
+                    }))
                     .child(Icon::new(card.icon).size(IconSize::Small))
                     .child(div().flex_shrink_0().max_w(px(160.)).truncate().child(card.title.clone()))
                     .child(
@@ -8680,15 +8684,7 @@ impl AgentiumApp {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.deploy_session_context_menu(
-                                arena_index,
-                                menu_pane.clone(),
-                                menu_item.clone(),
-                                show_context,
-                                event.position,
-                                window,
-                                cx,
-                            );
+                            this.deploy_session_context_menu(item_id, show_context, event.position, window, cx);
                         }),
                     ),
             )
@@ -8706,16 +8702,13 @@ impl AgentiumApp {
 
     fn deploy_session_context_menu(
         &mut self,
-        arena_index: usize,
-        pane: Entity<Pane>,
-        item: Box<dyn workspace::ItemHandle>,
+        item_id: EntityId,
         showing_context: bool,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let this = cx.entity();
-        let item_id = item.item_id();
         self.badge_menu.take();
         let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
             menu.entry(
@@ -8728,13 +8721,6 @@ impl AgentiumApp {
                         }
                         cx.notify();
                     });
-                }),
-            )
-            .entry(
-                "Open Agent Tab",
-                None,
-                window.handler_for(&this, move |this, window, cx| {
-                    this.navigate_to_item(arena_index, &pane, item.as_ref(), window, cx);
                 }),
             )
         });
