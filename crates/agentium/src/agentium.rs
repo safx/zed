@@ -324,6 +324,118 @@ pub fn sender_label(verified: Option<&str>, claimed: Option<&str>) -> String {
     }
 }
 
+/// Who answers an agent's `todo ask` question.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Answerer {
+    User,
+    Coordinator,
+}
+
+/// An Inbox record as far as hub delivery cares.
+#[derive(Clone, Copy)]
+enum HubRecord {
+    Question { resolved: bool },
+    Completion {
+        has_asker: bool,
+        confirmed: bool,
+        pull_request: bool,
+    },
+}
+
+/// Whether a record goes to `task`'s hub in its next batch: made for that
+/// task, newer than the cursor, and still open. A finished turn without a
+/// session (a Codex TUI tab, Claude without hooks) has no text a hub could
+/// use; one the user already looked at needs no hub.
+fn hub_record_due(record: HubRecord, id: u64, hub_task: Option<Uuid>, task: Uuid, after: u64) -> bool {
+    if hub_task != Some(task) || id <= after {
+        return false;
+    }
+    match record {
+        HubRecord::Question { resolved } => !resolved,
+        HubRecord::Completion {
+            has_asker,
+            confirmed,
+            pull_request,
+        } => !confirmed && (has_asker || pull_request),
+    }
+}
+
+/// Refuses handing an item to a tab outside the item's task (for a
+/// task-less item, outside its arena), and a coordinator assigning another
+/// task's item. Items saved before arenas had paths match any arena.
+fn check_assignment_scope(
+    todo_id: u64,
+    title: &str,
+    item_task: Option<Uuid>,
+    item_arena: Option<&Path>,
+    coordinator_task: Option<Uuid>,
+    target_tasks: &[Uuid],
+    target_arena: Option<&Path>,
+) -> anyhow::Result<()> {
+    if let Some(task) = coordinator_task {
+        anyhow::ensure!(
+            item_task == Some(task),
+            "To do item #{todo_id} belongs to another task"
+        );
+    }
+    let in_scope = match item_task {
+        Some(task) => target_tasks.contains(&task),
+        None => item_arena.is_none_or(|path| Some(path) == target_arena),
+    };
+    anyhow::ensure!(in_scope, "tab {title:?} is not in the task of To do item #{todo_id}");
+    Ok(())
+}
+
+/// The ancestry of a CLI socket peer as the kernel reports it
+/// (`LOCAL_PEERPID`). Only the socket listener should build one; a request's
+/// self-reported `ancestor_pids` must never be wrapped in it.
+pub struct PeerAncestry(Vec<u32>);
+
+impl PeerAncestry {
+    pub fn from_kernel(pids: Vec<u32>) -> Self {
+        Self(pids)
+    }
+}
+
+/// Who sent a CLI request, identified from the peer ancestry.
+#[derive(Debug, PartialEq)]
+pub enum CliCaller {
+    /// `claude_session` is the coordinator's own Claude session, `None` for
+    /// a Codex coordinator, which runs no Claude hooks.
+    Coordinator {
+        task: Uuid,
+        claude_session: Option<String>,
+    },
+    Tab { title: String },
+    Unknown,
+}
+
+/// Whether a Task Coordinator may make `request`. A coordinator files and
+/// summarizes; it reaches other agents only through `hub answer`, so every
+/// request that writes to a tab, opens one, or closes items is refused. Its
+/// own Claude hooks report through the same socket and are let through only
+/// for its own session, so they cannot overwrite another session's state.
+pub fn coordinator_request_check(
+    request: &serde_json::Value,
+    claude_session: Option<&str>,
+) -> anyhow::Result<()> {
+    let request_type = request["type"].as_str().unwrap_or_default();
+    match request_type {
+        "coordinator_summary" | "hub_answer" | "hub_ack" | "todo_add" | "todo_assign"
+        | "todo_list" | "task_info" | "task_list" | "tab_list" | "tab_self" => Ok(()),
+        "coordinator_claude_turn" | "permission_request" => {
+            anyhow::ensure!(
+                claude_session.is_some() && request["session_id"].as_str() == claude_session,
+                "the Task Coordinator may only report its own session"
+            );
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "the Task Coordinator cannot {other}; use `agentium hub` commands"
+        ),
+    }
+}
+
 /// Unlike terminal's `last_n_non_empty_lines`, keeps blank lines inside the
 /// output and only drops the empty screen rows below the cursor.
 fn tail_lines(content: &str, count: usize) -> String {
@@ -427,10 +539,14 @@ pub enum AssignTarget {
 
 /// The id to hand out next: every persisted kind of Inbox record shares one
 /// counter, so ids stay unique across a restart.
+/// The first free Inbox id, never below `minimum`. Records dropped at
+/// startup free their ids, so the remaining records alone could hand out an
+/// id a hub already acknowledged.
 fn next_inbox_id(
     questions: &[InboxQuestion],
     completions: &[InboxCompletion],
     max_todo_id: Option<u64>,
+    minimum: u64,
 ) -> u64 {
     questions
         .iter()
@@ -439,6 +555,7 @@ fn next_inbox_id(
         .chain(max_todo_id)
         .max()
         .map_or(1, |id| id + 1)
+        .max(minimum)
 }
 
 /// What survives an Agentium restart to find the asking tab again: tab
@@ -536,6 +653,10 @@ struct InboxQuestion {
     tab: Option<InboxTab>,
     #[serde(skip)]
     error: Option<String>,
+    /// The task whose hub gets this question, fixed when it is asked: the
+    /// task selected later must not move it to another hub.
+    #[serde(default)]
+    hub_task: Option<Uuid>,
 }
 
 impl InboxTab {
@@ -550,32 +671,44 @@ impl InboxQuestion {
             || asker.is_some_and(|asker| self.asker.as_ref() == Some(asker))
     }
 
-    fn answer(&self, option_index: Option<usize>, note: &str) -> Option<(String, bool)> {
-        if self.resolution.is_some() {
-            return None;
-        }
+    /// The answer text, and whether it confirms an assumption without a
+    /// message to the agent. Errors say why the answer does not fit.
+    fn answer(&self, option_index: Option<usize>, note: &str) -> anyhow::Result<(String, bool)> {
+        let id = self.id;
+        anyhow::ensure!(self.resolution.is_none(), "question #{id} is already answered");
         let note = note.trim();
         let mut answer = match option_index {
             Some(index) => {
-                let option = self.options.get(index)?;
+                let option = self
+                    .options
+                    .get(index)
+                    .with_context(|| format!("question #{id} has no option {}", index + 1))?;
                 if note.is_empty() { option.label.clone() } else { format!("{}\nNote: {note}", option.label) }
             }
-            None if self.options.is_empty() && !note.is_empty() => note.to_string(),
-            None => return None,
+            None if !self.options.is_empty() => {
+                anyhow::bail!("question #{id} has options; choose one")
+            }
+            None if note.is_empty() => anyhow::bail!("question #{id} needs an answer text"),
+            None => note.to_string(),
         };
         if let Some(assumed_index) = self.recommended.filter(|_| self.assumed) {
             // Confirming the assumption must not start another agent turn.
             if option_index == Some(assumed_index) && note.is_empty() {
-                return Some((answer, true));
+                return Ok((answer, true));
             }
             if option_index == Some(assumed_index) {
                 answer.push_str("\nThis matches the option you assumed; apply the note.");
             } else {
-                let assumed_label = self.options.get(assumed_index)?.label.as_str();
+                let assumed_label = self
+                    .options
+                    .get(assumed_index)
+                    .with_context(|| format!("question #{id} assumed a missing option"))?
+                    .label
+                    .as_str();
                 answer.push_str(&format!("\nYou assumed \"{assumed_label}\". Revise the work you did on that assumption."));
             }
         }
-        Some((answer, false))
+        Ok((answer, false))
     }
 
     fn resolve(&mut self, resolution: String) {
@@ -612,6 +745,9 @@ struct InboxCompletion {
     /// Set for a PR CI failure, which has no tab.
     #[serde(default)]
     pull_request: Option<InboxPullRequest>,
+    /// The task whose hub gets this record, fixed when it is recorded.
+    #[serde(default)]
+    hub_task: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -640,6 +776,7 @@ struct FinishedTab {
     detail: String,
     failure: Option<String>,
     notify: bool,
+    hub_task: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -696,6 +833,7 @@ fn record_finished_tabs(
                 tab: finished.tab,
                 failure: finished.failure,
                 pull_request: None,
+                hub_task: finished.hub_task,
             },
         );
         recorded.push((id, finished.notify));
@@ -786,6 +924,7 @@ fn apply_ci_status(
             tab: None,
             failure: Some(failure),
             pull_request: Some(pull_request.clone()),
+            hub_task: None,
         },
     );
     (true, Some(id))
@@ -1197,7 +1336,7 @@ pub struct AgentiumApp {
     last_branch_names: HashMap<EntityId, Option<String>>,
     pr_session_db: HashMap<String, HashMap<String, PrSessionData>>,
     _pr_session_db_write_task: Option<Task<()>>,
-    _inbox_write_task: Option<Task<()>>,
+    inbox_question_writer: SerialWriter,
     // Snapshot of the most recent arena-derived PR fetch per canonical worktree
     // path, persisted so `agentium task info` can show PRs without an app
     // instance running. Loaded once at startup; see `apply_pr_fetch_result`.
@@ -1286,8 +1425,10 @@ impl AgentiumApp {
             this.snapshot_all_coordinators(cx);
             let pending = this.coordinators.update(cx, |store, _| store.finish());
             async move {
-                if let Some(pending) = pending {
-                    pending.await;
+                if let Some(pending) = pending
+                    && let Err(error) = pending.await
+                {
+                    log::error!("Coordinator state was not saved before quitting: {error}");
                 }
             }
         });
@@ -1565,7 +1706,10 @@ impl AgentiumApp {
         let board = board::load_board();
         // Lists written by earlier versions take fresh ids from the shared
         // Inbox counter while they are migrated to items.
-        let mut next_inbox_question_id = next_inbox_id(&inbox_questions, &inbox_completions, None);
+        // Applied before the To do list loads, whose migration also takes ids.
+        let acked_floor = coordinators.read(cx).max_acked_inbox_id().saturating_add(1);
+        let mut next_inbox_question_id =
+            next_inbox_id(&inbox_questions, &inbox_completions, None, acked_floor);
         let inbox_todos = cx.new(|cx| {
             let mut todos = inbox_todo_view::InboxTodos::load(
                 Some(paths::data_dir().join(INBOX_TODOS_FILE)),
@@ -1590,6 +1734,7 @@ impl AgentiumApp {
             &[],
             &[],
             inbox_todos.read(cx).max_id(),
+            0,
         ));
         let overview = {
             let app = cx.entity();
@@ -1648,7 +1793,7 @@ impl AgentiumApp {
             last_branch_names: HashMap::new(),
             pr_session_db: load_pr_session_db(),
             _pr_session_db_write_task: None,
-            _inbox_write_task: None,
+            inbox_question_writer: SerialWriter::default(),
             _inbox_completions_write_task: None,
             pr_cache: load_pr_cache(),
             _pr_cache_write_task: None,
@@ -3290,6 +3435,27 @@ impl AgentiumApp {
         Ok(self.tab_info(item.as_ref(), &arena, cx))
     }
 
+    /// Who sent a CLI request. Takes the kernel-reported peer ancestry only:
+    /// a request's own `ancestor_pids` is whatever the client claims.
+    pub fn cli_caller(&self, peer: &PeerAncestry, cx: &App) -> CliCaller {
+        if let Some((task, _)) = self.coordinator_for_ancestors(&peer.0, cx) {
+            let claude_session = self.coordinators.read(cx).get(task).and_then(|coordinator| {
+                coordinator
+                    .provider
+                    .claude_model()
+                    .map(|_| coordinator.claude_session.clone())
+            });
+            return CliCaller::Coordinator {
+                task,
+                claude_session,
+            };
+        }
+        match self.tab_self(&peer.0, cx) {
+            Ok(tab) => CliCaller::Tab { title: tab.title },
+            Err(_) => CliCaller::Unknown,
+        }
+    }
+
     fn tab_for_ancestors(
         &self,
         ancestor_pids: &[u32],
@@ -3407,7 +3573,12 @@ impl AgentiumApp {
             .ok_or_else(|| anyhow::anyhow!("tab {title:?} cannot receive messages"))?;
         let terminal = terminal_view.read(cx).terminal().clone();
         self.ensure_safe_message_target(&title, terminal.read(cx))?;
-        terminal.update(cx, |terminal, _cx| {
+        terminal.update(cx, |terminal, cx| {
+            // `paste` brackets the text only when `last_content` says the
+            // program asked for bracketed paste, and `last_content` is
+            // refreshed by drawing; a tab that is not drawn (hidden, or the
+            // coordinator) would otherwise submit at the first newline.
+            terminal.sync(window, cx);
             if !text.is_empty() {
                 terminal.paste(&text);
             }
@@ -3490,6 +3661,7 @@ impl AgentiumApp {
             anyhow::bail!("--recommended {} is out of range", index + 1);
         }
         let (arena, pane, item) = self.tab_for_ancestors(peer_ancestor_pids, cx)?;
+        let hub_task = self.hub_task_for_arena(&arena);
         let id = self.next_inbox_question_id;
         self.next_inbox_question_id += 1;
         self.inbox_questions.push(InboxQuestion {
@@ -3510,6 +3682,7 @@ impl AgentiumApp {
                 item: item.downgrade_item(),
             }),
             error: None,
+            hub_task,
         });
         self.persist_inbox(cx);
         cx.notify();
@@ -3579,6 +3752,189 @@ impl AgentiumApp {
                 "{count} tabs titled {title:?} in this task's arenas; pick one with --arena <path>"
             ),
         }
+    }
+
+    /// The task whose hub gets a record made in `arena`, by the To do rule.
+    /// Callers store the result: the selected task may change afterwards.
+    fn hub_task_for_arena(&self, arena: &Entity<Arena>) -> Option<Uuid> {
+        self.arenas
+            .iter()
+            .position(|candidate| candidate == arena)
+            .and_then(|index| self.todo_task_for_arena(index))
+    }
+
+    fn hub_records(&self) -> impl Iterator<Item = (u64, Option<Uuid>, HubRecord)> + '_ {
+        let questions = self.inbox_questions.iter().map(|question| {
+            (
+                question.id,
+                question.hub_task,
+                HubRecord::Question {
+                    resolved: question.resolution.is_some(),
+                },
+            )
+        });
+        let completions = self.inbox_completions.iter().map(|record| {
+            (
+                record.id,
+                record.hub_task,
+                HubRecord::Completion {
+                    has_asker: record.asker.is_some(),
+                    confirmed: record.confirmed_at.is_some(),
+                    pull_request: record.pull_request.is_some(),
+                },
+            )
+        });
+        questions.chain(completions)
+    }
+
+    pub(crate) fn hub_has_events(&self, task: Uuid, after: u64, _cx: &App) -> bool {
+        self.hub_records()
+            .any(|(id, hub_task, record)| hub_record_due(record, id, hub_task, task, after))
+    }
+
+    /// The Inbox records due to `task`'s hub, oldest first, as batch events.
+    pub(crate) fn hub_events(&self, task: Uuid, after: u64, cx: &App) -> Vec<(u64, serde_json::Value)> {
+        let mut events = Vec::new();
+        for question in &self.inbox_questions {
+            let record = HubRecord::Question {
+                resolved: question.resolution.is_some(),
+            };
+            if !hub_record_due(record, question.id, question.hub_task, task, after) {
+                continue;
+            }
+            let options: Vec<serde_json::Value> = question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    serde_json::json!({
+                        "number": index + 1,
+                        "label": option.label,
+                        "description": option.description,
+                    })
+                })
+                .collect();
+            events.push((
+                question.id,
+                serde_json::json!({
+                    "type": "question",
+                    "id": question.id,
+                    "agent": self.hub_agent_json(question.tab.as_ref(), question.asker.as_ref(), &question.arena_name, cx),
+                    "question": question.question,
+                    "context": question.context,
+                    "options": options,
+                    "recommended": question.recommended.map(|index| index + 1),
+                    "assumed": question.assumed,
+                }),
+            ));
+        }
+        for completion in &self.inbox_completions {
+            let record = HubRecord::Completion {
+                has_asker: completion.asker.is_some(),
+                confirmed: completion.confirmed_at.is_some(),
+                pull_request: completion.pull_request.is_some(),
+            };
+            if !hub_record_due(record, completion.id, completion.hub_task, task, after) {
+                continue;
+            }
+            let event = match &completion.pull_request {
+                Some(pull_request) => serde_json::json!({
+                    "type": "ci_failed",
+                    "id": completion.id,
+                    "arena": pull_request.arena_path,
+                    "pull_request": pull_request.number,
+                    "title": completion.title,
+                    "failure": completion.failure,
+                }),
+                None => serde_json::json!({
+                    "type": if completion.failure.is_some() { "failed" } else { "completed" },
+                    "id": completion.id,
+                    "agent": self.hub_agent_json(completion.tab.as_ref(), completion.asker.as_ref(), &completion.arena_name, cx),
+                    "title": completion.title,
+                    "detail": completion.detail,
+                    "failure": completion.failure,
+                }),
+            };
+            events.push((completion.id, event));
+        }
+        events.sort_by_key(|(id, _)| *id);
+        events
+    }
+
+    /// The agent behind a record, from its tab or the tab now hosting its
+    /// session. Unknown fields are null: a record whose tab is not open yet
+    /// (right after a restart) still goes to the hub.
+    fn hub_agent_json(
+        &self,
+        tab: Option<&InboxTab>,
+        asker: Option<&InboxAsker>,
+        arena_name: &str,
+        cx: &App,
+    ) -> serde_json::Value {
+        let live = tab.and_then(InboxTab::live).or_else(|| {
+            asker
+                .and_then(|asker| self.tab_for_asker(asker, cx))
+                .and_then(|tab| tab.live())
+        });
+        match live {
+            Some((arena, _, item)) => serde_json::json!({
+                "title": item.tab_content_text(0, cx).to_string(),
+                "arena": arena.read(cx).working_directory,
+                "arena_name": arena_name,
+                "kind": if item.act_as::<codex_acp_view::CodexAcpView>(cx).is_some() { "codex-acp" } else { "terminal" },
+            }),
+            None => serde_json::json!({
+                "title": null,
+                "arena": null,
+                "arena_name": arena_name,
+                "kind": null,
+            }),
+        }
+    }
+
+    /// The agent behind a summary job's owner (`claude:<session>` /
+    /// `codex:<id>`), so the hub can tell whose turn a summary is.
+    pub(crate) fn hub_agent_for_owner(&self, owner: &str, cx: &App) -> serde_json::Value {
+        let asker = match owner.split_once(':') {
+            Some(("claude", session_id)) => Some(InboxAsker::ClaudeSession {
+                session_id: session_id.to_string(),
+            }),
+            Some(("codex", saved_id)) => Uuid::parse_str(saved_id)
+                .ok()
+                .map(|saved_id| InboxAsker::CodexAcp { saved_id }),
+            _ => None,
+        };
+        let arena_name = asker
+            .as_ref()
+            .and_then(|asker| self.tab_for_asker(asker, cx))
+            .and_then(|tab| tab.live())
+            .map(|(arena, _, _)| arena.read(cx).name.clone())
+            .unwrap_or_default();
+        self.hub_agent_json(None, asker.as_ref(), &arena_name, cx)
+    }
+
+    /// The task as a batch shows it: its id for `task info --task`, and its
+    /// open arenas for `tab list --arena` and `todo assign --arena`.
+    pub(crate) fn hub_task_json(&self, task: Uuid, cx: &App) -> serde_json::Value {
+        let title = self
+            .board
+            .tasks
+            .iter()
+            .find(|candidate| candidate.id == task)
+            .map(|candidate| candidate.title.clone());
+        let live = self.live_arena_entity_ids_for_task(task);
+        let arenas: Vec<serde_json::Value> = self
+            .arenas
+            .iter()
+            .filter(|arena| live.contains(&arena.entity_id()))
+            .map(|arena| {
+                serde_json::json!({
+                    "path": arena.read(cx).working_directory,
+                    "name": arena.read(cx).name,
+                })
+            })
+            .collect();
+        serde_json::json!({ "id": task, "title": title, "arenas": arenas })
     }
 
     /// The task a To do created in the arena belongs to: the selected task
@@ -3744,6 +4100,27 @@ impl AgentiumApp {
                 let (tab_arena, _, _) =
                     inbox_todo_view::find_item_location(&self.arenas, item.item_id(), cx)
                         .with_context(|| format!("tab {title:?} is not open"))?;
+                let (item_task, item_arena) = self
+                    .inbox_todos
+                    .read(cx)
+                    .item(todo_id)
+                    .map(|item| (item.task_id, item.arena_path.clone()))
+                    .with_context(|| format!("no To do item #{todo_id}"))?;
+                let target_tasks = self
+                    .arenas
+                    .iter()
+                    .position(|candidate| *candidate == tab_arena)
+                    .map(|index| self.tasks_with_live_arena(index))
+                    .unwrap_or_default();
+                check_assignment_scope(
+                    todo_id,
+                    &title,
+                    item_task,
+                    item_arena.as_deref(),
+                    caller.coordinator_task,
+                    &target_tasks,
+                    tab_arena.read(cx).working_directory.as_deref(),
+                )?;
                 let assignee = Assignee {
                     asker,
                     arena_path: tab_arena.read(cx).working_directory.clone(),
@@ -4550,6 +4927,7 @@ impl AgentiumApp {
                     detail: info.secondary,
                     failure,
                     notify,
+                    hub_task: self.hub_task_for_arena(arena),
                 });
             }
         }
@@ -4637,6 +5015,7 @@ impl AgentiumApp {
             return;
         };
         let arena_name = arena.read(cx).name.clone();
+        let hub_task = self.hub_task_for_arena(arena);
         let title = self
             .pr_info
             .get(&entity_id)
@@ -4655,6 +5034,11 @@ impl AgentiumApp {
             &mut self.next_inbox_question_id,
             Utc::now(),
         );
+        if let Some(id) = recorded
+            && let Some(record) = self.inbox_completions.iter_mut().find(|record| record.id == id)
+        {
+            record.hub_task = hub_task;
+        }
         if changed {
             self.persist_inbox_completions(cx);
         }
@@ -4852,23 +5236,16 @@ impl AgentiumApp {
     }
 
     fn persist_inbox(&mut self, cx: &mut Context<Self>) {
-        let previous = self._inbox_write_task.take();
         let snapshot = serde_json::to_vec_pretty(
             &self
                 .inbox_questions
                 .iter()
                 .filter(|question| question.asker.is_some())
                 .collect::<Vec<_>>(),
-        );
-        self._inbox_write_task = Some(cx.background_spawn(async move {
-            if let Some(previous) = previous {
-                previous.await;
-            }
-            snapshot
-                .map_err(anyhow::Error::from)
-                .and_then(|content| write_inbox_file(INBOX_QUESTIONS_FILE, &content))
-                .log_err();
-        }));
+        )
+        .map_err(anyhow::Error::from);
+        self.inbox_question_writer
+            .write(paths::data_dir().join(INBOX_QUESTIONS_FILE), snapshot, cx);
     }
 
     /// Sends the chosen option, with the note typed under the question as its
@@ -4881,53 +5258,100 @@ impl AgentiumApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(position) = self
-            .inbox_questions
-            .iter()
-            .position(|question| question.id == question_id && question.resolution.is_none())
-        else {
-            return;
-        };
         let note = self
             .inbox_note_editors
             .get(&question_id)
             .map(|editor| editor.read(cx).text(cx).trim().to_string())
             .unwrap_or_default();
-        let question = &self.inbox_questions[position];
-        let Some((answer, silent)) = question.answer(option_index, &note) else {
-            return;
+        // A failed delivery is shown under the question; an answer that does
+        // not fit (already answered, no option chosen) leaves it as it is.
+        if let Err(error) =
+            self.deliver_question_answer(question_id, option_index, &note, Answerer::User, window, cx)
+        {
+            log::debug!("question #{question_id} was not answered: {error:#}");
+        }
+    }
+
+    /// Answers a question for the user or for the hub. The answer reaches
+    /// only the session that asked: if its tab now runs another session,
+    /// the asker's own tab is looked up, so an answer never lands in a
+    /// session it was not meant for.
+    pub(crate) fn deliver_question_answer(
+        &mut self,
+        question_id: u64,
+        option_index: Option<usize>,
+        note: &str,
+        answerer: Answerer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let position = self
+            .inbox_questions
+            .iter()
+            .position(|question| question.id == question_id)
+            .with_context(|| format!("no question #{question_id}"))?;
+        let (answer, silent) = self.inbox_questions[position].answer(option_index, note)?;
+        let resolution_prefix = match answerer {
+            Answerer::User => "Answered",
+            Answerer::Coordinator => "Answered by Task Coordinator",
         };
         if silent {
-            self.inbox_questions[position].resolve(format!("Answered: {answer} · confirmed without notifying the agent"));
+            self.inbox_questions[position].resolve(format!(
+                "{resolution_prefix}: {answer} · confirmed without notifying the agent"
+            ));
             self.inbox_note_editors.remove(&question_id);
             self.persist_inbox(cx);
             cx.notify();
-            return;
+            return Ok(());
         }
+        let sender = match answerer {
+            Answerer::User => "Task Overview",
+            Answerer::Coordinator => task_coordinator::TITLE,
+        };
         let text = with_from_line(
-            "Task Overview",
+            sender,
             &format!(
                 "Answer to your `agentium todo ask` question.\nQuestion: {}\nAnswer: {answer}",
-                question.question
+                self.inbox_questions[position].question
             ),
         );
-        let result = match question.live_tab() {
-            Some((_, _, item)) => self.send_message_to_item(item.as_ref(), true, &text, window, cx),
-            None => Err(anyhow::anyhow!("the asking tab is not open")),
-        };
-        match result {
+        let result = self
+            .question_target(&self.inbox_questions[position], cx)
+            .and_then(|item| self.send_message_to_item(item.as_ref(), true, &text, window, cx));
+        match &result {
             Ok(()) => {
-                self.inbox_questions[position].resolve(format!("Answered: {answer}"));
+                self.inbox_questions[position].resolve(format!("{resolution_prefix}: {answer}"));
                 self.inbox_note_editors.remove(&question_id);
                 self.persist_inbox(cx);
             }
             Err(error) => {
-                if let Some(question) = self.inbox_questions.get_mut(position) {
-                    question.error = Some(format!("{error:#}"));
-                }
+                self.inbox_questions[position].error = Some(format!("{error:#}"));
             }
         }
         cx.notify();
+        result
+    }
+
+    /// The tab of the session that asked. A question without a session (a
+    /// Codex TUI tab) goes to its tab as it is.
+    fn question_target(
+        &self,
+        question: &InboxQuestion,
+        cx: &App,
+    ) -> anyhow::Result<Box<dyn workspace::ItemHandle>> {
+        let live = question.live_tab().map(|(_, _, item)| item);
+        let Some(asker) = &question.asker else {
+            return live.context("the asking tab is not open");
+        };
+        if let Some(item) = live
+            && self.inbox_asker(item.as_ref(), cx).as_ref() == Some(asker)
+        {
+            return Ok(item);
+        }
+        self.tab_for_asker(asker, cx)
+            .and_then(|tab| tab.live())
+            .map(|(_, _, item)| item)
+            .context("the asking session is no longer open")
     }
 
     fn sync_inbox_note_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7015,6 +7439,71 @@ fn write_inbox_file(file_name: &str, content: &[u8]) -> anyhow::Result<()> {
     write_file_atomically(&paths::data_dir().join(file_name), content)
 }
 
+/// The outcome of one file write, shareable between the writer and every
+/// party that waits for it.
+pub(crate) type WriteResult = Result<(), Arc<str>>;
+
+/// Writes snapshots of one file in order. Each snapshot holds every earlier
+/// change, so the last write's result says whether all of them reached disk:
+/// a hub acknowledges a batch only after the To do items and answers it made
+/// are on disk.
+#[derive(Default)]
+pub(crate) struct SerialWriter {
+    last: Option<futures::future::Shared<Task<WriteResult>>>,
+    /// The number of writes started.
+    issued: u64,
+    /// The number and failure of the last write that finished, set by the
+    /// write itself: a `Shared` future only yields its output once polled.
+    finished: Arc<parking_lot::Mutex<(u64, Option<Arc<str>>)>>,
+}
+
+impl SerialWriter {
+    pub(crate) fn write(
+        &mut self,
+        path: PathBuf,
+        content: anyhow::Result<Vec<u8>>,
+        cx: &App,
+    ) {
+        use futures::FutureExt as _;
+        let previous = self.last.take();
+        self.issued += 1;
+        let generation = self.issued;
+        let finished = self.finished.clone();
+        let task = cx.background_spawn(async move {
+            if let Some(previous) = previous
+                && let Err(error) = previous.await
+            {
+                log::debug!("the previous write of {} failed: {error}", path.display());
+            }
+            let result = content
+                .and_then(|content| write_file_atomically(&path, &content))
+                .map_err(|error| {
+                    let message = format!("could not write {}: {error:#}", path.display());
+                    log::error!("{message}");
+                    Arc::<str>::from(message)
+                });
+            *finished.lock() = (generation, result.clone().err());
+            result
+        });
+        self.last = Some(task.shared());
+    }
+
+    pub(crate) fn last(&self) -> Option<futures::future::Shared<Task<WriteResult>>> {
+        self.last.clone()
+    }
+
+    /// The failure of the last write, once it finished. While a newer write
+    /// is still running (a retry), an older failure is no longer the state.
+    pub(crate) fn failure(&self) -> Option<Arc<str>> {
+        let finished = self.finished.lock();
+        if finished.0 == self.issued {
+            finished.1.clone()
+        } else {
+            None
+        }
+    }
+}
+
 fn write_file_atomically(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -8542,9 +9031,9 @@ impl AgentiumApp {
                     } else {
                         model
                     }
-                }).or_else(|| coordinator_provider.map(|provider| match provider {
-                    task_coordinator::Provider::ClaudeHaiku => "Coordinator · Claude / Haiku (configured)".into(),
-                    task_coordinator::Provider::CodexLuna => "Coordinator · Codex / Luna (configured)".into(),
+                }).or_else(|| coordinator_provider.map(|provider| {
+                    let (agent, model) = provider.names();
+                    format!("Coordinator · {agent} / {model} (configured)")
                 }));
                 let acp_turn = item
                     .act_as::<codex_acp_view::CodexAcpView>(cx)
@@ -11615,8 +12104,8 @@ mod tests {
         CiCheckEntry, CiFetchGenerations, CiInfo, CiStatus, FinishKey, FinishedTab,
         InboxCompletion, InboxPullRequest,
         InboxTab, RecordedTabState,
-        age_inbox_records, apply_ci_status, next_inbox_id,
-        record_finished_tabs,
+        age_inbox_records, apply_ci_status, check_assignment_scope, coordinator_request_check,
+        next_inbox_id, record_finished_tabs, HubRecord, SerialWriter, hub_record_due,
         ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line, resolve_selected_task, arena_to_open_for_task,
@@ -11624,7 +12113,7 @@ mod tests {
     use crate::arena::TitleState;
     use crate::board::{BoardTask, IssueLink, IssueRef, PrRef};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     #[test]
@@ -11654,9 +12143,10 @@ mod tests {
         let mut question: InboxQuestion = serde_json::from_value(legacy).expect("legacy question");
         assert!(question.resolution.is_none());
         assert!(question.arena_path.is_none());
-        assert_eq!(question.answer(None, ""), None);
-        assert_eq!(question.answer(Some(9), ""), None);
-        assert_eq!(question.answer(Some(0), " "), Some(("JST".into(), true)));
+        let error = |result: anyhow::Result<(String, bool)>| result.expect_err("no answer").to_string();
+        assert_eq!(error(question.answer(None, "")), "question #42 has options; choose one");
+        assert_eq!(error(question.answer(Some(9), "")), "question #42 has no option 10");
+        assert_eq!(question.answer(Some(0), " ").expect("confirm"), ("JST".into(), true));
         let (answer, silent) = question.answer(Some(0), "Use next month").expect("answer with note");
         assert!(!silent);
         assert!(answer.contains("Use next month"));
@@ -11667,15 +12157,139 @@ mod tests {
         question.selected_option = Some(0);
         question.error = Some("delivery failed".into());
         question.resolve("Answered: JST · confirmed without notifying the agent".into());
-        assert!(question.answer(Some(0), "").is_none());
+        assert_eq!(error(question.answer(Some(0), "")), "question #42 is already answered");
+        question.options.clear();
+        question.resolution = None;
+        assert_eq!(error(question.answer(None, " ")), "question #42 needs an answer text");
+        question.resolve("Answered: JST · confirmed without notifying the agent".into());
         assert!(question.selected_option.is_none());
         assert!(question.error.is_none());
         let saved = serde_json::to_value(&question).expect("save resolution");
         assert!(saved.get("selected_option").is_none());
         let restored: InboxQuestion = serde_json::from_value(saved).expect("restore resolution");
         assert_eq!(restored.resolution, question.resolution);
-        assert_eq!(next_inbox_id(&[restored], &[], None), 43);
-        assert_eq!(next_inbox_id(&[], &[], Some(50)), 51);
+        assert_eq!(next_inbox_id(&[restored], &[], None, 0), 43);
+        assert_eq!(next_inbox_id(&[], &[], Some(50), 0), 51);
+    }
+
+    #[test]
+    fn inbox_ids_stay_above_every_acknowledged_id_after_records_drop() {
+        // The records up to 80 were dropped at startup; a hub acknowledged 80.
+        assert_eq!(next_inbox_id(&[], &[], Some(12), 81), 81);
+        assert_eq!(next_inbox_id(&[], &[], None, 81), 81);
+        assert_eq!(next_inbox_id(&[], &[], Some(90), 81), 91);
+    }
+
+    #[test]
+    fn a_coordinator_may_only_file_summarize_answer_and_report_itself() {
+        let allowed = [
+            "coordinator_summary", "hub_answer", "hub_ack", "todo_add", "todo_assign",
+            "todo_list", "task_info", "task_list", "tab_list", "tab_self",
+        ];
+        for request_type in allowed {
+            let request = serde_json::json!({ "type": request_type });
+            assert!(coordinator_request_check(&request, Some("own")).is_ok(), "{request_type}");
+            assert!(coordinator_request_check(&request, None).is_ok(), "{request_type}");
+        }
+        let refused = [
+            "tab_send_message", "tab_new", "tab_log", "todo_ask", "todo_take", "todo_done",
+            "todo_update", "something_new",
+        ];
+        for request_type in refused {
+            let request = serde_json::json!({ "type": request_type });
+            let error = coordinator_request_check(&request, Some("own")).expect_err(request_type);
+            assert!(error.to_string().contains("cannot"), "{request_type}: {error}");
+        }
+        for request_type in ["coordinator_claude_turn", "permission_request"] {
+            let own = serde_json::json!({ "type": request_type, "session_id": "own" });
+            let other = serde_json::json!({ "type": request_type, "session_id": "agent" });
+            assert!(coordinator_request_check(&own, Some("own")).is_ok());
+            assert!(coordinator_request_check(&other, Some("own")).is_err());
+            // A Codex coordinator runs no Claude hooks.
+            assert!(coordinator_request_check(&own, None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_hub_gets_open_records_of_its_own_task_after_its_cursor() {
+        let task = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let open_question = HubRecord::Question { resolved: false };
+        let finished = HubRecord::Completion {
+            has_asker: true,
+            confirmed: false,
+            pull_request: false,
+        };
+        assert!(hub_record_due(open_question, 11, Some(task), task, 10));
+        assert!(!hub_record_due(open_question, 10, Some(task), task, 10));
+        assert!(!hub_record_due(open_question, 11, Some(other), task, 10));
+        // Records made before routing existed belong to no hub.
+        assert!(!hub_record_due(open_question, 11, None, task, 10));
+        assert!(!hub_record_due(HubRecord::Question { resolved: true }, 11, Some(task), task, 10));
+        assert!(hub_record_due(finished, 11, Some(task), task, 10));
+        let looked_at = HubRecord::Completion {
+            has_asker: true,
+            confirmed: true,
+            pull_request: false,
+        };
+        assert!(!hub_record_due(looked_at, 11, Some(task), task, 10));
+        // A Codex TUI tab or a Claude without hooks has no session.
+        let sessionless = HubRecord::Completion {
+            has_asker: false,
+            confirmed: false,
+            pull_request: false,
+        };
+        assert!(!hub_record_due(sessionless, 11, Some(task), task, 10));
+        let ci_failure = HubRecord::Completion {
+            has_asker: false,
+            confirmed: false,
+            pull_request: true,
+        };
+        assert!(hub_record_due(ci_failure, 11, Some(task), task, 10));
+    }
+
+    #[gpui::test]
+    async fn the_last_write_reports_failure_until_a_later_write_succeeds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let blocked = directory.path().join("todo.json");
+        std::fs::create_dir(&blocked).expect("block the path");
+        let mut writer = SerialWriter::default();
+        assert!(writer.last().is_none());
+        cx.update(|cx| writer.write(blocked, Ok(b"[]".to_vec()), cx));
+        // Seen without anyone waiting for the write, as the hub's tick sees it.
+        cx.run_until_parked();
+        assert!(writer.failure().is_some());
+        assert!(writer.last().expect("write").await.is_err());
+        let path = directory.path().join("questions.json");
+        cx.update(|cx| writer.write(path.clone(), Ok(b"[1]".to_vec()), cx));
+        // While the rewrite runs (Retry), the old failure no longer stops the hub.
+        assert!(writer.failure().is_none());
+        cx.run_until_parked();
+        assert!(writer.failure().is_none());
+        assert!(writer.last().expect("write").await.is_ok());
+        assert_eq!(std::fs::read(&path).expect("written"), b"[1]");
+    }
+
+    #[test]
+    fn assignments_stay_inside_the_items_task() {
+        let task = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let arena = Path::new("/src/zed");
+        let elsewhere = Path::new("/src/other");
+        let check = |item_task, item_arena, coordinator, targets: &[Uuid], target_arena| {
+            check_assignment_scope(7, "Claude", item_task, item_arena, coordinator, targets, target_arena)
+        };
+        assert!(check(Some(task), Some(arena), None, &[task], Some(elsewhere)).is_ok());
+        assert!(check(Some(task), Some(arena), None, &[other], Some(arena)).is_err());
+        assert!(check(Some(task), Some(arena), Some(task), &[task, other], Some(arena)).is_ok());
+        assert!(check(Some(task), Some(arena), Some(other), &[task, other], Some(arena)).is_err());
+        // A coordinator never assigns task-less items.
+        assert!(check(None, Some(arena), Some(task), &[task], Some(arena)).is_err());
+        assert!(check(None, Some(arena), None, &[], Some(arena)).is_ok());
+        assert!(check(None, Some(arena), None, &[], Some(elsewhere)).is_err());
+        assert!(check(None, None, None, &[], Some(elsewhere)).is_ok());
     }
 
     #[test]
@@ -11699,6 +12313,7 @@ mod tests {
             }),
             tab: None,
             error: Some("the asking tab is not open".to_string()),
+            hub_task: None,
         };
         let json = serde_json::to_value(&question).expect("serialize");
         assert_eq!(
@@ -11760,6 +12375,7 @@ mod tests {
             detail: "Codex (ACP)".to_string(),
             failure: failed.then(|| "Stopped with an error".to_string()),
             notify: false,
+            hub_task: None,
         }
     }
 
@@ -12032,6 +12648,7 @@ mod tests {
             tab: None,
             failure: Some("Failing: lint".to_string()),
             pull_request: Some(pull_request.clone()),
+            hub_task: None,
         }];
         let mut next_id = 5;
         // After a restart `ci_status` is empty, so there is no previous status.

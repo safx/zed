@@ -71,6 +71,8 @@ Clearing Claude session state (Completed → Idle) routes through `AgentiumApp` 
 
 The Unix datagram socket at `agentium.sock` carries two message formats: raw UTF-8 paths (for `agentium arena new`) and JSON objects (for `agentium claude hook`). The receiver distinguishes them by checking whether the first byte is `{`. This works because UNIX paths start with `/`, never `{`.
 
+Requests that need a reply (`tab`, `todo`, `task info`, `coordinator`, `hub`, and the hooks' `permission_request` and `coordinator_claude_turn`) use a second, stream socket, `agentium-cli.sock`, one JSON request and one JSON reply per connection. Only this socket knows its caller: the listener reads the peer's ancestry from the kernel (`LOCAL_PEERPID`), so identity checks (the sender of `tab send-message`, the Task Coordinator's request allowlist) must use that ancestry, never the request's self-reported `ancestor_pids`. The datagram socket identifies no one.
+
 ## LSP requires `language_server_download_dir`
 
 `LanguageRegistry::set_language_server_download_dir` must be called before `languages::init`. Without it, LSP servers that aren't already on PATH cannot be downloaded or cached. Note that Node.js-based LSP servers (TypeScript, Pyright) also require a real `NodeRuntime`, which Agentium currently does not provide (`NodeRuntime::unavailable()`).

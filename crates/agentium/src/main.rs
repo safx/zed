@@ -51,6 +51,11 @@ enum Command {
         #[command(subcommand)]
         action: CoordinatorAction,
     },
+    /// Task Coordinator in limited auto mode: answer agents and acknowledge batches
+    Hub {
+        #[command(subcommand)]
+        action: HubAction,
+    },
     Arena {
         #[command(subcommand)]
         action: ArenaAction,
@@ -104,6 +109,31 @@ enum CoordinatorAction {
     Summary {
         #[command(subcommand)]
         action: CoordinatorSummaryAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum HubAction {
+    /// Answer an agent's `todo ask` question; the answer goes only to the agent that asked
+    Answer {
+        /// The question id from the batch
+        #[arg(long)]
+        question: u64,
+        /// 1-based number of the chosen option
+        #[arg(long, conflicts_with = "text", required_unless_present = "text")]
+        choice: Option<usize>,
+        /// A condition or correction attached to the chosen option
+        #[arg(long, conflicts_with = "text")]
+        note: Option<String>,
+        /// The answer to a question without options
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// Mark a batch as handled, after registering its summaries
+    Ack {
+        /// The `batch_id` of the batch
+        #[arg(long)]
+        batch: String,
     },
 }
 
@@ -490,6 +520,27 @@ mod claude_stop_title_tests {
         use clap::Parser as _;
         let args = super::Args::try_parse_from(["agentium", "coordinator", "summary", "set", "--job-id", "job", "--json", "{}"]);
         assert!(matches!(args.expect("valid CLI").command, Some(super::Command::Coordinator { .. })));
+    }
+
+    #[test]
+    fn hub_answers_take_a_choice_with_a_note_or_a_text() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| super::Args::try_parse_from(args).map(|args| args.command);
+        assert!(matches!(
+            parse(&["agentium", "hub", "answer", "--question", "41", "--choice", "2", "--note", "after lunch"]),
+            Ok(Some(super::Command::Hub {
+                action: super::HubAction::Answer { question: 41, choice: Some(2), .. }
+            }))
+        ));
+        assert!(parse(&["agentium", "hub", "answer", "--question", "41", "--text", "UTC"]).is_ok());
+        assert!(parse(&["agentium", "hub", "answer", "--question", "41"]).is_err());
+        assert!(parse(&["agentium", "hub", "answer", "--question", "41", "--choice", "1", "--text", "x"]).is_err());
+        assert!(parse(&["agentium", "hub", "answer", "--question", "41", "--text", "x", "--note", "y"]).is_err());
+        assert!(matches!(
+            parse(&["agentium", "hub", "ack", "--batch", "b"]),
+            Ok(Some(super::Command::Hub { action: super::HubAction::Ack { .. } }))
+        ));
+        assert!(parse(&["agentium", "task", "info", "--task", "1f2e"]).is_ok());
     }
 
     use super::claude_stop_title;
@@ -2065,11 +2116,13 @@ fn get_ancestor_pids() -> Vec<u32> {
     ancestor_pids_from(std::os::unix::process::parent_id())
 }
 
-/// `start` and its ancestors, at most 10 PIDs, stopping before launchd/init.
+/// `start` and its ancestors, at most 32 PIDs, stopping before launchd/init.
+/// Deep enough that a Task Coordinator's subprocesses are still recognized as
+/// its own: a caller identified as no one escapes the coordinator's limits.
 fn ancestor_pids_from(start: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let mut current = start;
-    for _ in 0..10 {
+    for _ in 0..32 {
         if current <= 1 {
             break;
         }
@@ -2250,6 +2303,15 @@ fn handle_cli_request(
         },
     };
 
+    if let agentium::CliCaller::Coordinator { claude_session, .. } = app.cli_caller(
+        &agentium::PeerAncestry::from_kernel(peer_ancestor_pids.to_vec()),
+        cx,
+    ) && let Err(error) =
+        agentium::coordinator_request_check(request, claude_session.as_deref())
+    {
+        return Task::ready(serde_json::json!({ "ok": false, "error": format!("{error:#}") }));
+    }
+
     // `task_info` returns its own `Task`, unlike every other request below
     // (which resolve synchronously): `--update` awaits `gh`/`bee` fetches, so
     // this needs its own conversion to `Task<Value>` rather than the
@@ -2263,6 +2325,18 @@ fn handle_cli_request(
             request["permission_suggestions"].clone(),
             cx,
         );
+    }
+
+    if request["type"].as_str() == Some("hub_ack") {
+        let acknowledgement = app.hub_ack(
+            &agentium::PeerAncestry::from_kernel(peer_ancestor_pids.to_vec()),
+            request["batch"].as_str().unwrap_or_default(),
+            cx,
+        );
+        return cx.spawn(async move |_this, _cx| match acknowledgement.await {
+            Ok(()) => serde_json::json!({ "ok": true }),
+            Err(error) => serde_json::json!({ "ok": false, "error": format!("{error:#}") }),
+        });
     }
 
     if request["type"].as_str() == Some("task_info") {
@@ -2344,6 +2418,20 @@ fn handle_cli_request(
             })
             .map(|()| serde_json::json!({ "ok": true })),
         Some("task_list") => Ok(serde_json::json!({ "ok": true, "tasks": app.task_list() })),
+        Some("hub_answer") => request["question"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("the request names no question id"))
+            .and_then(|question| {
+                app.hub_answer(
+                    &agentium::PeerAncestry::from_kernel(peer_ancestor_pids.to_vec()),
+                    question,
+                    request["option"].as_u64().map(|index| index as usize),
+                    request["note"].as_str().unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            })
+            .map(|()| serde_json::json!({ "ok": true })),
         Some("todo_ask") => {
             let options = request["options"]
                 .as_array()
@@ -2666,6 +2754,36 @@ fn main() {
             match result {
                 Ok(reply) => println!("{reply}"),
                 Err(error) => { eprintln!("agentium: {error:#}"); std::process::exit(1); }
+            }
+            return;
+        }
+        Some(Command::Hub { action }) => {
+            let request = match action {
+                HubAction::Answer {
+                    question,
+                    choice,
+                    note,
+                    text,
+                } => {
+                    if choice == Some(0) {
+                        eprintln!("agentium: --choice is 1-based");
+                        std::process::exit(1);
+                    }
+                    serde_json::json!({
+                        "type": "hub_answer",
+                        "question": question,
+                        "option": choice.map(|number| number - 1),
+                        "note": note.or(text).unwrap_or_default(),
+                    })
+                }
+                HubAction::Ack { batch } => serde_json::json!({ "type": "hub_ack", "batch": batch }),
+            };
+            match cli_request(request) {
+                Ok(reply) => println!("{reply}"),
+                Err(error) => {
+                    eprintln!("agentium: {error:#}");
+                    std::process::exit(1);
+                }
             }
             return;
         }

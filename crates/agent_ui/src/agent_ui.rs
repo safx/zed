@@ -81,7 +81,7 @@ pub use crate::ui::{AgentNotification, AgentNotificationEvent};
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::RootThreadUpdated;
 pub use conversation_view::open_markdown_in_workspace;
-pub use conversation_view::{ConversationView, StateChange};
+pub use conversation_view::{ConversationView, ExternalMessageReadiness, StateChange};
 
 pub struct AgentUiHost {
     pub is_conversation_visible: fn(gpui::EntityId, &gpui::Window, &App) -> bool,
