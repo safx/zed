@@ -118,7 +118,7 @@ The sidebar shows one line per task with a dot per agent state present (permissi
 
 Keyboard shortcuts that create tabs (`Cmd+T`, `Cmd+Shift+T`, `Ctrl+~`) work while the overview column has focus and target the active arena.
 
-Every agent tab of the task except the Task Coordinator is listed under **Agents**, assigned or not, one line each with name, model and status; clicking the row opens the agent tab, the status button opens the agent's activity, including permission responses, and the row's context menu shows or hides its latest Request and Response (the first sentence or the coordinator's summary first; Show more / Show original toggles the received text). A To do item's assignee row shows only the agent's name and state.
+Every agent tab of the task except the Task Coordinator is listed under **Agents**, assigned or not, one line each with name, model and status; clicking the row opens the agent tab, the status button opens the agent's activity, including permission responses, and the row's context menu shows or hides its latest Request and Response, hidden by default (the first sentence or the coordinator's summary first; Show more / Show original toggles the received text). A To do item's assignee row shows only the agent's name and state.
 
 The **To do** section is the task's own list (see *To do items* under *CLI*): choose Done / Go / Skip per item, add a note, and Send. Go items stay listed as Requested until the assigned agent closes them with `todo done`; Done and Skip close them at once and they move to the folded Done history, which is persisted. Choices and note drafts survive switching tasks. A closed assignee is restored from its row before sending. **Assign…** lists the task's open agent tabs and, below them, **New Claude Code** for the item's arena (reopening it when closed), or one entry per arena of the task when the item has none; the chosen arena becomes the item's default, which "New Claude Code in another arena…" changes. The new tab is assigned as soon as its session is reported; the item shows the wait with Cancel, and an error with Dismiss when the tab closes first or no session arrives within 3 minutes. An assignee row carries the session's status button, which opens its activity.
 
@@ -337,7 +337,7 @@ if command -v agentium >/dev/null 2>&1; then eval "$(command agentium completion
 
 Use `agentium todo ask "Question" --option "Choice::Explanation" --recommended 1` to request a decision. Omit options for a free-text answer. `--assume` continues with the recommended option; confirming it without a note does not send a message. The former `agentium inbox` command has been removed.
 
-Task Overview shows each agent's pending questions in its card, with answered ones folded below. Choose an option, add an optional note, then confirm the answer; delivery failures remain pending. Questions contribute to the sidebar’s To do count. Request and response are collapsed by default.
+Task Overview lists questions under **Questions**, one box per agent that has asked any, with its pending questions first and answered ones below; a question whose agent tab was not restored gets a box of its own. Choose an option, add an optional note, then confirm the answer; delivery failures remain pending. Questions contribute to the sidebar’s To do count.
 
 `todo list` includes pending questions in the current arena. Saved questions from earlier versions are retained, and answers are persisted.
 
