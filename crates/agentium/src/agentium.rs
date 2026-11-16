@@ -589,12 +589,17 @@ struct SessionCard {
     arena: Entity<Arena>,
     pane: Entity<Pane>,
     item: Box<dyn workspace::ItemHandle>,
-    asker: Option<InboxAsker>,
     icon: IconName,
     title: String,
     status: &'static str,
     question_ids: Vec<u64>,
-    context: inbox_todo_view::AssigneeContext,
+    /// The tab runs a task's coordinator session.
+    coordinator: bool,
+    model: Option<String>,
+    request: String,
+    request_summary: Option<String>,
+    response: String,
+    response_summary: Option<String>,
 }
 
 /// The tab a `todo` CLI command was run from.
@@ -8896,30 +8901,6 @@ impl AgentiumApp {
             .filter(|(_, arena)| arena_ids.contains(&arena.entity_id()))
             .map(|(index, arena)| (index, arena.clone()))
             .collect();
-        let todo_scope = self.todo_scope_for_overview(scope, cx);
-        // Sessions assigned to an open item appear under that item; the rest
-        // keep their own card.
-        let assigned_askers: HashSet<InboxAsker> = self
-            .inbox_todos
-            .read(cx)
-            .items()
-            .iter()
-            .filter(|item| item.is_open() && todo_scope.contains(item))
-            .flat_map(|item| item.assigned.iter().map(|assignee| assignee.asker.clone()))
-            .collect();
-        // Contexts come from every open arena: an assignee may live outside
-        // the task (assigned by CLI, or its tab moved).
-        let mut contexts: HashMap<InboxAsker, inbox_todo_view::AssigneeContext> = HashMap::new();
-        for (index, arena) in self.arenas.clone().iter().enumerate() {
-            if arena_ids.contains(&arena.entity_id()) {
-                continue;
-            }
-            for card in self.session_cards(index, arena, cx) {
-                if let Some(asker) = card.asker.filter(|asker| assigned_askers.contains(asker)) {
-                    contexts.insert(asker, card.context);
-                }
-            }
-        }
         let closed_rows: Vec<_> = match scope {
             task_overview::OverviewScope::Task(task_id) => self
                 .board_cache
@@ -8946,22 +8927,17 @@ impl AgentiumApp {
         for (task_id, path, missing) in closed_rows {
             content = content.child(self.render_closed_worktree_row(task_id, path, missing, &colors, cx));
         }
-        let mut unassigned_cards = Vec::new();
-        for card in &cards {
-            if let Some(asker) = card.asker.clone().filter(|asker| assigned_askers.contains(asker)) {
-                contexts.insert(asker, card.context.clone());
-            } else {
-                unassigned_cards.push(card);
-            }
+        // Every agent keeps its card here, assigned or not: the To do list
+        // shows only an assignee's name and state.
+        let agent_cards: Vec<_> = cards.iter().filter(|card| !card.coordinator).collect();
+        if !agent_cards.is_empty() {
+            content = content.child(overview_section_header("Agents", &colors));
         }
-        if !unassigned_cards.is_empty() {
-            content = content.child(overview_section_header("Unassigned agents", &colors));
-        }
-        for card in unassigned_cards {
+        for card in agent_cards {
             content = content.child(self.render_session_card(card, overview, &overview_entity, window, cx));
         }
         content = content.child(overview_section_header("To do", &colors));
-        content = content.child(self.render_scope_todos(scope, overview, &contexts, window, cx));
+        content = content.child(self.render_scope_todos(scope, overview, window, cx));
         // Questions stand on their own: a session with a pending question is
         // listed here whether or not an item is assigned to it.
         let asking: Vec<_> = cards
@@ -9091,7 +9067,6 @@ impl AgentiumApp {
                     arena: arena.clone(),
                     pane: pane.clone(),
                     item,
-                    asker,
                     icon,
                     title: if coordinator_provider.is_some() {
                         task_coordinator::TITLE.to_string()
@@ -9100,13 +9075,12 @@ impl AgentiumApp {
                     },
                     status,
                     question_ids,
-                    context: inbox_todo_view::AssigneeContext {
-                        request,
-                        request_summary,
-                        response,
-                        response_summary,
-                        model: model_label,
-                    },
+                    coordinator: coordinator_provider.is_some(),
+                    model: model_label,
+                    request,
+                    request_summary,
+                    response,
+                    response_summary,
                 });
             }
         }
@@ -9160,7 +9134,7 @@ impl AgentiumApp {
                             .truncate()
                             .text_sm()
                             .text_color(colors.text_muted)
-                            .children(card.context.model.clone()),
+                            .children(card.model.clone()),
                     )
                     .child(
                         Button::new(("overview-status", item_id), card.status).on_click(cx.listener(
@@ -9182,8 +9156,8 @@ impl AgentiumApp {
                     v_flex()
                         .pl_6()
                         .gap_2()
-                        .child(overview.render_message(item_id, "Request", card.context.request.clone(), card.context.request_summary.clone(), overview_entity.clone()))
-                        .child(overview.render_message(item_id, "Response", card.context.response.clone(), card.context.response_summary.clone(), overview_entity.clone())),
+                        .child(overview.render_message(item_id, "Request", card.request.clone(), card.request_summary.clone(), overview_entity.clone()))
+                        .child(overview.render_message(item_id, "Response", card.response.clone(), card.response_summary.clone(), overview_entity.clone())),
                 )
             })
             .into_any_element()
@@ -9280,7 +9254,6 @@ impl AgentiumApp {
         &mut self,
         scope: task_overview::OverviewScope,
         overview: &mut task_overview::TaskOverview,
-        contexts: &HashMap<InboxAsker, inbox_todo_view::AssigneeContext>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -9301,7 +9274,7 @@ impl AgentiumApp {
                 view
             }
         };
-        let assignees = self.assignee_rows(&view, contexts, cx);
+        let assignees = self.assignee_rows(&view, cx);
         let mut pending_sessions: HashMap<u64, inbox_todo_view::PendingSession> = HashMap::new();
         let waiting_ids = self
             .pending_todo_assignments
@@ -9320,11 +9293,10 @@ impl AgentiumApp {
     }
 
     /// Where each assignee of the view's open items is now: its tab title
-    /// and agent state, or closed, plus its latest turn when open.
+    /// and agent state, or closed.
     fn assignee_rows(
         &self,
         view: &Entity<inbox_todo_view::InboxTodoView>,
-        contexts: &HashMap<InboxAsker, inbox_todo_view::AssigneeContext>,
         cx: &App,
     ) -> HashMap<u64, Vec<inbox_todo_view::AssigneeRow>> {
         let colors = cx.theme().colors();
@@ -9390,7 +9362,6 @@ impl AgentiumApp {
                     restoring: restoring.as_ref() == Some(&assignee.asker),
                     error: error.clone().filter(|_| restoring.is_none()),
                     status,
-                    context: contexts.get(&assignee.asker).cloned(),
                 });
             }
             rows.insert(item.id, entries);

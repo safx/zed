@@ -5,11 +5,13 @@ use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
-    prelude::FluentBuilder as _,
+    Refineable as _, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    Subscription, TextStyleRefinement, UnderlineStyle, Window, div, prelude::FluentBuilder as _,
+    px, rems,
 };
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use ui::{
     ActiveTheme, Button, ButtonCommon as _, Clickable as _, Disableable as _, Icon, IconName,
     IconSize, LabelSize, Toggleable as _, h_flex, v_flex,
@@ -1108,16 +1110,6 @@ pub(crate) enum InboxTodoViewEvent {
     },
 }
 
-/// The latest turn of an assigned session, shown under its row.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AssigneeContext {
-    pub(crate) request: String,
-    pub(crate) request_summary: Option<String>,
-    pub(crate) response: String,
-    pub(crate) response_summary: Option<String>,
-    pub(crate) model: Option<String>,
-}
-
 /// What the overview knows about one assignee that the view cannot find out
 /// itself: whether its tab is open and what state the agent is in.
 #[derive(Clone, Debug, PartialEq)]
@@ -1133,7 +1125,6 @@ pub(crate) struct AssigneeRow {
     /// The card's status button, kept on the row: "Running", "Awaiting
     /// answer", … Click opens the agent's activity.
     pub(crate) status: &'static str,
-    pub(crate) context: Option<AssigneeContext>,
 }
 
 /// Claude Code tabs started for the item from Assign…: the wait for a
@@ -1144,12 +1135,11 @@ pub(crate) struct PendingSession {
     pub(crate) error: Option<String>,
 }
 
-/// Which part of an assignee's latest turn the user unfolded.
+/// Which text of an item a [`Markdown`] in [`InboxTodoView::texts`] holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum ContextPart {
-    Turn,
-    Request,
-    Response,
+enum ItemText {
+    Title,
+    Detail,
 }
 
 /// The To do list of one task (or task-less arena) in Task Overview.
@@ -1158,8 +1148,9 @@ pub(crate) struct InboxTodoView {
     scope: TodoScope,
     assignees: HashMap<u64, Vec<AssigneeRow>>,
     pending_sessions: HashMap<u64, PendingSession>,
-    /// Unfolded parts of assignee turns, by item, assignee position and part.
-    unfolded: std::collections::HashSet<(u64, usize, ContextPart)>,
+    /// Shown items' titles and details, kept across renders because the
+    /// user's text selection lives in the entity.
+    texts: HashMap<(u64, ItemText), Entity<Markdown>>,
     note_editors: HashMap<u64, Entity<Editor>>,
     error: Option<String>,
     last_report: Option<SendReport>,
@@ -1183,7 +1174,7 @@ impl InboxTodoView {
             scope,
             assignees: HashMap::new(),
             pending_sessions: HashMap::new(),
-            unfolded: Default::default(),
+            texts: HashMap::new(),
             note_editors: HashMap::new(),
             error: None,
             last_report: None,
@@ -1303,7 +1294,49 @@ impl InboxTodoView {
                 }));
             self.note_editors.insert(todo_id, editor);
         }
+        self.sync_texts(cx);
         cx.notify();
+    }
+
+    /// Keeps one [`Markdown`] per shown title and detail. Done items get
+    /// theirs only while the Done list is unfolded.
+    fn sync_texts(&mut self, cx: &mut Context<Self>) {
+        let mut wanted: HashMap<(u64, ItemText), SharedString> = HashMap::new();
+        let mut add = |item: &TodoItem, title: String| {
+            wanted.insert((item.id, ItemText::Title), title.into());
+            if let Some(detail) = &item.detail {
+                wanted.insert((item.id, ItemText::Detail), detail.clone().into());
+            }
+        };
+        for item in self.open_items(cx) {
+            add(&item, item.title.clone());
+        }
+        if self.show_done {
+            for item in self.done_items(cx) {
+                add(&item, done_title(&item));
+            }
+        }
+        self.texts.retain(|key, _| wanted.contains_key(key));
+        for (key, source) in wanted {
+            match self.texts.get(&key) {
+                Some(markdown) => markdown.update(cx, |markdown, cx| markdown.reset(source, cx)),
+                None => {
+                    let markdown = cx.new(|cx| Markdown::new_text(source, cx));
+                    self.texts.insert(key, markdown);
+                }
+            }
+        }
+    }
+
+    fn render_text(&self, todo_id: u64, part: ItemText, style: &MarkdownStyle) -> Option<AnyElement> {
+        let markdown = self.texts.get(&(todo_id, part))?;
+        Some(
+            div()
+                .min_w_0()
+                .debug_selector(|| format!("todo-text-{todo_id}-{part:?}"))
+                .child(MarkdownElement::new(markdown.clone(), style.clone()))
+                .into_any_element(),
+        )
     }
 
     fn notes(&self, cx: &App) -> HashMap<u64, String> {
@@ -1364,131 +1397,10 @@ impl InboxTodoView {
         cx.notify();
     }
 
-    /// One message of an assignee's latest turn: the summary or the first
-    /// sentence, with the rest behind a toggle.
-    fn render_context_message(
-        &self,
-        todo_id: u64,
-        index: usize,
-        part: ContextPart,
-        label: &'static str,
-        text: &str,
-        summary: Option<&str>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let text = text.trim().to_owned();
-        let first_sentence_end = text
-            .char_indices()
-            .find(|(_, character)| matches!(character, '.' | '。'))
-            .map(|(index, character)| index + character.len_utf8())
-            .unwrap_or(text.len());
-        let has_more = summary.is_some() || !text[first_sentence_end..].trim().is_empty();
-        let expanded = self.unfolded.contains(&(todo_id, index, part));
-        let visible = if expanded {
-            text
-        } else {
-            summary
-                .map(str::to_owned)
-                .unwrap_or_else(|| text[..first_sentence_end].to_owned())
-        };
-        let colors = cx.theme().colors().clone();
-        v_flex()
-            .min_w_0()
-            .gap_0p5()
-            .child(div().text_xs().text_color(colors.text_muted).child(label))
-            .child(div().text_sm().child(visible))
-            .when(has_more, |column| {
-                column.child(
-                    Button::new(
-                        SharedString::from(format!("todo-context-{todo_id}-{index}-{label}")),
-                        if expanded {
-                            "Show less"
-                        } else if summary.is_some() {
-                            "Show original"
-                        } else {
-                            "Show more"
-                        },
-                    )
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        if !this.unfolded.remove(&(todo_id, index, part)) {
-                            this.unfolded.insert((todo_id, index, part));
-                        }
-                        cx.notify();
-                    })),
-                )
-            })
-    }
-
-    /// The latest request and response of an assigned session, folded under
-    /// its row.
-    fn render_assignee_context(
-        &self,
-        todo_id: u64,
-        index: usize,
-        context: &AssigneeContext,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
-        let open = self.unfolded.contains(&(todo_id, index, ContextPart::Turn));
-        v_flex()
-            .min_w_0()
-            .gap_1()
-            .pl_3()
-            .child(
-                Button::new(
-                    SharedString::from(format!("todo-turn-{todo_id}-{index}")),
-                    if open { "▾ Request and response" } else { "▸ Request and response" },
-                )
-                .label_size(LabelSize::Small)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    if !this.unfolded.remove(&(todo_id, index, ContextPart::Turn)) {
-                        this.unfolded.insert((todo_id, index, ContextPart::Turn));
-                    }
-                    cx.notify();
-                })),
-            )
-            .when(open, |column| {
-                column
-                    .when_some(context.model.clone(), |column, model| {
-                        column.child(div().text_xs().text_color(colors.text_muted).child(model))
-                    })
-                    .child(self.render_context_message(
-                        todo_id,
-                        index,
-                        ContextPart::Request,
-                        "Request",
-                        &context.request,
-                        context.request_summary.as_deref(),
-                        cx,
-                    ))
-                    .child(self.render_context_message(
-                        todo_id,
-                        index,
-                        ContextPart::Response,
-                        "Response",
-                        &context.response,
-                        context.response_summary.as_deref(),
-                        cx,
-                    ))
-            })
-    }
-
     fn render_assignees(&self, item: &TodoItem, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let todo_id = item.id;
         let rows = self.assignees.get(&todo_id).cloned().unwrap_or_default();
-        let contexts: Vec<_> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                row.context
-                    .as_ref()
-                    .map(|context| self.render_assignee_context(todo_id, index, context, cx).into_any_element())
-            })
-            .collect();
         v_flex().min_w_0().gap_1().child(
         h_flex()
             .flex_wrap()
@@ -1625,7 +1537,6 @@ impl InboxTodoView {
                         )
                     })
             })
-            .children(contexts)
     }
 
     fn render_item(
@@ -1633,6 +1544,7 @@ impl InboxTodoView {
         number: usize,
         item: &TodoItem,
         choice: Option<TodoChoice>,
+        styles: &TextStyles,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
@@ -1687,22 +1599,14 @@ impl InboxTodoView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(item.title.clone()),
+                            .children(self.render_text(todo_id, ItemText::Title, &styles.open_title)),
                     )
                     .when_some(state_label, |row, label| {
                         row.child(div().text_xs().text_color(colors.text_muted).child(label))
                     })
                     .children(buttons),
             )
-            .when_some(item.detail.clone(), |d, detail| {
-                d.child(
-                    div()
-                        .text_sm()
-                        .text_color(colors.text_muted)
-                        .child(detail),
-                )
-            })
+            .children(self.render_text(todo_id, ItemText::Detail, &styles.open_detail))
             .when_some(
                 item.request.as_ref().and_then(|request| request.note.clone()),
                 |d, note| {
@@ -1731,7 +1635,7 @@ impl InboxTodoView {
             )
     }
 
-    fn render_done(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_done(&self, styles: &TextStyles, cx: &mut Context<Self>) -> impl IntoElement {
         let done = self.done_items(cx);
         let colors = cx.theme().colors().clone();
         v_flex()
@@ -1751,6 +1655,7 @@ impl InboxTodoView {
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_done = !this.show_done;
+                            this.sync_texts(cx);
                             cx.notify();
                         })),
                     )
@@ -1776,15 +1681,8 @@ impl InboxTodoView {
                                 .border_color(colors.border_variant)
                                 .rounded_md()
                                 .child(ui::Label::new(state))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(format!("#{} {}", item.id, item.title)),
-                                )
-                                .when_some(item.detail.clone(), |row, detail| {
-                                    row.child(div().text_sm().child(detail))
-                                })
+                                .children(self.render_text(item.id, ItemText::Title, &styles.done_title))
+                                .children(self.render_text(item.id, ItemText::Detail, &styles.done_detail))
                                 .when_some(
                                     item.request.as_ref().and_then(|request| request.note.clone()),
                                     |row, condition| {
@@ -1807,6 +1705,66 @@ fn kind_rank(kind: InboxTodoKind) -> u8 {
     }
 }
 
+fn done_title(item: &TodoItem) -> String {
+    format!("#{} {}", item.id, item.title)
+}
+
+/// A [`MarkdownElement`] does not inherit the surrounding div's text style,
+/// so each kind of item text carries its own.
+struct TextStyles {
+    open_title: MarkdownStyle,
+    open_detail: MarkdownStyle,
+    done_title: MarkdownStyle,
+    done_detail: MarkdownStyle,
+}
+
+impl TextStyles {
+    fn new(window: &Window, cx: &App) -> Self {
+        let colors = cx.theme().colors();
+        let style = |refinement: TextStyleRefinement| {
+            let mut text_style = window.text_style();
+            text_style.refine(&refinement);
+            // Text runs carry no size: lines are sized by the container.
+            let mut container_style = StyleRefinement::default();
+            container_style.text.font_size = refinement.font_size;
+            MarkdownStyle {
+                base_text_style: text_style,
+                container_style,
+                selection_background_color: colors.element_selection_background,
+                link: TextStyleRefinement {
+                    color: Some(colors.text_accent),
+                    underline: Some(UnderlineStyle {
+                        color: Some(colors.text_accent.opacity(0.5)),
+                        thickness: px(1.),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+        let small = || TextStyleRefinement {
+            font_size: Some(rems(0.875).into()),
+            ..Default::default()
+        };
+        Self {
+            open_title: style(TextStyleRefinement {
+                font_weight: Some(FontWeight::SEMIBOLD),
+                ..Default::default()
+            }),
+            open_detail: style(TextStyleRefinement {
+                color: Some(colors.text_muted),
+                ..small()
+            }),
+            done_title: style(TextStyleRefinement {
+                font_weight: Some(FontWeight::SEMIBOLD),
+                ..small()
+            }),
+            done_detail: style(small()),
+        }
+    }
+}
+
 impl EventEmitter<InboxTodoViewEvent> for InboxTodoView {}
 
 impl Focusable for InboxTodoView {
@@ -1816,8 +1774,9 @@ impl Focusable for InboxTodoView {
 }
 
 impl Render for InboxTodoView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+        let styles = TextStyles::new(window, cx);
         let items = self.open_items(cx);
         let choices: Vec<Option<TodoChoice>> = {
             let todos = self.todos.read(cx);
@@ -1843,7 +1802,7 @@ impl Render for InboxTodoView {
         let mut proposals = Vec::new();
         let mut user_tasks = Vec::new();
         for (index, (item, choice)) in items.iter().zip(choices).enumerate() {
-            let element = self.render_item(index + 1, item, choice, cx).into_any_element();
+            let element = self.render_item(index + 1, item, choice, &styles, cx).into_any_element();
             match item.kind {
                 InboxTodoKind::Proposal => proposals.push(element),
                 InboxTodoKind::UserTask => user_tasks.push(element),
@@ -1919,7 +1878,7 @@ impl Render for InboxTodoView {
                         ),
                 )
             })
-            .child(self.render_done(cx))
+            .child(self.render_done(&styles, cx))
             .into_any_element()
     }
 }
@@ -2626,6 +2585,54 @@ mod tests {
         });
         cx.simulate_keystrokes("cmd-enter");
         assert_eq!(sent.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn titles_and_details_can_be_selected_and_copied(cx: &mut TestAppContext) {
+        init(cx);
+        let task = Uuid::new_v4();
+        let todos = cx.new(|_| InboxTodos::new(None));
+        let mut next_id = 1;
+        let todo_id = todos.update(cx, |todos, cx| {
+            let draft = TodoDraft {
+                detail: Some("Cover the Failed lane".to_string()),
+                ..draft(InboxTodoKind::Proposal, "Add tests", Some(task))
+            };
+            todos.add(draft, &mut next_id, cx).unwrap()
+        });
+        assert_eq!(todo_id, 1, "the selectors below name item 1");
+        let scope = TodoScope {
+            task_id: Some(task),
+            arena_paths: vec![],
+            arena_names: vec![],
+        };
+        let (_view, cx) = cx.add_window_view(|window, cx| InboxTodoView::new(todos.clone(), scope, window, cx));
+        cx.update(|_, cx| cx.bind_keys([gpui::KeyBinding::new("cmd-c", markdown::Copy, Some("Markdown"))]));
+        cx.run_until_parked();
+
+        let title = cx.debug_bounds("todo-text-1-Title").expect("title");
+        let detail = cx.debug_bounds("todo-text-1-Detail").expect("detail");
+        assert!(
+            detail.size.height < title.size.height,
+            "the detail keeps its smaller text: {detail:?} vs {title:?}"
+        );
+
+        for (selector, expected) in [
+            ("todo-text-1-Title", "Add tests"),
+            ("todo-text-1-Detail", "Cover the Failed lane"),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            let start = gpui::point(bounds.left() + gpui::px(1.), bounds.center().y);
+            let end = gpui::point(bounds.right() - gpui::px(1.), bounds.center().y);
+            cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_keystrokes("cmd-c");
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                Some(expected),
+            );
+        }
     }
 
     #[test]
