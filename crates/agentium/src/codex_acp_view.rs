@@ -5,7 +5,8 @@ use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection, ThreadStatus};
 use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use agent_servers::{AcpConnection, AcpLaunchOptions, AgentServer, AgentServerDelegate, CODEX_ID};
 use agent_ui::{
-    Agent, AgentConnectionStore, AgentThreadSource, ConversationView, RootThreadUpdated,
+    Agent, AgentConnectionStore, AgentThreadSource, ConversationView, ExternalMessageReadiness,
+    RootThreadUpdated,
 };
 use anyhow::{Context as _, Result};
 use editor::{Editor, EditorEvent, actions::SelectAll};
@@ -458,6 +459,22 @@ impl CodexAcpView {
             .clone()
             .downcast::<AcpConnection>()?
             .live_process_id()
+    }
+
+    /// Whether `send_message` would go through now, should wait, or cannot
+    /// succeed until someone looks at the tab.
+    pub(crate) fn external_message_readiness(&self, cx: &App) -> ExternalMessageReadiness {
+        match self.state {
+            CodexAcpState::Error => ExternalMessageReadiness::Fatal(
+                format!("tab {:?} stopped with an error", self.cli_title).into(),
+            ),
+            CodexAcpState::Running | CodexAcpState::Permission => ExternalMessageReadiness::Wait(
+                format!("tab {:?} is {}", self.cli_title, self.state.cli_state()).into(),
+            ),
+            CodexAcpState::Idle | CodexAcpState::Completed => {
+                self.conversation.read(cx).external_message_readiness(cx)
+            }
+        }
     }
 
     pub(crate) fn send_message(
@@ -2016,6 +2033,46 @@ mod tests {
             });
         }
         assert!(thread.read_with(cx, |thread, _| thread.entries().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn codex_acp_readiness_waits_for_drafts_and_busy_turns_but_not_errors(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, workspace, cx) = setup(cx).await;
+        let view = fake_tab(FakeAcpAgentServer::new(), "/arena", project, &workspace, cx);
+        cx.run_until_parked();
+        let readiness = |view: &Entity<CodexAcpView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.external_message_readiness(cx))
+        };
+        assert_eq!(readiness(&view, cx), ExternalMessageReadiness::Ready);
+        for (state, waits) in [
+            (CodexAcpState::Running, true),
+            (CodexAcpState::Permission, true),
+            (CodexAcpState::Error, false),
+        ] {
+            view.update(cx, |view, _| view.state = state);
+            let readiness = readiness(&view, cx);
+            assert_eq!(
+                matches!(readiness, ExternalMessageReadiness::Wait(_)),
+                waits,
+                "{state:?}: {readiness:?}"
+            );
+            assert_eq!(
+                matches!(readiness, ExternalMessageReadiness::Fatal(_)),
+                !waits,
+                "{state:?}: {readiness:?}"
+            );
+        }
+        view.update(cx, |view, _| view.state = CodexAcpState::Idle);
+        view.update_in(cx, |view, window, cx| {
+            view.send_message("a draft the user is writing", false, window, cx)
+        })
+        .expect("insert draft");
+        assert_eq!(
+            readiness(&view, cx),
+            ExternalMessageReadiness::Wait("The conversation has an unsent draft".into())
+        );
     }
 
     #[gpui::test]

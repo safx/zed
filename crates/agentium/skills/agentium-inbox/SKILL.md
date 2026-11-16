@@ -27,6 +27,8 @@ agentium todo ask "Close the monthly aggregate at JST or UTC midnight?" \
 
 Without `--assume`, end your turn immediately. Do not keep working on an assumed answer. The user answers from Task Overview and the answer arrives in this tab as a new message starting with `[from: Task Overview]`; continue from there.
 
+When the task's Task Coordinator runs in limited auto mode, it may answer instead; that answer starts with `[from: Task Coordinator]`. Treat it as a teammate's answer rather than the user's decision: follow it, but if it conflicts with the code, the spec or what the user told you, stop and ask again with `todo ask`.
+
 The `Answer:` line carries the chosen option label, or the user's own text when you gave no options. A following `Note:` line is a condition or correction the user attached to that option; it takes precedence over the option's description.
 
 With `--assume`, continue on the recommended option and mention the assumption in your final report. A message arrives only if the user picks another option (revise the work built on the assumption) or attaches a note to the assumed one (apply it). No message means the assumption stands.
@@ -54,5 +56,5 @@ agentium todo done 12 --note "pushed as 3f2a1c"
 - `agentium todo list` prints the task's open items with ids, states and assignees (`--all` includes done ones), and this arena's pending questions. Run it after a compaction, or when a message refers to an item id.
 - The user sends Go from Task Overview in one message starting with `[from: Task Overview]` and `To do`, one line per item: `Go: #ID TITLE :: DETAIL — Note: CONDITION`. The note is the user's condition and overrides the detail. Do the work, then `agentium todo done <id> --note "..."` for each item; items stay listed until you close them. Skip and Done answers never reach you: the user closes those items directly.
 - Only an assigned agent may `done` or `update` an item (`todo take <id>` assigns you first). Anyone may change assignees: `todo assign <id> --to self`, `--to "<tab title>" [--arena <path>]`, or `--unassign`. This is a guard against closing someone else's work by accident, not a permission boundary.
-- The Task Coordinator (a summarizer session the user enables per task) runs in no arena. Its `todo add` always creates unassigned items, it cannot `take` or be assigned items, its `todo list` covers the whole task's items and the questions of all its arenas, and `--to "<tab title>"` without `--arena` looks for the tab among the task's open arenas.
+- The Task Coordinator (a summarizer session the user enables per task) runs in no arena. Its `todo add` always creates unassigned items, it cannot `take` or be assigned items, its `todo list` covers the whole task's items and the questions of all its arenas, and `--to "<tab title>"` without `--arena` looks for the tab among the task's open arenas. In limited auto mode it also answers this task's questions (`agentium hub answer`) and proposes work; it never sends Go, which stays with the user.
 - `todo set` and `todo clear` no longer exist; there is no per-tab list to replace.

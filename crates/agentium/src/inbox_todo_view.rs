@@ -7,7 +7,7 @@ use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
     prelude::FluentBuilder as _,
 };
 use ui::{
@@ -566,7 +566,7 @@ pub(crate) struct InboxTodos {
     /// `persist_migration` wrote them.
     migrated: bool,
     path: Option<PathBuf>,
-    write_task: Option<Task<()>>,
+    writer: crate::SerialWriter,
 }
 
 impl InboxTodos {
@@ -592,7 +592,7 @@ impl InboxTodos {
             delivered: HashMap::new(),
             migrated,
             path,
-            write_task: None,
+            writer: crate::SerialWriter::default(),
         }
     }
 
@@ -1057,24 +1057,20 @@ impl InboxTodos {
         }
     }
 
-    fn persist(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn persist(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else {
             return;
         };
-        let previous = self.write_task.take();
         let snapshot = serde_json::to_vec_pretty(&TodoFile {
             version: TODO_FILE_VERSION,
             items: self.items.clone(),
-        });
-        self.write_task = Some(cx.background_spawn(async move {
-            if let Some(previous) = previous {
-                previous.await;
-            }
-            snapshot
-                .map_err(anyhow::Error::from)
-                .and_then(|content| crate::write_file_atomically(&path, &content))
-                .log_err();
-        }));
+        })
+        .map_err(anyhow::Error::from);
+        self.writer.write(path, snapshot, cx);
+    }
+
+    pub(crate) fn writer(&self) -> &crate::SerialWriter {
+        &self.writer
     }
 }
 

@@ -451,6 +451,13 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Whether an input method is composing text that has not reached the
+    /// terminal yet. Anything written to the terminal now would come before
+    /// the composed text.
+    pub fn has_marked_text(&self) -> bool {
+        self.ime_state.is_some()
+    }
+
     /// Gets the current marked range (UTF-16).
     pub(crate) fn marked_text_range(&self) -> Option<StdRange<usize>> {
         self.ime_state

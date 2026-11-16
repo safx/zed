@@ -2185,24 +2185,24 @@ impl ThreadView {
         }
     }
 
-    pub(super) fn check_external_message(&self, cx: &App) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.thread.read(cx).status() == ThreadStatus::Idle,
-            "The conversation is running"
-        );
-        anyhow::ensure!(
-            !self.is_loading_contents && !self.has_queued_messages(),
-            "The conversation has a pending message"
-        );
-        anyhow::ensure!(
-            self.editing_message.is_none() && !self.message_editor.read(cx).has_draft(cx),
-            "The conversation has an unsent draft"
-        );
-        anyhow::ensure!(
-            self.thread_error.is_none(),
-            "The conversation has an error; resolve it before sending"
-        );
-        Ok(())
+    pub(super) fn external_message_readiness(
+        &self,
+        cx: &App,
+    ) -> super::ExternalMessageReadiness {
+        use super::ExternalMessageReadiness::{Fatal, Ready, Wait};
+        if self.thread.read(cx).status() != ThreadStatus::Idle {
+            return Wait("The conversation is running".into());
+        }
+        if self.is_loading_contents || self.has_queued_messages() {
+            return Wait("The conversation has a pending message".into());
+        }
+        if self.editing_message.is_some() || self.message_editor.read(cx).has_draft(cx) {
+            return Wait("The conversation has an unsent draft".into());
+        }
+        if self.thread_error.is_some() {
+            return Fatal("The conversation has an error; resolve it before sending".into());
+        }
+        Ready
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {

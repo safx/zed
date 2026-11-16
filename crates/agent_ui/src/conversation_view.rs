@@ -837,7 +837,60 @@ pub struct ConversationView {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Whether a message from outside the conversation (another program) can be
+/// sent now, must wait (the user or the agent is busy with it), or cannot
+/// be sent until someone fixes the conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExternalMessageReadiness {
+    Ready,
+    Wait(SharedString),
+    Fatal(SharedString),
+}
+
 impl ConversationView {
+    /// Checked without side effects, so a sender can wait instead of
+    /// failing when the conversation is only busy.
+    pub fn external_message_readiness(&self, cx: &App) -> ExternalMessageReadiness {
+        let Some(connected) = self.as_connected() else {
+            return ExternalMessageReadiness::Wait(
+                "The conversation is connecting or restoring".into(),
+            );
+        };
+        if !connected.auth_state.is_ok() {
+            return ExternalMessageReadiness::Fatal(
+                "The conversation requires authentication".into(),
+            );
+        }
+        if connected
+            .conversation
+            .read(cx)
+            .threads
+            .values()
+            .any(|thread| thread.read(cx).is_waiting_for_confirmation())
+        {
+            return ExternalMessageReadiness::Wait(
+                "The conversation is waiting for a permission answer; ask the user instead".into(),
+            );
+        }
+        if connected
+            .connection
+            .request_elicitations()
+            .is_some_and(|store| {
+                store.read(cx).elicitations().iter().any(|elicitation| {
+                    matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                })
+            })
+        {
+            return ExternalMessageReadiness::Wait(
+                "The conversation is waiting for an answer; ask the user instead".into(),
+            );
+        }
+        match self.root_thread_view() {
+            Some(thread_view) => thread_view.read(cx).external_message_readiness(cx),
+            None => ExternalMessageReadiness::Wait("The conversation has no root thread".into()),
+        }
+    }
+
     pub fn insert_external_message(
         &mut self,
         text: &str,
@@ -845,35 +898,15 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let connected = self
-            .as_connected()
-            .context("The conversation is connecting or restoring")?;
-        anyhow::ensure!(
-            connected.auth_state.is_ok(),
-            "The conversation requires authentication"
-        );
-        anyhow::ensure!(
-            !connected
-                .conversation
-                .read(cx)
-                .threads
-                .values()
-                .any(|thread| thread.read(cx).is_waiting_for_confirmation()),
-            "The conversation is waiting for a permission answer; ask the user instead"
-        );
-        anyhow::ensure!(
-            !connected
-                .connection
-                .request_elicitations()
-                .is_some_and(|store| store.read(cx).elicitations().iter().any(
-                    |elicitation| matches!(elicitation.status, ElicitationStatus::Pending { .. })
-                )),
-            "The conversation is waiting for an answer; ask the user instead"
-        );
+        match self.external_message_readiness(cx) {
+            ExternalMessageReadiness::Ready => {}
+            ExternalMessageReadiness::Wait(reason) | ExternalMessageReadiness::Fatal(reason) => {
+                anyhow::bail!("{reason}")
+            }
+        }
         let thread_view = self
             .root_thread_view()
             .context("The conversation has no root thread")?;
-        thread_view.read(cx).check_external_message(cx)?;
         thread_view.update(cx, |view, cx| {
             view.message_editor
                 .update(cx, |editor, cx| editor.insert_text(text, window, cx));
@@ -4433,7 +4466,12 @@ pub(crate) mod tests {
         let root = root_view.read_with(cx, |view, _| view.thread.clone());
         let editor = root_view.read_with(cx, |view, _| view.message_editor.clone());
 
+        let readiness = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.external_message_readiness(cx))
+        };
+        assert_eq!(readiness(&view, cx), ExternalMessageReadiness::Ready);
         root_view.update(cx, |view, _| view.is_loading_contents = true);
+        assert!(matches!(readiness(&view, cx), ExternalMessageReadiness::Wait(_)));
         view.update_in(cx, |view, window, cx| {
             assert!(
                 view.insert_external_message("blocked", true, window, cx)
@@ -4465,6 +4503,7 @@ pub(crate) mod tests {
         });
         let request = generic_permission_prompt(&child, None, cx);
         let (request_id, _response) = request_test_generic_permission(&child, request, cx);
+        assert!(matches!(readiness(&view, cx), ExternalMessageReadiness::Wait(_)));
         view.update_in(cx, |view, window, cx| {
             let error = view
                 .insert_external_message("blocked", true, window, cx)
@@ -4494,6 +4533,10 @@ pub(crate) mod tests {
                 cx,
             );
         });
+        assert_eq!(
+            readiness(&view, cx),
+            ExternalMessageReadiness::Wait("The conversation has a pending message".into())
+        );
         view.update_in(cx, |view, window, cx| {
             let error = view
                 .insert_external_message("blocked", true, window, cx)
