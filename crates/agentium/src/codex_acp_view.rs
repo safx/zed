@@ -2,7 +2,7 @@ use std::{any::Any, path::PathBuf, rc::Rc, sync::Arc};
 
 use crate::codex_acp_persistence::SavedCodexTab;
 use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection, ThreadStatus};
-use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
+use agent_client_protocol::v2::schema as acp_v2;
 use agent_servers::{AcpConnection, AcpLaunchOptions, AgentServer, AgentServerDelegate, CODEX_ID};
 use agent_ui::{
     Agent, AgentConnectionStore, AgentThreadSource, ConversationView, ExternalMessageReadiness,
@@ -82,7 +82,7 @@ pub(crate) struct CodexAcpView {
     rename_error: Option<SharedString>,
     saved_id: uuid::Uuid,
     cli_title: SharedString,
-    session_id: Option<acp::SessionId>,
+    session_id: Option<acp_v2::SessionId>,
     conversation: Entity<ConversationView>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
@@ -258,7 +258,7 @@ impl CodexAcpView {
     ) -> Self {
         let session_id = saved
             .as_ref()
-            .map(|saved| acp::SessionId::new(saved.session_id.clone()));
+            .map(|saved| acp_v2::SessionId::new(saved.session_id.clone()));
         let connection_store = cx.new(|cx| AgentConnectionStore::new_isolated(project.clone(), cx));
         let work_dirs = working_directory
             .as_ref()
@@ -783,7 +783,7 @@ fn fallback_command() -> AgentServerCommand {
 struct CodexAcpLaunch {
     command: AgentServerCommand,
     options: AcpLaunchOptions,
-    default_mode: Option<acp::SessionModeId>,
+    default_mode: Option<acp_v2::SessionConfigValueId>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     warning: Option<String>,
 }
@@ -804,7 +804,7 @@ fn build_launch(
             ..
         }) => (
             command.clone(),
-            default_mode.clone().map(acp::SessionModeId::new),
+            default_mode.clone().map(acp_v2::SessionConfigValueId::new),
             default_config_options.clone(),
         ),
         Some(CustomAgentServerSettings::Registry { .. }) => anyhow::bail!(
@@ -855,13 +855,18 @@ impl AgentServer for CodexAcpServer {
     fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
         self
     }
-    fn default_mode(&self, cx: &App) -> Option<acp::SessionModeId> {
+    fn default_mode(&self, cx: &App) -> Option<acp_v2::SessionConfigValueId> {
         agent_servers::CustomAgentServer::new(CODEX_ID.into()).default_mode(cx)
     }
     fn default_config_option(&self, config_id: &str, cx: &App) -> Option<AgentConfigOptionValue> {
         agent_servers::CustomAgentServer::new(CODEX_ID.into()).default_config_option(config_id, cx)
     }
-    fn set_default_mode(&self, mode: Option<acp::SessionModeId>, fs: Arc<dyn Fs>, cx: &mut App) {
+    fn set_default_mode(
+        &self,
+        mode: Option<acp_v2::SessionConfigValueId>,
+        fs: Arc<dyn Fs>,
+        cx: &mut App,
+    ) {
         update_settings_file(fs, cx, move |settings, _| {
             let settings = settings
                 .agent_servers
@@ -1051,6 +1056,7 @@ mod tests {
     }
 
     use super::*;
+    use agent_client_protocol::v1::schema as acp;
     use agent_servers::FakeAcpAgentServer;
     use fs::FakeFs;
     use gpui::UpdateGlobal as _;
@@ -1215,7 +1221,7 @@ mod tests {
         assert_eq!(launch.command.env, Some(expected_environment));
         assert_eq!(
             launch.default_mode,
-            Some(acp::SessionModeId::new("read-only"))
+            Some(acp_v2::SessionConfigValueId::new("read-only"))
         );
         assert_eq!(launch.default_config_options, defaults);
     }
@@ -1964,6 +1970,28 @@ mod tests {
                 .expect("restored thread view");
             let state = thread_view.read(cx).entry_view_state.read(cx);
             assert_eq!(state.expanded_tool_call_count(), 0);
+        });
+        view.update_in(cx, |view, window, cx| {
+            let thread_view = view
+                .conversation
+                .read(cx)
+                .root_thread_view()
+                .expect("restored thread view");
+            let entry_count = thread.read(cx).entries().len();
+            let state = thread_view.read(cx).entry_view_state.clone();
+            state.update(cx, |state, cx| {
+                for index in 0..entry_count {
+                    state.materialize_entry(index, &thread, window, cx);
+                }
+            });
+        });
+        view.read_with(cx, |view, cx| {
+            let thread_view = view
+                .conversation
+                .read(cx)
+                .root_thread_view()
+                .expect("restored thread view");
+            let state = thread_view.read(cx).entry_view_state.read(cx);
             for (index, entry) in thread.read(cx).entries().iter().enumerate() {
                 let state_entry = state.entry(index).expect("rendered tool entry");
                 for diff in entry.diffs() {
@@ -2358,7 +2386,7 @@ mod tests {
         };
         cx.update(|cx| {
             server.set_default_mode(
-                Some(acp::SessionModeId::new("plan")),
+                Some(acp_v2::SessionConfigValueId::new("plan")),
                 filesystem.clone(),
                 cx,
             )

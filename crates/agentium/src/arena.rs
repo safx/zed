@@ -1415,7 +1415,7 @@ impl Render for Arena {
             })
             .ok()
             .map(|pane_group| {
-                let mut context = KeyContext::new_with_defaults();
+                let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
                 context.add("Workspace");
 
                 div()

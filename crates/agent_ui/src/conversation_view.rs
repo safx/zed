@@ -4525,7 +4525,7 @@ pub(crate) mod tests {
 
         root_view.update_in(cx, |view, window, cx| {
             view.add_to_queue(
-                vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
                     "queued",
                 ))],
                 vec![],

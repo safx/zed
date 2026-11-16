@@ -118,7 +118,9 @@ impl AgentConnectionStore {
             cx.on_release(|store, cx| {
                 // Review panes can retain a thread after its conversation tab closes.
                 for connection in store.active_acp_connections(cx) {
-                    connection.connection.terminate_process().log_err();
+                    if let Some(connection) = connection.connection.downcast::<AcpConnection>() {
+                        connection.terminate_process().log_err();
+                    }
                 }
             })
             .detach();

@@ -8109,7 +8109,7 @@ exec sleep 60
             std::process::Stdio::null(),
         )
         .expect("spawn waiting child");
-        let mut child = transport::OwnedChild(child);
+        let mut child = transport::OwnedChild(child.into());
         // status() closes the child's stdin; keep it open so only shutdown ends the process.
         let stdin = child.0.stdin.take().expect("child stdin");
         let status = child.0.status();

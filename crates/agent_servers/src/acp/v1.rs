@@ -1,10 +1,11 @@
 use super::{
-    AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion, apply_subagent_update,
-    drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
-    handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
-    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
-    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    AcpDebugLog, AcpDebugMessage, AcpLaunchOptions, AcpSession, ClientContext, ConfigOptions,
+    FlattenAcpResult as _, ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion,
+    apply_subagent_update, drain_foreground_queue, enqueue_notification, enqueue_request,
+    first_class_terminal_auth_task, handle_v2_complete_elicitation, handle_v2_create_elicitation,
+    map_acp_error, mcp_configurations_for_project, respond_err, respond_result, runtime,
+    session_thread, terminal_auth_task_id, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -83,7 +84,7 @@ pub struct AcpConnection {
     accepts_subagent_updates: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
-    _child: Option<transport::OwnedChild>,
+    child: RefCell<Option<transport::OwnedChild>>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -550,6 +551,17 @@ impl AcpConnection {
         self.debug_log.subscribe()
     }
 
+    pub fn live_process_id(&self) -> Option<u32> {
+        self.child.borrow().as_ref()?.0.live_process_id()
+    }
+
+    pub fn terminate_process(&self) -> Result<()> {
+        if let Some(child) = self.child.borrow_mut().as_mut() {
+            child.0.terminate()?;
+        }
+        Ok(())
+    }
+
     pub async fn stdio(
         agent_id: AgentId,
         project: Entity<Project>,
@@ -559,6 +571,29 @@ impl AcpConnection {
         default_config_options: HashMap<String, AgentConfigOptionValue>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        Self::stdio_with_options(
+            agent_id,
+            project,
+            command,
+            agent_server_store,
+            default_mode,
+            default_config_options,
+            AcpLaunchOptions::default(),
+            cx,
+        )
+        .await
+    }
+
+    pub async fn stdio_with_options(
+        agent_id: AgentId,
+        project: Entity<Project>,
+        command: AgentServerCommand,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        default_mode: Option<acp_v2::SessionConfigValueId>,
+        default_config_options: HashMap<String, AgentConfigOptionValue>,
+        options: AcpLaunchOptions,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
         let original_command = command.clone();
         let transport::StdioProcess {
             child,
@@ -566,7 +601,7 @@ impl AcpConnection {
             outgoing,
             stderr,
             debug_log,
-        } = transport::spawn_stdio(&project, command, cx)?;
+        } = transport::spawn_stdio_with_options(&project, command, &options, cx)?;
         let mut child = transport::OwnedChild(child);
         let sessions = Rc::new(RefCell::new(HashMap::default()));
 
@@ -605,7 +640,7 @@ impl AcpConnection {
 
         let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
         let connection_future = connect_client_future(
-            "zed",
+            options.client_name,
             transport,
             dispatch_tx.clone(),
             connection_tx,
@@ -619,11 +654,19 @@ impl AcpConnection {
                 .context("Failed to receive ACP connection handle")
         }
         .boxed_local();
+        let exited = child.0.exit_flag();
         let status_fut = child
             .0
             .status()
-            .map(|status| {
-                status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
+            .map(move |status| {
+                // A wait error can mean the child was already reaped; its PID may be reused.
+                if let Some(exited) = exited {
+                    exited.set(true);
+                }
+                status.map_err(|error| {
+                    log::error!("Failed to wait for agent server exit: {error}");
+                    anyhow!("failed to wait for agent server exit: {error}")
+                })
             })
             .boxed_local();
         let (connection, status_fut, _) = runtime::race_startup(
@@ -648,7 +691,7 @@ impl AcpConnection {
                 acp::InitializeRequest::new(ProtocolVersion::V1)
                     .client_capabilities(client_capabilities)
                     .client_info(
-                        acp::Implementation::new("zed", version)
+                        acp::Implementation::new(options.client_name, version)
                             .title(release_channel.map(ToOwned::to_owned)),
                     ),
             )
@@ -752,7 +795,7 @@ impl AcpConnection {
             dispatch_tx,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            _child: Some(child),
+            child: RefCell::new(Some(child)),
         })
     }
 
@@ -792,7 +835,7 @@ impl AcpConnection {
             accepts_subagent_updates,
             request_elicitations,
             defaults,
-            _child: None,
+            child: RefCell::new(None),
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
@@ -1818,8 +1861,12 @@ pub mod test_support {
     use super::*;
     use futures::StreamExt as _;
 
+    type FakeLoadSessionHandler =
+        Arc<dyn Fn(&Entity<AcpThread>, &mut App) -> Result<()> + Send + Sync>;
+
     #[derive(Clone, Default)]
     pub struct FakeAcpAgentServer {
+        load_session_handler: Option<FakeLoadSessionHandler>,
         load_session_count: Arc<AtomicUsize>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
@@ -1832,6 +1879,14 @@ pub mod test_support {
     }
 
     impl FakeAcpAgentServer {
+        pub fn on_load_session(
+            mut self,
+            handler: impl Fn(&Entity<AcpThread>, &mut App) -> Result<()> + Send + Sync + 'static,
+        ) -> Self {
+            self.load_session_handler = Some(Arc::new(handler));
+            self
+        }
+
         pub fn new() -> Self {
             Self::default()
         }
@@ -1900,6 +1955,7 @@ pub mod test_support {
             let auth_elicitation_response = self.auth_elicitation_response.clone();
             let auth_elicitation_completion = self.auth_elicitation_completion.clone();
             let exit_status_sender = self.exit_status_sender.clone();
+            let load_session_handler = self.load_session_handler.clone();
             cx.spawn(async move |cx| {
                 let harness = build_fake_acp_connection(
                     project,
@@ -1931,6 +1987,7 @@ pub mod test_support {
                     Ok(())
                 });
                 Ok(Rc::new(FakeAcpAgentConnection {
+                    load_session_handler,
                     inner: harness.connection,
                     _keep_agent_alive: harness.keep_agent_alive,
                     _simulate_exit_task: simulate_exit_task,
@@ -1953,6 +2010,7 @@ pub mod test_support {
     }
 
     struct FakeAcpAgentConnection {
+        load_session_handler: Option<FakeLoadSessionHandler>,
         inner: Rc<AcpConnection>,
         _keep_agent_alive: Task<anyhow::Result<()>>,
         _simulate_exit_task: Task<anyhow::Result<()>>,
@@ -1992,9 +2050,17 @@ pub mod test_support {
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
-            self.inner
+            let load = self
+                .inner
                 .clone()
-                .load_session(session_id, project, work_dirs, title, cx)
+                .load_session(session_id, project, work_dirs, title, cx);
+            cx.spawn(async move |cx| {
+                let thread = load.await?;
+                if let Some(handler) = &self.load_session_handler {
+                    cx.update(|cx| handler(&thread, cx))?;
+                }
+                Ok(thread)
+            })
         }
 
         fn supports_resume_session(&self) -> bool {
@@ -9345,7 +9411,6 @@ exit 7
             })
             .await
             .expect("load_session failed");
-        cx.run_until_parked();
 
         let entries = thread.read_with(cx, |thread, _| {
             thread

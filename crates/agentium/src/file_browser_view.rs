@@ -142,8 +142,8 @@ impl FileBrowserView {
         this
     }
 
-    fn dispatch_context(&self) -> KeyContext {
-        let mut context = KeyContext::new_with_defaults();
+    fn dispatch_context(&self, cx: &App) -> KeyContext {
+        let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
         context.add("FileBrowser");
         context.add("menu");
         context
@@ -1028,7 +1028,7 @@ impl Render for FileBrowserView {
 
         div()
             .track_focus(&self.focus_handle)
-            .key_context(self.dispatch_context())
+            .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::expand_selected_entry))

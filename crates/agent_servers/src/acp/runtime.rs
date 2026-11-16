@@ -344,7 +344,7 @@ mod tests {
             std::process::Stdio::null(),
         )
         .expect("spawn waiting child");
-        let mut child = crate::acp::transport::OwnedChild(child);
+        let mut child = crate::acp::transport::OwnedChild(child.into());
         // status() closes stdin, which must not end the child before the guard kills it.
         let stdin = child.0.stdin.take().expect("child stdin");
         let status = child.0.status();

@@ -121,6 +121,22 @@ fn fallback_failure(failure: anyhow::Error, negotiation: anyhow::Error) -> anyho
     failure.context(context)
 }
 
+pub struct AcpLaunchOptions {
+    pub working_directory: Option<PathBuf>,
+    pub client_name: &'static str,
+    pub terminate_on_drop_and_quit: bool,
+}
+
+impl Default for AcpLaunchOptions {
+    fn default() -> Self {
+        Self {
+            working_directory: None,
+            client_name: "zed",
+            terminate_on_drop_and_quit: false,
+        }
+    }
+}
+
 pub async fn connect(
     agent_id: AgentId,
     project: Entity<Project>,

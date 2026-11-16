@@ -250,7 +250,7 @@ impl GitStatusView {
 
             repo_weak
                 .update(cx, |repo, cx| {
-                    repo.checkout_files("HEAD", vec![repo_path.clone()], cx)
+                    repo.checkout_files(Some("HEAD"), vec![repo_path.clone()], cx)
                 })?
                 .await?;
 

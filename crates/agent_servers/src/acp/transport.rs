@@ -18,11 +18,11 @@ use std::{
 use task::{Shell, ShellBuilder};
 use util::{ResultExt as _, process::Child};
 
-pub(super) struct OwnedChild(pub Child);
+pub(super) struct OwnedChild(pub AcpProcess);
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        self.0.kill().log_err();
+        self.0.terminate().log_err();
     }
 }
 
@@ -35,11 +35,10 @@ pub(super) struct StdioProcess {
     pub debug_log: AcpDebugLog,
 }
 
-#[cfg(test)]
 pub(super) fn spawn_stdio(
     project: &Entity<Project>,
     command: AgentServerCommand,
-    cx: &mut AsyncApp,
+    cx: &AsyncApp,
 ) -> Result<StdioProcess> {
     spawn_stdio_with_options(project, command, &super::AcpLaunchOptions::default(), cx)
 }
@@ -58,7 +57,7 @@ impl AcpProcess {
             .map(|_| self.child.id())
     }
 
-    fn new(child: Child, guarded: bool, cx: &mut AsyncApp) -> Self {
+    fn new(child: Child, guarded: bool, cx: &AsyncApp) -> Self {
         let exited = guarded.then(|| Rc::new(Cell::new(false)));
         let mut process = Self {
             child,
@@ -108,6 +107,17 @@ impl AcpProcess {
     }
 }
 
+#[cfg(test)]
+impl From<Child> for AcpProcess {
+    fn from(child: Child) -> Self {
+        Self {
+            child,
+            exited: None,
+            _quit_subscription: None,
+        }
+    }
+}
+
 impl Deref for AcpProcess {
     type Target = Child;
     fn deref(&self) -> &Child {
@@ -144,7 +154,7 @@ pub(super) fn spawn_stdio_with_options(
     project: &Entity<Project>,
     command: AgentServerCommand,
     options: &super::AcpLaunchOptions,
-    cx: &mut AsyncApp,
+    cx: &AsyncApp,
 ) -> Result<StdioProcess> {
     let root_dir = project.read_with(cx, |project, cx| {
         project

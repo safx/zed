@@ -531,7 +531,7 @@ impl PickerDelegate for ResumeDelegate {
 mod tests {
     use super::*;
     use acp_thread::{AcpThread, AgentConnection, AgentSessionListResponse};
-    use agent_client_protocol::schema::v1 as acp;
+    use agent_client_protocol::{v1::schema as acp, v2::schema as acp_v2};
     use agent_servers::AgentServerDelegate;
     use fs::FakeFs;
     use gpui::{TestAppContext, VisualTestContext};
@@ -772,16 +772,22 @@ mod tests {
                 "History picker must not create sessions"
             )))
         }
-        fn auth_methods(&self) -> &[acp::AuthMethod] {
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
             &[]
         }
-        fn authenticate(&self, _: acp::AuthMethodId, _: &mut App) -> Task<Result<()>> {
+        fn authenticate(&self, _: acp_v2::AuthMethodId, _: &mut App) -> Task<Result<()>> {
             Task::ready(Ok(()))
         }
-        fn prompt(&self, _: acp::PromptRequest, _: &mut App) -> Task<Result<acp::PromptResponse>> {
+        fn prompt(
+            &self,
+            _: acp_v2::PromptRequest,
+            _: &mut App,
+        ) -> Task<Result<acp::PromptResponse>> {
             Task::ready(Err(anyhow::anyhow!("History picker must not send prompts")))
         }
-        fn cancel(&self, _: &acp::SessionId, _: &mut App) {}
+        fn cancel(&self, _: &acp_v2::SessionId, _: &mut App) -> Result<()> {
+            Ok(())
+        }
     }
     struct SharedTestList(Arc<TestList>);
     impl AgentSessionList for SharedTestList {
