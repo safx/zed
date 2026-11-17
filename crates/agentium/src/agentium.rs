@@ -1214,7 +1214,8 @@ fn resolve_selected_task(current: Option<Uuid>, tasks_with_arena: &[Uuid]) -> Op
 }
 
 /// The arena a task returns to when selected: the one last active for it if
-/// still open, else its first open arena. `None` leaves the center as is.
+/// still open, else its first open arena. `None` empties the center rather
+/// than leaving another task's arena under this task's overview.
 fn arena_to_open_for_task(
     remembered: Option<EntityId>,
     live: &[(usize, EntityId)],
@@ -2068,8 +2069,7 @@ impl AgentiumApp {
     }
 
     /// Shows the task's overview and returns the center to the arena the user
-    /// last had open for it. A task with no open arena only changes the
-    /// overview.
+    /// last had open for it. A task with no open arena empties the center.
     fn select_task(&mut self, task_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if !self.board.tasks.iter().any(|task| task.id == task_id) {
             return;
@@ -2079,6 +2079,18 @@ impl AgentiumApp {
         }
         self.selected_task = Some(task_id);
         self.agent_activity = None;
+        match self.arena_to_open_for_task(task_id) {
+            Some(index) => self.switch_arena(index, window, cx),
+            None => {
+                self.active_arena_index = None;
+                self.focus_handle.focus(window, cx);
+                self.set_overview_scope(Some(task_overview::OverviewScope::Task(task_id)), cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn arena_to_open_for_task(&self, task_id: Uuid) -> Option<usize> {
         let live: Vec<(usize, EntityId)> = self
             .board_cache
             .task_worktrees
@@ -2093,14 +2105,7 @@ impl AgentiumApp {
                 WorktreeRow::Closed { .. } | WorktreeRow::Missing { .. } => None,
             })
             .collect();
-        let remembered = self.last_active_arena.get(&task_id).copied();
-        match arena_to_open_for_task(remembered, &live) {
-            Some(index) => self.switch_arena(index, window, cx),
-            None => {
-                self.set_overview_scope(Some(task_overview::OverviewScope::Task(task_id)), cx);
-                cx.notify();
-            }
-        }
+        arena_to_open_for_task(self.last_active_arena.get(&task_id).copied(), &live)
     }
 
     fn switch_arena(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2195,7 +2200,8 @@ impl AgentiumApp {
 
     /// Keeps the sidebar selection and the overview scope consistent with the
     /// board and the open arenas after either changed. A selected task whose
-    /// arenas are all closed keeps its overview; everything else follows the
+    /// arenas are all closed keeps its overview over an empty center, as does
+    /// one selected while the center is empty; everything else follows the
     /// active arena.
     fn reconcile_selection(&mut self, cx: &mut Context<Self>) {
         let selected = self
@@ -2211,9 +2217,13 @@ impl AgentiumApp {
             .task_worktrees
             .get(&task_id)
             .is_some_and(|rows| rows.iter().any(|row| matches!(row, WorktreeRow::Live { .. })));
-        if selected_has_open_arena {
+        // With no active arena, syncing would clear the selection.
+        if selected_has_open_arena && self.active_arena_index.is_some() {
             self.sync_selection_to_active_arena(cx);
         } else {
+            if !selected_has_open_arena {
+                self.active_arena_index = None;
+            }
             self.set_overview_scope(Some(task_overview::OverviewScope::Task(task_id)), cx);
         }
     }
@@ -2924,7 +2934,11 @@ impl AgentiumApp {
             self.active_arena_index = None;
         } else if let Some(active) = self.active_arena_index {
             if active == index {
-                self.active_arena_index = Some(active.min(self.arenas.len() - 1));
+                // The neighbouring index may hold another task's arena.
+                self.active_arena_index = match self.selected_task {
+                    Some(task_id) => self.arena_to_open_for_task(task_id),
+                    None => Some(active.min(self.arenas.len() - 1)),
+                };
             } else if active > index {
                 self.active_arena_index = Some(active - 1);
             }
@@ -2942,6 +2956,8 @@ impl AgentiumApp {
             });
             let focus = ws.focus_handle(cx);
             focus.focus(window, cx);
+        } else {
+            self.focus_handle.focus(window, cx);
         }
         cx.notify();
     }
@@ -11307,6 +11323,88 @@ impl AgentiumApp {
             )
             .into_any_element()
     }
+
+    fn render_empty_center(&self, cx: &mut Context<Self>) -> AnyElement {
+        let task = match self.overview.read(cx).scope {
+            Some(task_overview::OverviewScope::Task(task_id)) => {
+                self.board.tasks.iter().find(|task| task.id == task_id)
+            }
+            _ => None,
+        };
+        let (label, buttons) = match task {
+            Some(task) => {
+                let buttons: Vec<AnyElement> = self
+                    .board_cache
+                    .task_worktrees
+                    .get(&task.id)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter_map(|(row_index, row)| {
+                        let button_id = SharedString::from(format!("empty-center-arena-{row_index}"));
+                        match row {
+                            WorktreeRow::Live { arena_index } => {
+                                let arena_index = *arena_index;
+                                let name = self.arenas.get(arena_index)?.read(cx).name.clone();
+                                Some(
+                                    Button::new(button_id, name)
+                                        .full_width()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.switch_arena(arena_index, window, cx);
+                                        }))
+                                        .into_any_element(),
+                                )
+                            }
+                            WorktreeRow::Closed { path } => {
+                                let name = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                let path = path.clone();
+                                Some(
+                                    Button::new(button_id, name)
+                                        .full_width()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.add_arena_with_path(path.clone(), window, cx);
+                                        }))
+                                        .into_any_element(),
+                                )
+                            }
+                            WorktreeRow::Missing { .. } => None,
+                        }
+                    })
+                    .collect();
+                let label = if buttons.is_empty() {
+                    format!("No arena is open for {}. Press + New Arena to add one.", task.title)
+                } else {
+                    format!("No arena is open for {}. Choose one to open.", task.title)
+                };
+                (label, buttons)
+            }
+            None if self.arenas.is_empty() => ("Press + New Arena to add an arena.".to_string(), Vec::new()),
+            None => ("Select a task or an arena in the sidebar.".to_string(), Vec::new()),
+        };
+        v_flex()
+            .id("empty-center")
+            .p_4()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w_64()
+                    .max_w_full()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_center()
+                            .mb_2()
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                    .children(buttons),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for AgentiumApp {
@@ -11651,15 +11749,7 @@ impl Render for AgentiumApp {
                     )
                     .map(|d| match self.active_arena() {
                         Some(arena) => d.child(arena.clone()),
-                        None => d.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size_full()
-                                .text_color(colors.text_muted)
-                                .child("Press + to add an arena"),
-                        ),
+                        None => d.child(self.render_empty_center(cx)),
                     }),
             )
             .child(self.workspace_entity.read(cx).modal_layer().clone())
