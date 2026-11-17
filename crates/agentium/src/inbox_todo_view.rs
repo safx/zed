@@ -1556,7 +1556,6 @@ impl InboxTodoView {
 
     fn render_item(
         &self,
-        number: usize,
         item: &TodoItem,
         choice: Option<TodoChoice>,
         styles: &TextStyles,
@@ -1608,7 +1607,7 @@ impl InboxTodoView {
                         div()
                             .text_xs()
                             .text_color(colors.text_muted)
-                            .child(format!("{number}.")),
+                            .child(format!("#{todo_id}")),
                     )
                     .child(
                         div()
@@ -1816,8 +1815,8 @@ impl Render for InboxTodoView {
         };
         let mut proposals = Vec::new();
         let mut user_tasks = Vec::new();
-        for (index, (item, choice)) in items.iter().zip(choices).enumerate() {
-            let element = self.render_item(index + 1, item, choice, &styles, cx).into_any_element();
+        for (item, choice) in items.iter().zip(choices) {
+            let element = self.render_item(item, choice, &styles, cx).into_any_element();
             match item.kind {
                 InboxTodoKind::Proposal => proposals.push(element),
                 InboxTodoKind::UserTask => user_tasks.push(element),
