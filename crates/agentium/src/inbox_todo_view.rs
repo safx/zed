@@ -237,21 +237,36 @@ impl TodoChoice {
 /// Items are named by id and title: the agent lists them with `todo list`
 /// and closes them with `todo done <id>`.
 pub(crate) fn todo_request_message(items: &[(&TodoItem, Option<&str>)]) -> String {
-    let mut lines = vec!["To do".to_string()];
-    for (item, note) in items {
-        let mut line = format!("Go: #{} {}", item.id, item.title);
-        if let Some(detail) = &item.detail {
-            line.push_str(" :: ");
-            line.push_str(detail);
-        }
-        if let Some(note) = note {
-            line.push_str(" — Note: ");
-            line.push_str(note);
-        }
-        lines.push(line);
+    let blocks: Vec<String> = items
+        .iter()
+        .map(|(item, note)| {
+            let mut block = format!("Go: #{} {}", item.id, item.title);
+            if let Some(detail) = &item.detail {
+                push_item_field(&mut block, ":: ", detail);
+            }
+            if let Some(note) = note {
+                push_item_field(&mut block, "Note: ", note);
+            }
+            block
+        })
+        .collect();
+    format!(
+        "To do\n{}\n\nRun `agentium todo done <id>` for each item once it is finished.",
+        blocks.join("\n\n")
+    )
+}
+
+// A note at the end of a long detail line was misread as applying to every
+// item, so each field starts its own indented line under its item.
+fn push_item_field(block: &mut String, label: &str, text: &str) {
+    let mut lines = text.lines();
+    block.push_str("\n  ");
+    block.push_str(label);
+    block.push_str(lines.next().unwrap_or_default());
+    for line in lines {
+        block.push_str("\n    ");
+        block.push_str(line);
     }
-    lines.push("Run `agentium todo done <id>` for each item once it is finished.".to_string());
-    lines.join("\n")
 }
 
 /// Where a tab is now. Tabs move between panes and a closed tab's entity can
@@ -2186,7 +2201,7 @@ mod tests {
         assert_eq!(
             delivered[0].1,
             format!(
-                "[from: Task Overview]\nTo do\nGo: #{go_a} Add tests — Note: with the Failed lane\nGo: #{go_b} Fix flake\nRun `agentium todo done <id>` for each item once it is finished."
+                "[from: Task Overview]\nTo do\nGo: #{go_a} Add tests\n  Note: with the Failed lane\n\nGo: #{go_b} Fix flake\n\nRun `agentium todo done <id>` for each item once it is finished."
             )
         );
         todos.read_with(cx, |todos, _| {
@@ -2431,7 +2446,32 @@ mod tests {
         let b = item(8, "Open a PR", None);
         assert_eq!(
             todo_request_message(&[(&a, Some("quickly")), (&b, None)]),
-            "To do\nGo: #3 Add tests :: rebinding — Note: quickly\nGo: #8 Open a PR\nRun `agentium todo done <id>` for each item once it is finished."
+            "To do\nGo: #3 Add tests\n  :: rebinding\n  Note: quickly\n\nGo: #8 Open a PR\n\nRun `agentium todo done <id>` for each item once it is finished."
+        );
+    }
+
+    #[test]
+    fn multi_line_notes_stay_inside_their_item() {
+        let item = TodoItem {
+            id: 926,
+            task_id: None,
+            arena_path: None,
+            arena_name: "zed".to_string(),
+            branch: None,
+            kind: InboxTodoKind::Proposal,
+            title: "Fix the flake".to_string(),
+            detail: Some("Retry once\nthen bisect".to_string()),
+            created_by: TodoCreator::Human,
+            assigned: Vec::new(),
+            state: TodoState::Assigned,
+            request: None,
+            resolution: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            todo_request_message(&[(&item, Some("Tell me if anything else remains\nafter this"))]),
+            "To do\nGo: #926 Fix the flake\n  :: Retry once\n    then bisect\n  Note: Tell me if anything else remains\n    after this\n\nRun `agentium todo done <id>` for each item once it is finished."
         );
     }
 
