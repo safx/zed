@@ -233,6 +233,23 @@ impl TodoChoice {
     }
 }
 
+/// Names what the button does with the chosen items: only Go sends a
+/// message, while Skip and Done close items without sending anything.
+fn send_button_label(choices: impl IntoIterator<Item = TodoChoice>) -> &'static str {
+    let (mut sends, mut closes) = (false, false);
+    for choice in choices {
+        match choice {
+            TodoChoice::Go => sends = true,
+            TodoChoice::Done | TodoChoice::Skip => closes = true,
+        }
+    }
+    match (sends, closes) {
+        (true, true) => "Apply",
+        (false, true) => "Close",
+        _ => "Send",
+    }
+}
+
 /// The message one agent receives for the items the user sent it with Go.
 /// Items are named by id and title: the agent lists them with `todo list`
 /// and closes them with `todo done <id>`.
@@ -1798,6 +1815,7 @@ impl Render for InboxTodoView {
         };
         let can_send = self.send_problem(cx).is_none();
         let has_choices = choices.iter().any(|choice| choice.is_some());
+        let send_label = send_button_label(choices.iter().flatten().copied());
         let chosen_ids = self.chosen_ids(cx);
 
         let group = |label: &'static str, hint: &'static str| {
@@ -1864,11 +1882,14 @@ impl Render for InboxTodoView {
                         .when_some(report, |d, report| {
                             d.child(div().text_sm().text_color(colors.text_muted).child(report))
                         })
+                        // Hidden rather than removed, so choosing the first
+                        // item does not shift the list.
                         .child(
                             h_flex()
                                 .gap_2()
+                                .when(!has_choices, |row| row.invisible())
                                 .child(
-                                    Button::new("inbox-todo-send", "Send")
+                                    Button::new("inbox-todo-send", send_label)
                                         .disabled(!can_send)
                                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                             this.send(cx);
@@ -1887,7 +1908,7 @@ impl Render for InboxTodoView {
                                     div()
                                         .text_xs()
                                         .text_color(colors.text_placeholder)
-                                        .child("cmd-enter sends. Go asks the assigned agent; it closes the item with `todo done` when finished."),
+                                        .child("cmd-enter applies. Go sends the item to its assigned agent, which closes it with `todo done` when finished; Skip and Done close it without sending anything."),
                                 ),
                         ),
                 )
@@ -1906,7 +1927,7 @@ mod tests {
         RestoreObservation, RestoreOutcome, RestorePlan, SendAnswers, TodoChoice, TodoCreator,
         TodoDraft, TodoItem, TodoOutcome, TodoScope, TodoState, acp_restore_outcome,
         advance_pending_restores, find_item_location, parse_todo_file, prune_done,
-        record_restore_launch, todo_request_message, todo_restore_plan,
+        record_restore_launch, send_button_label, todo_request_message, todo_restore_plan,
     };
     use crate::InboxAsker;
     use crate::arena::Arena;
@@ -2447,6 +2468,15 @@ mod tests {
             todo_request_message(&[(&a, Some("quickly")), (&b, None)]),
             "To do\nGo: #3 Add tests\n  :: rebinding\n  Note: quickly\n\nGo: #8 Open a PR\n\nRun `agentium todo done <id>` for each item once it is finished."
         );
+    }
+
+    #[test]
+    fn send_button_says_whether_it_sends_closes_or_both() {
+        assert_eq!(send_button_label([TodoChoice::Go, TodoChoice::Go]), "Send");
+        assert_eq!(send_button_label([TodoChoice::Skip]), "Close");
+        assert_eq!(send_button_label([TodoChoice::Done, TodoChoice::Skip]), "Close");
+        assert_eq!(send_button_label([TodoChoice::Skip, TodoChoice::Go]), "Apply");
+        assert_eq!(send_button_label([TodoChoice::Go, TodoChoice::Done]), "Apply");
     }
 
     #[test]
