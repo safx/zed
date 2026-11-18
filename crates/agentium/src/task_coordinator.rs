@@ -11,7 +11,7 @@ use futures::{FutureExt as _, future::Shared};
 use gpui::{prelude::*, *};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use ui::{Tooltip, prelude::*};
+use ui::{ContextMenu, ContextMenuEntry, Tooltip, prelude::*};
 use util::ResultExt as _;
 use uuid::Uuid;
 use task::Shell;
@@ -59,14 +59,17 @@ impl Provider {
         }
     }
 
-    /// The provider after this one on the settings button.
-    fn next(self) -> Self {
-        match self {
-            Self::ClaudeHaiku => Self::ClaudeSonnet,
-            Self::ClaudeSonnet => Self::ClaudeOpus,
-            Self::ClaudeOpus => Self::CodexLuna,
-            Self::CodexLuna => Self::ClaudeHaiku,
-        }
+    /// In the order the Model menu lists them.
+    const ALL: [Self; 4] = [
+        Self::ClaudeHaiku,
+        Self::ClaudeSonnet,
+        Self::ClaudeOpus,
+        Self::CodexLuna,
+    ];
+
+    fn label(self) -> String {
+        let (agent, model) = self.names();
+        format!("{agent} {model}")
     }
 
     /// The `claude --model` alias, or `None` for a Codex coordinator.
@@ -87,6 +90,27 @@ pub(crate) enum Mode {
     #[default]
     SummaryOnly,
     LimitedAuto,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SummaryOnly => "Summary only",
+            Self::LimitedAuto => "Limited auto",
+        }
+    }
+}
+
+/// Limited auto relies on launch flags that only Claude takes.
+fn settings_allowed(provider: Provider, mode: Mode) -> bool {
+    mode == Mode::SummaryOnly || provider.claude_model().is_some()
+}
+
+/// Whether enabling launches the coordinator at once instead of when a job
+/// is waiting: a Claude session that has never started may first ask to
+/// trust the coordinator's folder.
+fn starts_on_enable(coordinator: &Coordinator) -> bool {
+    coordinator.provider.claude_model().is_some() && !coordinator.claude_started
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -885,7 +909,8 @@ pub(crate) struct Runtime {
     pub(crate) view: Option<CoordinatorView>,
     launch_token: Uuid,
     attempted: bool,
-    /// Set by Start in the Coordinator tab; otherwise a coordinator launches
+    /// Set by Start Now in the Coordinator tab and by enabling a Claude
+    /// session that never ran; otherwise a coordinator launches
     /// only when a job is waiting for it.
     start_requested: bool,
     configuring: bool,
@@ -2036,13 +2061,192 @@ impl AgentiumApp {
         });
     }
 
-    /// One line in the task's overview heading.
-    pub(crate) fn render_coordinator_controls(
+    /// Turns the coordinator on. It launches when a summary or an Inbox
+    /// event is waiting for it, except for a Claude session that has never
+    /// started.
+    fn enable_coordinator(&mut self, task: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let mut start_now = false;
+        self.coordinators.update(cx, |store, cx| {
+            if store.disabled {
+                return;
+            }
+            let coordinator = store
+                .saved
+                .tasks
+                .entry(task)
+                .or_insert_with(|| Coordinator::new(Provider::default()));
+            coordinator.enabled = true;
+            start_now = starts_on_enable(coordinator);
+            store.change(cx);
+        });
+        // Claude's first start asks to trust the coordinator's folder in the
+        // Coordinator tab; launched later in the background, that prompt goes
+        // unseen and the launch times out.
+        if start_now {
+            self.coordinator_runtime.entry(task).or_default().start_requested = true;
+            self.coordinator_tab_open.insert(task);
+        }
+        self.coordinator_tick(window, cx);
+    }
+
+    fn disable_coordinator(&mut self, task: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.release_coordinator_focus(task, window, cx);
+        self.coordinators.update(cx, |store, cx| {
+            if store.disabled {
+                return;
+            }
+            if let Some(coordinator) = store.saved.tasks.get_mut(&task) {
+                coordinator.enabled = false;
+                store.change(cx);
+            }
+        });
+        self.stop_coordinator(task, cx);
+        self.coordinator_tick(window, cx);
+    }
+
+    /// Restarts a coordinator whose process failed, resuming its session,
+    /// or resends to one that stopped responding.
+    fn retry_coordinator(&mut self, task: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let failed_connection = matches!(
+            self.coordinator_view(task),
+            Some(CoordinatorView::Codex(view))
+                if view.read(cx).state() == crate::codex_acp_view::CodexAcpState::Error
+        );
+        if failed_connection {
+            self.release_coordinator_focus(task, window, cx);
+            self.stop_coordinator(task, cx);
+        }
+        let runtime = self.coordinator_runtime.entry(task).or_default();
+        if runtime.view.is_none() {
+            *runtime = Runtime::default();
+            runtime.start_requested = true;
+        } else {
+            runtime.error = None;
+            runtime.sent = None;
+            runtime.batch = None;
+            runtime.waiting_since = Some(Instant::now());
+        }
+        self.coordinators.update(cx, |store, cx| store.change(cx));
+        self.rewrite_failed_inbox_files(cx);
+        self.coordinator_tick(window, cx);
+    }
+
+    /// Replaces the conversation, keeping the pending jobs.
+    fn start_new_coordinator_session(
+        &mut self,
+        task: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.release_coordinator_focus(task, window, cx);
+        self.stop_coordinator(task, cx);
+        self.coordinators.update(cx, |store, cx| {
+            if let Some(coordinator) = store.saved.tasks.get_mut(&task) {
+                reset_session(coordinator);
+                store.change(cx);
+            }
+        });
+        self.coordinator_runtime.entry(task).or_default().start_requested = true;
+        self.coordinator_tick(window, cx);
+    }
+
+    fn coordinator_error(&self, task: Uuid, cx: &App) -> Option<String> {
+        self.coordinators.read(cx).error().or_else(|| {
+            self.coordinator_runtime
+                .get(&task)
+                .and_then(|runtime| runtime.error.clone())
+        })
+    }
+
+    /// The state the Coordinator tab's dot shows; `None` while disabled.
+    fn coordinator_state(&self, task: Uuid, cx: &App) -> Option<(&'static str, Color)> {
+        if !self.coordinator_enabled(task, cx) {
+            return None;
+        }
+        if self.coordinator_error(task, cx).is_some() {
+            return Some(("Error", Color::Error));
+        }
+        Some(match self.coordinator_view(task) {
+            None => ("Not started", Color::Muted),
+            Some(view) => match self.item_state(view.item().as_ref(), cx) {
+                Some("permission") => ("Waiting for permission", Color::Warning),
+                Some("running") => ("Running", Color::Success),
+                Some("error") => ("Error", Color::Error),
+                _ => ("Idle", Color::Muted),
+            },
+        })
+    }
+
+    /// The "Coordinator" tab beside "Overview": a dot for its state, and
+    /// its settings on right-click.
+    pub(crate) fn render_coordinator_tab(
         &self,
         task: Uuid,
+        showing_coordinator: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let store = self.coordinators.read(cx);
+        let coordinator = store.get(task);
+        let provider = coordinator
+            .map(|coordinator| coordinator.provider)
+            .unwrap_or_default();
+        let mode = coordinator
+            .map(|coordinator| coordinator.effective_mode())
+            .unwrap_or_default();
+        let pending = store
+            .jobs()
+            .values()
+            .filter(|job| job.task == Some(task) && job.summary.is_none())
+            .count();
+        let state = self.coordinator_state(task, cx);
+        let tooltip = match state {
+            Some((state, _)) => format!(
+                "Task Coordinator (experimental)\n{state} · {} · {} · {pending} pending summaries\nRight-click to disable it.",
+                mode.label(),
+                provider.label(),
+            ),
+            None => "Task Coordinator (experimental): off\nRight-click to enable it or to choose its mode and model.".to_string(),
+        };
+        div()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_coordinator_menu(task, event.position, window, cx);
+                }),
+            )
+            .child(
+                Button::new("overview-tab-coordinator", "Coordinator")
+                    .toggle_state(showing_coordinator)
+                    .when_some(state, |button, (_, color)| {
+                        button.start_icon(
+                            Icon::new(IconName::Circle).size(IconSize::Small).color(color),
+                        )
+                    })
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.coordinator_tab_open.insert(task);
+                        if let Some(view) = this.coordinator_view(task) {
+                            window.focus(&view.focus_handle(cx), cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Off: Enable, then the mode and model to choose. On: Disable, with the
+    /// settings shown but fixed, since changing them starts a new session.
+    fn deploy_coordinator_menu(
+        &mut self,
+        task: Uuid,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.badge_menu.take();
+        let store = self.coordinators.read(cx);
+        let unavailable = store.disabled;
         let coordinator = store.get(task);
         let enabled = coordinator.is_some_and(|coordinator| coordinator.enabled);
         let provider = coordinator
@@ -2051,181 +2255,120 @@ impl AgentiumApp {
         let mode = coordinator
             .map(|coordinator| coordinator.effective_mode())
             .unwrap_or_default();
-        let runtime = self.coordinator_runtime.get(&task);
-        let error = store
-            .error()
-            .or_else(|| runtime.and_then(|runtime| runtime.error.clone()));
-        let pending = store
-            .jobs()
-            .values()
-            .filter(|job| job.task == Some(task) && job.summary.is_none())
-            .count();
-        let state = enabled.then(|| match self.coordinator_view(task) {
-            None => ("Not started", Color::Muted),
-            Some(view) => match self.item_state(view.item().as_ref(), cx) {
-                Some("permission") => ("Waiting for permission", Color::Warning),
-                Some("running") => ("Running", Color::Success),
-                Some("error") => ("Error", Color::Error),
-                _ => ("Idle", Color::Muted),
-            },
-        });
-        v_flex()
-            .min_w_0()
-            .gap_1()
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Label::new("Coordinator · Experimental")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+        let failed = enabled && self.coordinator_error(task, cx).is_some();
+        let context_menu = ContextMenu::build(window, cx, move |menu, window, _| {
+            let mut menu = menu;
+            if failed {
+                menu = menu
+                    .entry(
+                        "Retry",
+                        None,
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.retry_coordinator(task, window, cx);
+                        }),
                     )
-                    .child(
-                        Button::new("coordinator-toggle", if enabled { "Disable" } else { "Enable" })
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if enabled {
-                                    this.release_coordinator_focus(task, window, cx);
-                                }
-                                this.coordinators.update(cx, |store, cx| {
-                                    if store.disabled {
-                                        return;
-                                    }
-                                    store
-                                        .saved
-                                        .tasks
-                                        .entry(task)
-                                        .or_insert_with(|| Coordinator::new(provider))
-                                        .enabled = !enabled;
-                                    store.change(cx);
-                                });
-                                if enabled {
-                                    this.stop_coordinator(task, cx);
-                                }
-                                this.coordinator_tick(window, cx);
-                            })),
+                    .entry(
+                        "New Session",
+                        None,
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.start_new_coordinator_session(task, window, cx);
+                        }),
+                    );
+            }
+            if enabled {
+                return menu
+                    .entry(
+                        "Disable",
+                        None,
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.disable_coordinator(task, window, cx);
+                        }),
                     )
-                    .child(
-                        Button::new(
-                            "coordinator-mode",
-                            match mode {
-                                Mode::SummaryOnly => "Summary only",
-                                Mode::LimitedAuto => "Limited auto",
-                            },
-                        )
-                        .label_size(LabelSize::Small)
-                        .disabled(enabled || provider.claude_model().is_none())
-                        .tooltip(Tooltip::text(match provider.claude_model() {
-                            Some(_) => "Limited auto also answers agents' questions and files To do items",
-                            None => "Limited auto needs a Claude model",
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let (provider, mode) = match mode {
-                                Mode::SummaryOnly => (
-                                    match provider {
-                                        Provider::ClaudeHaiku => Provider::ClaudeSonnet,
-                                        provider => provider,
-                                    },
-                                    Mode::LimitedAuto,
-                                ),
-                                Mode::LimitedAuto => (provider, Mode::SummaryOnly),
-                            };
-                            this.change_coordinator_settings(task, provider, mode, cx);
-                        })),
-                    )
-                    .child(
-                        Button::new("coordinator-provider", {
-                            let (agent, model) = provider.names();
-                            format!("{agent} · {model}")
-                        })
-                        .label_size(LabelSize::Small)
-                        .disabled(enabled)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let mut next = provider.next();
-                            if mode == Mode::LimitedAuto && next.claude_model().is_none() {
-                                next = next.next();
-                            }
-                            this.change_coordinator_settings(task, next, mode, cx);
-                        })),
-                    )
-                    .when_some(state, |row, (label, color)| {
-                        row.child(
-                            Button::new("coordinator-state", label)
-                                .label_size(LabelSize::Small)
-                                .color(color)
-                                .tooltip(Tooltip::text("Open the Coordinator tab"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.coordinator_tab_open.insert(task);
-                                    cx.notify();
-                                })),
+                    .separator()
+                    .label(format!("Mode: {}", mode.label()))
+                    .label(format!("Model: {}", provider.label()));
+            }
+            let mode_this = this.clone();
+            let model_this = this.clone();
+            menu.item(
+                ContextMenuEntry::new("Enable")
+                    .disabled(unavailable)
+                    .handler(window.handler_for(&this, move |this, window, cx| {
+                        this.enable_coordinator(task, window, cx);
+                    })),
+            )
+            .separator()
+            .submenu("Mode", move |menu, window, _| {
+                [Mode::SummaryOnly, Mode::LimitedAuto]
+                    .into_iter()
+                    .fold(menu, |menu, option| {
+                        menu.toggleable_entry_disabled_when(
+                            option.label(),
+                            option == mode,
+                            unavailable || !settings_allowed(provider, option),
+                            IconPosition::Start,
+                            None,
+                            window.handler_for(&mode_this, move |this, _, cx| {
+                                this.change_coordinator_settings(task, provider, option, cx);
+                            }),
                         )
                     })
-                    .when(enabled, |row| {
-                        row.child(
-                            Label::new(format!("{pending} pending summaries"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    }),
-            )
-            .when_some(error, |column, error| {
-                column
-                    .child(Label::new(error).color(Color::Error))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Button::new("coordinator-retry", "Retry / reconnect").on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    let failed_connection = matches!(
-                                        this.coordinator_view(task),
-                                        Some(CoordinatorView::Codex(view))
-                                            if view.read(cx).state()
-                                                == crate::codex_acp_view::CodexAcpState::Error
-                                    );
-                                    if failed_connection {
-                                        this.release_coordinator_focus(task, window, cx);
-                                        this.stop_coordinator(task, cx);
-                                    }
-                                    let runtime = this.coordinator_runtime.entry(task).or_default();
-                                    if runtime.view.is_none() {
-                                        *runtime = Runtime::default();
-                                        runtime.start_requested = true;
-                                    } else {
-                                        runtime.error = None;
-                                        runtime.sent = None;
-                                        runtime.batch = None;
-                                        runtime.waiting_since = Some(Instant::now());
-                                    }
-                                    this.coordinators.update(cx, |store, cx| store.change(cx));
-                                    this.rewrite_failed_inbox_files(cx);
-                                    this.coordinator_tick(window, cx);
-                                }),
-                            ))
-                            .child(
-                                Button::new("coordinator-new-session", "Create new session")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.release_coordinator_focus(task, window, cx);
-                                        this.stop_coordinator(task, cx);
-                                        this.coordinators.update(cx, |store, cx| {
-                                            if let Some(coordinator) =
-                                                store.saved.tasks.get_mut(&task)
-                                            {
-                                                reset_session(coordinator);
-                                                store.change(cx);
-                                            }
-                                        });
-                                        this.coordinator_runtime
-                                            .entry(task)
-                                            .or_default()
-                                            .start_requested = true;
-                                        this.coordinator_tick(window, cx);
-                                    })),
-                            ),
-                    )
             })
-            .into_any_element()
+            .submenu("Model", move |menu, window, _| {
+                Provider::ALL.into_iter().fold(menu, |menu, option| {
+                    menu.toggleable_entry_disabled_when(
+                        option.label(),
+                        option == provider,
+                        unavailable || !settings_allowed(option, mode),
+                        IconPosition::Start,
+                        None,
+                        window.handler_for(&model_this, move |this, _, cx| {
+                            this.change_coordinator_settings(task, option, mode, cx);
+                        }),
+                    )
+                })
+            })
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Shown under the overview tabs only while something failed.
+    pub(crate) fn render_coordinator_error(
+        &self,
+        task: Uuid,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let error = self.coordinator_error(task, cx)?;
+        Some(
+            v_flex()
+                .min_w_0()
+                .gap_1()
+                .child(Label::new(error).color(Color::Error))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Button::new("coordinator-retry", "Retry / reconnect").on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.retry_coordinator(task, window, cx);
+                            }),
+                        ))
+                        .child(
+                            Button::new("coordinator-new-session", "Create new session").on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.start_new_coordinator_session(task, window, cx);
+                                }),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The Coordinator tab of the overview: the session itself, drawn only
@@ -2257,14 +2400,25 @@ impl AgentiumApp {
                 })
                 .child(view.clone().into_any_element())
                 .into_any_element(),
+            None if !self.coordinator_enabled(task, cx) => v_flex()
+                .p_4()
+                .gap_2()
+                .child(
+                    Label::new("The Task Coordinator is off. When on, it summarizes this task's agents in Task Overview. Right-click the Coordinator tab to choose its mode and model.")
+                        .color(Color::Muted),
+                )
+                .child(Button::new("coordinator-enable", "Enable").on_click(cx.listener(
+                    move |this, _, window, cx| this.enable_coordinator(task, window, cx),
+                )))
+                .into_any_element(),
             None => v_flex()
                 .p_4()
                 .gap_2()
                 .child(
-                    Label::new("The coordinator is not running. It starts when a summary is waiting.")
+                    Label::new("The coordinator starts on its own when there is something to summarize. Start it now to talk to it.")
                         .color(Color::Muted),
                 )
-                .child(Button::new("coordinator-start", "Start").on_click(cx.listener(
+                .child(Button::new("coordinator-start", "Start Now").on_click(cx.listener(
                     move |this, _, window, cx| {
                         let runtime = this.coordinator_runtime.entry(task).or_default();
                         *runtime = Runtime::default();
@@ -2286,8 +2440,8 @@ mod tests {
         HUB_DENIED_TOOLS, HUB_INSTRUCTIONS, HUB_SETTINGS, HUB_TOOLS, Job, Mode,
         Provider, SUMMARY_INSTRUCTIONS, SUMMARY_TOOLS, Saved, SentBatch, Source, Store, Summary,
         ack_is_current, apply_settings, batch_max_inbox_id, claude_arguments, complete,
-        finish_ack, hub_message, join_or_start_ack, observe, track_user_input,
-        unsummarized_jobs, v1_merge,
+        finish_ack, hub_message, join_or_start_ack, observe, settings_allowed, starts_on_enable,
+        track_user_input, unsummarized_jobs, v1_merge,
     };
     use futures::{FutureExt as _, future::Shared};
     use gpui::{
@@ -2618,6 +2772,28 @@ mod tests {
         assert!(apply_settings(&mut coordinator, Provider::ClaudeOpus, Mode::SummaryOnly, 10));
         assert!(apply_settings(&mut coordinator, Provider::ClaudeOpus, Mode::LimitedAuto, 10));
         assert_eq!(coordinator.acked_inbox_id, 90);
+    }
+
+    #[test]
+    fn limited_auto_can_be_chosen_only_with_a_claude_model() {
+        for provider in Provider::ALL {
+            assert!(settings_allowed(provider, Mode::SummaryOnly));
+        }
+        assert!(settings_allowed(Provider::ClaudeHaiku, Mode::LimitedAuto));
+        assert!(settings_allowed(Provider::ClaudeOpus, Mode::LimitedAuto));
+        assert!(!settings_allowed(Provider::CodexLuna, Mode::LimitedAuto));
+    }
+
+    #[test]
+    fn enabling_starts_at_once_only_a_claude_session_that_never_started() {
+        let mut coordinator = Coordinator::new(Provider::ClaudeSonnet);
+        assert!(starts_on_enable(&coordinator));
+        coordinator.claude_started = true;
+        assert!(!starts_on_enable(&coordinator));
+        // A settings change starts a new session, which may ask again.
+        assert!(apply_settings(&mut coordinator, Provider::ClaudeOpus, Mode::SummaryOnly, 0));
+        assert!(starts_on_enable(&coordinator));
+        assert!(!starts_on_enable(&Coordinator::new(Provider::CodexLuna)));
     }
 
     #[test]

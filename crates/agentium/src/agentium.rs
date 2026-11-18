@@ -8688,8 +8688,7 @@ impl AgentiumApp {
         )
     }
 
-    /// "Overview | Coordinator" under the heading of a task whose
-    /// coordinator is enabled.
+    /// "Overview | Coordinator" under the heading of every task.
     fn render_overview_tabs(
         &self,
         task_id: Uuid,
@@ -8707,17 +8706,7 @@ impl AgentiumApp {
                         cx.notify();
                     })),
             )
-            .child(
-                Button::new("overview-tab-coordinator", "Coordinator")
-                    .toggle_state(showing_coordinator)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.coordinator_tab_open.insert(task_id);
-                        if let Some(view) = this.coordinator_view(task_id) {
-                            window.focus(&view.focus_handle(cx), cx);
-                        }
-                        cx.notify();
-                    })),
-            )
+            .child(self.render_coordinator_tab(task_id, showing_coordinator, cx))
             .into_any_element()
     }
 
@@ -8798,10 +8787,9 @@ impl AgentiumApp {
             task_overview::OverviewScope::Task(task_id) => Some(task_id),
             task_overview::OverviewScope::Arena(_) => None,
         };
-        let coordinator_controls =
-            coordinator_task.map(|task_id| self.render_coordinator_controls(task_id, cx));
+        let coordinator_error =
+            coordinator_task.and_then(|task_id| self.render_coordinator_error(task_id, cx));
         let coordinator_tabs = coordinator_task
-            .filter(|task_id| self.coordinator_enabled(*task_id, cx))
             .map(|task_id| {
                 let showing_coordinator = self.coordinator_tab_open.contains(&task_id);
                 (task_id, showing_coordinator, self.render_overview_tabs(task_id, showing_coordinator, cx))
@@ -8817,8 +8805,8 @@ impl AgentiumApp {
                         .gap_4()
                         .child(heading)
                         .children(refresh_note)
-                        .children(coordinator_controls)
-                        .child(tabs),
+                        .child(tabs)
+                        .children(coordinator_error),
                 )
                 .child(self.render_coordinator_panel(task_id, cx))
                 .into_any_element();
@@ -8832,8 +8820,8 @@ impl AgentiumApp {
             .bg(colors.editor_background)
             .child(heading)
             .children(refresh_note)
-            .children(coordinator_controls)
-            .children(coordinator_tabs.map(|(_, _, tabs)| tabs));
+            .children(coordinator_tabs.map(|(_, _, tabs)| tabs))
+            .children(coordinator_error);
         let mut linked_prs = Vec::new();
         if let task_overview::OverviewScope::Task(task_id) = scope {
             if let Some(task) = self
