@@ -1433,12 +1433,19 @@ impl InboxTodoView {
         let colors = cx.theme().colors().clone();
         let todo_id = item.id;
         let rows = self.assignees.get(&todo_id).cloned().unwrap_or_default();
-        v_flex().min_w_0().gap_1().child(
+        // A user task is never sent to an agent, so assigning one hands
+        // nothing over; its assignee only names the agent that asked.
+        let editable = item.kind == InboxTodoKind::Proposal;
+        v_flex().min_w_0().gap_1().when(editable || !rows.is_empty(), |column| column.child(
         h_flex()
             .flex_wrap()
+            .justify_end()
             .gap_2()
             .items_center()
             .text_xs()
+            .when(!editable, |row| {
+                row.child(div().text_color(colors.text_muted).child("Asked by"))
+            })
             .when(rows.is_empty(), |row| {
                 row.child(div().text_color(colors.text_muted).child("Unassigned"))
             })
@@ -1488,7 +1495,7 @@ impl InboxTodoView {
                             })),
                         )
                     })
-                    .child(
+                    .when(editable, |row| row.child(
                         ui::IconButton::new(
                             SharedString::from(format!("todo-unassign-{todo_id}-{index}")),
                             IconName::Close,
@@ -1502,7 +1509,7 @@ impl InboxTodoView {
                                 asker: unassign_asker.clone(),
                             });
                         })),
-                    )
+                    ))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                         cx.stop_propagation();
                         cx.emit(InboxTodoViewEvent::OpenAssignee {
@@ -1511,7 +1518,7 @@ impl InboxTodoView {
                         });
                     }))
             }))
-            .child(
+            .when(editable, |row| row.child(
                 Button::new(
                     SharedString::from(format!("todo-assign-{todo_id}")),
                     "Assign…",
@@ -1524,7 +1531,7 @@ impl InboxTodoView {
                         position: event.position(),
                     });
                 })),
-            ))
+            ))))
             .when_some(self.pending_sessions.get(&todo_id).cloned(), |column, pending| {
                 let status_colors = cx.theme().status().clone();
                 column
