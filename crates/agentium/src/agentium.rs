@@ -422,7 +422,7 @@ pub fn coordinator_request_check(
     let request_type = request["type"].as_str().unwrap_or_default();
     match request_type {
         "coordinator_summary" | "hub_answer" | "hub_ack" | "todo_add" | "todo_assign"
-        | "todo_list" | "task_info" | "task_list" | "tab_list" | "tab_self" => Ok(()),
+        | "todo_list" | "todo_sort" | "task_info" | "task_list" | "tab_list" | "tab_self" => Ok(()),
         "coordinator_claude_turn" | "permission_request" => {
             anyhow::ensure!(
                 claude_session.is_some() && request["session_id"].as_str() == claude_session,
@@ -525,6 +525,9 @@ pub struct TodoListEntry {
     pub assignees: Vec<String>,
     /// Assigned to the calling session.
     pub mine: bool,
+    /// Listed under Off task: not needed to finish the task.
+    #[serde(default)]
+    pub aside: bool,
 }
 
 /// Whom `todo assign` points an item at.
@@ -4258,6 +4261,29 @@ impl AgentiumApp {
 
     /// The items of the caller's task (open ones unless `all`), and the
     /// pending questions of its arena.
+    /// Orders the task's open To do items. Agents may not: each would order
+    /// the list for its own work and undo the others' order.
+    pub fn todo_sort(
+        &mut self,
+        peer_ancestor_pids: &[u32],
+        ordered: Vec<u64>,
+        aside: Vec<u64>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let caller = self.todo_caller(peer_ancestor_pids, cx)?;
+        anyhow::ensure!(
+            caller.coordinator_task.is_some() || caller.asker.is_none(),
+            "only the Task Coordinator or your own shell can reorder To do items"
+        );
+        let scope = match (caller.coordinator_task, caller.arena_index) {
+            (Some(task_id), _) => self.todo_scope_for_task(task_id, cx),
+            (None, Some(index)) => self.todo_scope_for_arena(index, cx),
+            (None, None) => anyhow::bail!("run this from a terminal in an arena"),
+        };
+        self.inbox_todos
+            .update(cx, |todos, cx| todos.sort(&scope, &ordered, &aside, cx))
+    }
+
     pub fn todo_list(
         &self,
         peer_ancestor_pids: &[u32],
@@ -4281,7 +4307,9 @@ impl AgentiumApp {
             .iter()
             .filter(|item| scope.contains(item) && (all || item.is_open()))
             .collect();
-        items.sort_by_key(|item| item.id);
+        // Open items in the order Task Overview shows them, so the Task
+        // Coordinator sorts from what the user sees.
+        items.sort_by_key(|item| (!item.is_open(), inbox_todo_view::todo_display_key(item)));
         let items = items
             .into_iter()
             .map(|item| TodoListEntry {
@@ -4301,6 +4329,7 @@ impl AgentiumApp {
                     .asker
                     .as_ref()
                     .is_some_and(|asker| item.is_assigned_to(asker)),
+                aside: item.aside,
             })
             .collect();
         let questions = self.inbox_questions.iter()
@@ -4754,6 +4783,13 @@ impl AgentiumApp {
                         view.update(cx, |view, cx| view.set_error(Some(format!("{error:#}")), cx))
                     }
                 }
+            }
+            inbox_todo_view::InboxTodoViewEvent::ItemMenu {
+                todo_id,
+                aside,
+                position,
+            } => {
+                self.deploy_todo_item_menu(*todo_id, *aside, *position, view.downgrade(), window, cx);
             }
             inbox_todo_view::InboxTodoViewEvent::Assign { todo_id, position } => {
                 self.deploy_assign_menu(*todo_id, *position, window, cx);
@@ -6293,6 +6329,43 @@ impl AgentiumApp {
                 None,
                 window.handler_for(&this, move |this, _window, cx| {
                     this.archive_task(task_id, cx);
+                }),
+            )
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Moves a To do item between its group and Off task.
+    fn deploy_todo_item_menu(
+        &mut self,
+        todo_id: u64,
+        aside: bool,
+        position: Point<Pixels>,
+        view: WeakEntity<inbox_todo_view::InboxTodoView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity();
+        self.badge_menu.take();
+        let context_menu = ContextMenu::build(window, cx, |menu, window, _| {
+            menu.entry(
+                if aside { "Back to Task" } else { "Move to Off Task" },
+                None,
+                window.handler_for(&this, move |this, _window, cx| {
+                    let result = this
+                        .inbox_todos
+                        .update(cx, |todos, cx| todos.set_aside(todo_id, !aside, cx));
+                    if let Err(error) = result {
+                        view.update(cx, |view, cx| view.set_error(Some(format!("{error:#}")), cx))
+                            .log_err();
+                    }
                 }),
             )
         });
@@ -10093,7 +10166,7 @@ impl AgentiumApp {
         }
         // One row per task (or task-less arena) that has open items.
         let mut todo_rows: Vec<(task_overview::OverviewScope, InboxTodoRow)> = Vec::new();
-        for item in todos.items().iter().filter(|item| item.is_open()) {
+        for item in todos.items().iter().filter(|item| item.is_open() && !item.aside) {
             let Some(scope) = self.overview_scope_for_todo(item, cx) else {
                 continue;
             };
@@ -10837,7 +10910,7 @@ impl AgentiumApp {
             .read(cx)
             .items()
             .iter()
-            .filter(|item| item.is_open() && todo_scope.contains(item))
+            .filter(|item| item.is_open() && !item.aside && todo_scope.contains(item))
             .count()
             + self
                 .inbox_questions
@@ -12323,7 +12396,7 @@ mod tests {
     fn a_coordinator_may_only_file_summarize_answer_and_report_itself() {
         let allowed = [
             "coordinator_summary", "hub_answer", "hub_ack", "todo_add", "todo_assign",
-            "todo_list", "task_info", "task_list", "tab_list", "tab_self",
+            "todo_list", "todo_sort", "task_info", "task_list", "tab_list", "tab_self",
         ];
         for request_type in allowed {
             let request = serde_json::json!({ "type": request_type });

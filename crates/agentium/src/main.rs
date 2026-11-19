@@ -310,6 +310,16 @@ enum TodoAction {
         #[arg(long, allow_hyphen_values = true)]
         detail: Option<String>,
     },
+    /// Order this task's open items, most important first. For the Task
+    /// Coordinator and your own shell, not agents. Name every open item
+    /// once, from `todo list`: `todo sort 12 9 4 --aside 7 3`
+    Sort {
+        /// Item ids in the order to show them; Pick and You do each keep it
+        ids: Vec<u64>,
+        /// Items not needed to finish this task, shown apart under Off task
+        #[arg(long, num_args = 1..)]
+        aside: Vec<u64>,
+    },
     /// Print this task's open items and this arena's pending questions
     List {
         /// Include done items
@@ -1071,6 +1081,11 @@ fn print_todo_entries(items: &[agentium::TodoListEntry]) {
             item.assignees.join(", ")
         };
         let mine = if item.mine { " (yours)" } else { "" };
+        let state = if item.aside {
+            format!("{state}, off task")
+        } else {
+            state.to_string()
+        };
         match &item.detail {
             Some(detail) => println!(
                 "#{} [{kind}, {state}] {} :: {detail} — {assignees}{mine}",
@@ -1185,6 +1200,18 @@ fn run_todo_action(action: TodoAction) -> anyhow::Result<()> {
                 "detail": detail,
             }))?;
             println!("To do #{id} updated.");
+            Ok(())
+        }
+        TodoAction::Sort { ids, aside } => {
+            if ids.is_empty() && aside.is_empty() {
+                anyhow::bail!("give the id of every open item, from `agentium todo list`");
+            }
+            cli_request(serde_json::json!({
+                "type": "todo_sort",
+                "ids": ids,
+                "aside": aside,
+            }))?;
+            println!("To do order saved.");
             Ok(())
         }
         TodoAction::List { all } => {
@@ -1910,6 +1937,8 @@ mod inbox_cli_tests {
         assert!(Args::try_parse_from(["agentium", "todo", "assign", "7", "--arena", "/src/zed"]).is_err());
         assert!(Args::try_parse_from(["agentium", "todo", "done", "7", "--note", "pushed"]).is_ok());
         assert!(Args::try_parse_from(["agentium", "todo", "list", "--all"]).is_ok());
+        assert!(Args::try_parse_from(["agentium", "todo", "sort", "12", "9", "--aside", "7", "3"]).is_ok());
+        assert!(Args::try_parse_from(["agentium", "todo", "sort", "--aside", "7"]).is_ok());
     }
 
     #[test]
@@ -2512,6 +2541,10 @@ fn handle_cli_request(
                 )
             })
             .map(|()| serde_json::json!({ "ok": true })),
+        Some("todo_sort") => todo_ids(&request, "ids")
+            .and_then(|ordered| Ok((ordered, todo_ids(&request, "aside")?)))
+            .and_then(|(ordered, aside)| app.todo_sort(peer_ancestor_pids, ordered, aside, cx))
+            .map(|()| serde_json::json!({ "ok": true })),
         Some("todo_list") => app
             .todo_list(
                 peer_ancestor_pids,
@@ -2525,6 +2558,11 @@ fn handle_cli_request(
     Task::ready(
         result.unwrap_or_else(|error| serde_json::json!({ "ok": false, "error": format!("{error:#}") })),
     )
+}
+
+fn todo_ids(request: &serde_json::Value, key: &str) -> anyhow::Result<Vec<u64>> {
+    serde_json::from_value(request[key].clone())
+        .map_err(|error| anyhow::anyhow!("malformed todo_sort `{key}`: {error}"))
 }
 
 fn todo_id(request: &serde_json::Value) -> anyhow::Result<u64> {

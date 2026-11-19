@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
+    Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point,
     Refineable as _, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, TextStyleRefinement, UnderlineStyle, Window, div, prelude::FluentBuilder as _,
     px, rems,
@@ -127,6 +128,13 @@ pub struct TodoItem {
     pub resolution: Option<TodoResolution>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Position in the task's order from `todo sort`. `None` until then,
+    /// which puts the item after the ordered ones of its group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
+    /// Not needed to finish the task: listed apart, under Off task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub aside: bool,
 }
 
 impl TodoItem {
@@ -535,6 +543,8 @@ fn migrate_legacy_lists(
                 resolution: None,
                 created_at: list.updated_at,
                 updated_at: list.updated_at,
+                rank: None,
+                aside: false,
             });
         }
         // Ids of the old lists shared the Inbox counter; keep moving past them.
@@ -723,10 +733,52 @@ impl InboxTodos {
             resolution: None,
             created_at: now,
             updated_at: now,
+            rank: None,
+            aside: false,
         });
         self.persist(cx);
         cx.notify();
         Ok(id)
+    }
+
+    /// Orders the scope's open items as `todo sort` listed them; `aside`
+    /// moves its items under Off task, in its own order.
+    pub(crate) fn sort(
+        &mut self,
+        scope: &TodoScope,
+        ordered: &[u64],
+        aside: &[u64],
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let open: Vec<u64> = self
+            .items
+            .iter()
+            .filter(|item| item.is_open() && scope.contains(item))
+            .map(|item| item.id)
+            .collect();
+        check_sort(&open, ordered, aside)?;
+        for (rank, todo_id) in ordered.iter().chain(aside).enumerate() {
+            let item = self.item_mut(*todo_id)?;
+            item.rank = Some(rank as u32);
+            item.aside = aside.contains(todo_id);
+        }
+        self.persist(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn set_aside(
+        &mut self,
+        todo_id: u64,
+        aside: bool,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let item = self.item_mut(todo_id)?;
+        anyhow::ensure!(item.is_open(), "To do item #{todo_id} is already done");
+        item.aside = aside;
+        self.persist(cx);
+        cx.notify();
+        Ok(())
     }
 
     /// Adds a session to the item. Anyone may do this (see `may_write`).
@@ -1113,6 +1165,12 @@ pub(crate) enum InboxTodoViewEvent {
         todo_ids: Vec<u64>,
         notes: HashMap<u64, String>,
     },
+    /// Right-click on an item: the app shows its menu.
+    ItemMenu {
+        todo_id: u64,
+        aside: bool,
+        position: Point<Pixels>,
+    },
     /// The user wants to pick a session for the item; the app shows the menu.
     Assign {
         todo_id: u64,
@@ -1187,6 +1245,7 @@ pub(crate) struct InboxTodoView {
     error: Option<String>,
     last_report: Option<SendReport>,
     show_done: bool,
+    show_aside: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -1211,6 +1270,7 @@ impl InboxTodoView {
             error: None,
             last_report: None,
             show_done: false,
+            show_aside: false,
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![subscription],
         };
@@ -1265,11 +1325,7 @@ impl InboxTodoView {
             .filter(|item| item.is_open() && self.scope.contains(item))
             .cloned()
             .collect();
-        items.sort_by(|a, b| {
-            kind_rank(a.kind)
-                .cmp(&kind_rank(b.kind))
-                .then(b.updated_at.cmp(&a.updated_at))
-        });
+        items.sort_by_key(todo_display_key);
         items
     }
 
@@ -1588,6 +1644,7 @@ impl InboxTodoView {
         let colors = cx.theme().colors().clone();
         let todo_color = inbox_todo_color();
         let todo_id = item.id;
+        let aside = item.aside;
         let choices: &[TodoChoice] = match item.kind {
             InboxTodoKind::UserTask => &[TodoChoice::Done],
             InboxTodoKind::Proposal => &[TodoChoice::Go, TodoChoice::Skip],
@@ -1624,6 +1681,17 @@ impl InboxTodoView {
             })
             .bg(colors.element_background)
             .when(choice == Some(TodoChoice::Skip), |d| d.opacity(0.6))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(InboxTodoViewEvent::ItemMenu {
+                        todo_id,
+                        aside,
+                        position: event.position,
+                    });
+                }),
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -1667,6 +1735,8 @@ impl InboxTodoView {
                             .rounded_sm()
                             .border_1()
                             .border_color(colors.border)
+                            // The editor opens its own menu on right-click.
+                            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                             .child(editor),
                     )
                 },
@@ -1741,6 +1811,57 @@ fn kind_rank(kind: InboxTodoKind) -> u8 {
         InboxTodoKind::Proposal => 0,
         InboxTodoKind::UserTask => 1,
     }
+}
+
+/// The order Task Overview and `todo list` show open items in: Pick, You
+/// do, then Off task, each in `todo sort` order with the items added since
+/// last, by id. Not by last update: assigning or sending Go would move an
+/// item to the top.
+pub(crate) fn todo_display_key(item: &TodoItem) -> (u8, u32, u64) {
+    let group = if item.aside { 2 } else { kind_rank(item.kind) };
+    (group, item.rank.unwrap_or(u32::MAX), item.id)
+}
+
+/// `todo sort` must name every open item once, so an order made from a
+/// stale `todo list` fails instead of silently burying newer items.
+fn check_sort(open: &[u64], ordered: &[u64], aside: &[u64]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut repeated = Vec::new();
+    let mut unknown = Vec::new();
+    for todo_id in ordered.iter().chain(aside) {
+        if !seen.insert(*todo_id) {
+            repeated.push(*todo_id);
+        } else if !open.contains(todo_id) {
+            unknown.push(*todo_id);
+        }
+    }
+    let missing: Vec<u64> = open
+        .iter()
+        .filter(|todo_id| !seen.contains(*todo_id))
+        .copied()
+        .collect();
+    let ids = |ids: &[u64]| {
+        ids.iter()
+            .map(|todo_id| format!("#{todo_id}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("missing {}", ids(&missing)));
+    }
+    if !unknown.is_empty() {
+        problems.push(format!("not open in this task {}", ids(&unknown)));
+    }
+    if !repeated.is_empty() {
+        problems.push(format!("listed twice {}", ids(&repeated)));
+    }
+    anyhow::ensure!(
+        problems.is_empty(),
+        "list every open item of this task once ({}); run `agentium todo list` and try again",
+        problems.join("; ")
+    );
+    Ok(())
 }
 
 fn done_title(item: &TodoItem) -> String {
@@ -1840,11 +1961,24 @@ impl Render for InboxTodoView {
         };
         let mut proposals = Vec::new();
         let mut user_tasks = Vec::new();
+        let mut aside_items = Vec::new();
+        let aside_count = items.iter().filter(|item| item.aside).count();
+        // A chosen item moved under Off task (by `todo sort` or the menu)
+        // would otherwise be sent or closed without being seen.
+        let aside_chosen = items
+            .iter()
+            .zip(&choices)
+            .any(|(item, choice)| item.aside && choice.is_some());
+        let show_aside = self.show_aside || aside_chosen;
         for (item, choice) in items.iter().zip(choices) {
+            if item.aside && !show_aside {
+                continue;
+            }
             let element = self.render_item(item, choice, &styles, cx).into_any_element();
-            match item.kind {
-                InboxTodoKind::Proposal => proposals.push(element),
-                InboxTodoKind::UserTask => user_tasks.push(element),
+            match (item.aside, item.kind) {
+                (true, _) => aside_items.push(element),
+                (false, InboxTodoKind::Proposal) => proposals.push(element),
+                (false, InboxTodoKind::UserTask) => user_tasks.push(element),
             }
         }
         let report = self.last_report.as_ref().map(|report| {
@@ -1872,6 +2006,34 @@ impl Render for InboxTodoView {
             })
             .when(!user_tasks.is_empty(), |d| {
                 d.child(group("You do", "Done when finished")).children(user_tasks)
+            })
+            .when(aside_count > 0, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .mt_2()
+                        .child(
+                            Button::new(
+                                "todo-aside-toggle",
+                                format!(
+                                    "{} Off task · {aside_count}",
+                                    if show_aside { "▾" } else { "▸" }
+                                ),
+                            )
+                            .disabled(aside_chosen)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_aside = !this.show_aside;
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(colors.text_placeholder)
+                                .child("Not needed to finish this task"),
+                        ),
+                )
+                .children(aside_items)
             })
             .when(!items.is_empty(), |column| {
                 column.child(
@@ -1935,6 +2097,7 @@ mod tests {
         TodoDraft, TodoItem, TodoOutcome, TodoScope, TodoState, acp_restore_outcome,
         advance_pending_restores, find_item_location, parse_todo_file, prune_done,
         record_restore_launch, send_button_label, todo_request_message, todo_restore_plan,
+        check_sort, todo_display_key,
     };
     use crate::InboxAsker;
     use crate::arena::Arena;
@@ -2023,6 +2186,8 @@ mod tests {
             resolution: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            rank: None,
+            aside: false,
         };
         let scope_a = TodoScope {
             task_id: Some(task_a),
@@ -2123,6 +2288,64 @@ mod tests {
         });
         // Done items reject every further write.
         assert!(todos.update(cx, |todos, cx| todos.assign(id, assignee("s3", None), cx)).is_err());
+    }
+
+    #[gpui::test]
+    fn sorting_orders_each_group_and_moves_off_task_items_apart(cx: &mut TestAppContext) {
+        let todos = store(cx);
+        let mut next_id = 1;
+        let task = Uuid::new_v4();
+        let scope = TodoScope {
+            task_id: Some(task),
+            arena_paths: Vec::new(),
+            arena_names: Vec::new(),
+        };
+        let mut add = |kind, title: &str, cx: &mut TestAppContext| {
+            todos.update(cx, |todos, cx| todos.add(draft(kind, title, Some(task)), &mut next_id, cx).unwrap())
+        };
+        let first = add(InboxTodoKind::Proposal, "First", cx);
+        let second = add(InboxTodoKind::Proposal, "Second", cx);
+        let user = add(InboxTodoKind::UserTask, "Verify", cx);
+        let third = add(InboxTodoKind::Proposal, "Third", cx);
+        let shown = |cx: &mut TestAppContext| {
+            todos.read_with(cx, |todos, _| {
+                let mut items: Vec<&TodoItem> =
+                    todos.items().iter().filter(|item| item.is_open()).collect();
+                items.sort_by_key(|item| todo_display_key(item));
+                items.iter().map(|item| item.id).collect::<Vec<_>>()
+            })
+        };
+        // Unsorted, each group keeps the order the items were added in.
+        assert_eq!(shown(cx), vec![first, second, third, user]);
+
+        todos
+            .update(cx, |todos, cx| todos.sort(&scope, &[third, user, first], &[second], cx))
+            .unwrap();
+        assert_eq!(shown(cx), vec![third, first, user, second]);
+        todos.read_with(cx, |todos, _| assert!(todos.item(second).unwrap().aside));
+
+        // An item added since the last sort waits at the end of its group.
+        let added = add(InboxTodoKind::Proposal, "Added", cx);
+        assert_eq!(shown(cx), vec![third, first, added, user, second]);
+        let error = todos
+            .update(cx, |todos, cx| todos.sort(&scope, &[third, user, first], &[second], cx))
+            .unwrap_err();
+        assert!(error.to_string().contains(&format!("missing #{added}")), "{error}");
+
+        todos.update(cx, |todos, cx| todos.set_aside(second, false, cx)).unwrap();
+        assert_eq!(shown(cx), vec![third, first, second, added, user]);
+    }
+
+    #[test]
+    fn a_sort_must_name_every_open_item_once() {
+        assert!(check_sort(&[1, 2, 3], &[3, 1], &[2]).is_ok());
+        assert!(check_sort(&[], &[], &[]).is_ok());
+        let error = check_sort(&[1, 2, 3], &[3, 9, 3], &[]).unwrap_err().to_string();
+        assert!(error.contains("missing #1, #2"), "{error}");
+        assert!(error.contains("not open in this task #9"), "{error}");
+        assert!(error.contains("listed twice #3"), "{error}");
+        let error = check_sort(&[1, 2], &[1], &[1, 2]).unwrap_err().to_string();
+        assert!(error.contains("listed twice #1"), "{error}");
     }
 
     #[gpui::test]
@@ -2438,6 +2661,8 @@ mod tests {
                 }),
                 created_at: now,
                 updated_at: now,
+                rank: None,
+                aside: false,
             };
             if id == 3 {
                 // An open item is never pruned, however old.
@@ -2468,6 +2693,8 @@ mod tests {
             resolution: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            rank: None,
+            aside: false,
         };
         let a = item(3, "Add tests", Some("rebinding"));
         let b = item(8, "Open a PR", None);
@@ -2504,6 +2731,8 @@ mod tests {
             resolution: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            rank: None,
+            aside: false,
         };
         assert_eq!(
             todo_request_message(&[(&item, Some("Tell me if anything else remains\nafter this"))]),
