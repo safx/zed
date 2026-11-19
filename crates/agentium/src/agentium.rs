@@ -1261,6 +1261,68 @@ struct TaskStatusDots {
     busy: TaskStateDot,
 }
 
+/// Agent states the dot left of a task's name can show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskDotState {
+    Permission,
+    Error,
+    Ready,
+    Running,
+}
+
+impl TaskDotState {
+    /// An agent blocked on the user (a permission prompt, then a failure)
+    /// comes before one that finished and waits for review; a running one
+    /// needs nothing from the user.
+    const BY_URGENCY: [Self; 4] = [Self::Permission, Self::Error, Self::Ready, Self::Running];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Error => "error",
+            Self::Ready => "ready",
+            Self::Running => "running",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Permission => "waiting for permission",
+            Self::Error => "failed",
+            Self::Ready => "completed",
+            Self::Running => "running",
+        }
+    }
+}
+
+impl TaskStatusDots {
+    fn get(&self, state: TaskDotState) -> &TaskStateDot {
+        match state {
+            TaskDotState::Permission => &self.permission,
+            TaskDotState::Error => &self.error,
+            TaskDotState::Ready => &self.ready,
+            TaskDotState::Running => &self.running,
+        }
+    }
+
+    /// The one state the task's dot shows.
+    fn most_urgent(&self) -> Option<TaskDotState> {
+        TaskDotState::BY_URGENCY
+            .into_iter()
+            .find(|state| self.get(*state).count > 0)
+    }
+
+    /// The states the single dot hides, for its tooltip.
+    fn others_than(&self, shown: TaskDotState) -> Option<String> {
+        let others: Vec<String> = TaskDotState::BY_URGENCY
+            .into_iter()
+            .filter(|state| *state != shown && self.get(*state).count > 0)
+            .map(|state| format!("{} {}", self.get(state).count, state.description()))
+            .collect();
+        (!others.is_empty()).then(|| format!("Also {}", others.join(", ")))
+    }
+}
+
 #[derive(Clone)]
 enum WorktreeRow {
     Live { arena_index: usize },
@@ -10674,61 +10736,92 @@ impl AgentiumApp {
         dots
     }
 
-    /// One dot per agent state present in the task, in the badge order the
-    /// per-arena rows use. Clicking a dot shows the task and opens the same
-    /// terminal menu as the per-arena badge.
-    fn render_task_dots(
+    /// The dot left of a task's name: only its most urgent agent state, so
+    /// the eye lands on the tasks that need the user. Its slot is kept when
+    /// there is no dot, so task names line up.
+    fn render_task_state_dot(
         &self,
         task_id: Uuid,
-        dots: TaskStatusDots,
+        dots: &TaskStatusDots,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let status_colors = cx.theme().status().clone();
-        let states = [
-            ("permission", dots.permission, status_colors.warning),
-            ("running", dots.running, status_colors.success),
-            ("ready", dots.ready, colors.text_accent),
-            ("error", dots.error, status_colors.error),
-            ("busy", dots.busy, colors.text),
-        ];
-        h_flex()
-            .items_center()
-            .flex_shrink_0()
-            .children(states.into_iter().filter_map(|(name, dot, color)| {
-                let arena_index = dot.first_arena?;
-                let entries = dot.entries;
-                let tooltip_entries = entries.clone();
-                // The hit area is larger than the dot: an 8px target was
-                // too small to click reliably.
-                Some(
-                    div()
-                        .id(SharedString::from(format!("task-dot-{name}-{task_id}")))
-                        .size(px(18.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .hover(|hit_area| hit_area.bg(colors.element_hover))
-                        .cursor_pointer()
-                        .child(div().size(px(10.0)).rounded_full().bg(color))
-                        .tooltip(Tooltip::element(move |_window, cx| {
-                            render_badge_tooltip(&tooltip_entries, cx)
-                        }))
-                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.select_task(task_id, window, cx);
-                            this.switch_arena(arena_index, window, cx);
-                            this.deploy_badge_menu(
-                                arena_index,
-                                entries.clone(),
-                                event.position(),
-                                window,
-                                cx,
-                            );
-                        })),
-                )
-            }))
+        let dot = dots.most_urgent().and_then(|state| {
+            let color = match state {
+                TaskDotState::Permission => status_colors.warning,
+                TaskDotState::Error => status_colors.error,
+                TaskDotState::Ready => colors.text_accent,
+                TaskDotState::Running => status_colors.success,
+            };
+            self.render_task_dot(
+                task_id,
+                state.name(),
+                dots.get(state),
+                color,
+                dots.others_than(state),
+                cx,
+            )
+        });
+        div().size(px(18.0)).flex_shrink_0().children(dot)
+    }
+
+    /// Clicking a dot shows the task and opens the same terminal menu as
+    /// the per-arena badge.
+    fn render_task_dot(
+        &self,
+        task_id: Uuid,
+        name: &'static str,
+        dot: &TaskStateDot,
+        color: Hsla,
+        others: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let arena_index = dot.first_arena?;
+        let entries = dot.entries.clone();
+        let tooltip_entries = dot.entries.clone();
+        let hover = cx.theme().colors().element_hover;
+        // The hit area is larger than the dot: an 8px target was too small
+        // to click reliably.
+        Some(
+            div()
+                .id(SharedString::from(format!("task-dot-{name}-{task_id}")))
+                .size(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .hover(|hit_area| hit_area.bg(hover))
+                .cursor_pointer()
+                .child(div().size(px(10.0)).rounded_full().bg(color))
+                .tooltip(Tooltip::element(move |_window, cx| {
+                    v_flex()
+                        .gap_1()
+                        .child(render_badge_tooltip(&tooltip_entries, cx))
+                        .when_some(others.clone(), |column, others| {
+                            column.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .child(others),
+                            )
+                        })
+                        .into_any_element()
+                }))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.select_task(task_id, window, cx);
+                    this.switch_arena(arena_index, window, cx);
+                    this.deploy_badge_menu(
+                        arena_index,
+                        entries.clone(),
+                        event.position(),
+                        window,
+                        cx,
+                    );
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Open To do items in `todo_scope` plus unanswered questions of the
@@ -11056,6 +11149,7 @@ impl AgentiumApp {
                 .cursor_pointer()
                 .when(is_selected, |d| d.bg(colors.element_selected))
                 .when(!is_selected, |d| d.hover(|d| d.bg(colors.element_hover)))
+                .child(self.render_task_state_dot(task_id, &dots, cx))
                 .child(if is_renaming {
                     div()
                         .flex_1()
@@ -11071,7 +11165,14 @@ impl AgentiumApp {
                         .child(task.title.clone())
                         .into_any_element()
                 })
-                .child(self.render_task_dots(task_id, dots, cx))
+                .children(self.render_task_dot(
+                    task_id,
+                    "busy",
+                    &dots.busy,
+                    colors.text,
+                    None,
+                    cx,
+                ))
                 .when(todo_count > 0, |row| {
                     row.child(
                         render_arena_pill(
@@ -12146,6 +12247,7 @@ mod tests {
         ClaudeSessionState, InboxAsker, InboxOption, InboxQuestion, WorktreeRow, permission_summary, backlog_issue_keys_in_branch, next_title_driven_state,
         parse_backlog_remote, pr_ref_matches_remote, sender_label, tail_lines, task_fetch_inputs,
         tasks_sharing_arena, with_from_line, resolve_selected_task, arena_to_open_for_task,
+        TaskDotState, TaskStateDot, TaskStatusDots,
     };
     use crate::arena::TitleState;
     use crate::board::{BoardTask, IssueLink, IssueRef, PrRef};
@@ -13024,6 +13126,32 @@ mod tests {
         assert_eq!(resolve_selected_task(Some(other), &[first, second]), Some(first));
         assert_eq!(resolve_selected_task(None, &[first, second]), Some(first));
         assert_eq!(resolve_selected_task(Some(other), &[]), None);
+    }
+
+    #[test]
+    fn a_task_shows_only_the_state_that_most_needs_the_user() {
+        let present = |count| TaskStateDot {
+            count,
+            first_arena: Some(0),
+            entries: Vec::new(),
+        };
+        let mut dots = TaskStatusDots::default();
+        assert_eq!(dots.most_urgent(), None);
+        dots.running = present(2);
+        assert_eq!(dots.most_urgent(), Some(TaskDotState::Running));
+        assert_eq!(dots.others_than(TaskDotState::Running), None);
+        dots.ready = present(1);
+        assert_eq!(dots.most_urgent(), Some(TaskDotState::Ready));
+        dots.error = present(1);
+        assert_eq!(dots.most_urgent(), Some(TaskDotState::Error));
+        dots.permission = present(1);
+        // A busy non-agent process never takes the left dot.
+        dots.busy = present(3);
+        assert_eq!(dots.most_urgent(), Some(TaskDotState::Permission));
+        assert_eq!(
+            dots.others_than(TaskDotState::Permission).as_deref(),
+            Some("Also 1 failed, 1 completed, 2 running")
+        );
     }
 
     #[test]
