@@ -2000,6 +2000,50 @@ impl Render for InboxTodoView {
             .when(items.is_empty(), |column| {
                 column.child(div().text_color(colors.text_muted).child("No pending To do items."))
             })
+            .when(!items.is_empty(), |column| {
+                let message = match (self.error.clone(), report) {
+                    (Some(error), _) => Some((error, cx.theme().status().error)),
+                    (None, Some(report)) => Some((report, colors.text_muted)),
+                    (None, None) => None,
+                };
+                // Above the groups, next to the items read first. The row
+                // keeps a button's height when it has no buttons, so
+                // choosing the first item does not shift the list.
+                column.child(
+                    h_flex()
+                        .min_h_6()
+                        .gap_2()
+                        .items_center()
+                        .when(has_choices, |row| {
+                            row.child(
+                                Button::new("inbox-todo-send", send_label)
+                                    .disabled(!can_send)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.send(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("inbox-todo-clear", "Clear choices").on_click(
+                                    cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                        let ids = chosen_ids.clone();
+                                        this.todos
+                                            .update(cx, |todos, cx| todos.clear_choices(&ids, cx));
+                                    }),
+                                ),
+                            )
+                        })
+                        .when_some(message, |row, (message, color)| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(color)
+                                    .child(message),
+                            )
+                        }),
+                )
+            })
             .when(!proposals.is_empty(), |d| {
                 d.child(group("Pick", "Go to have the agent do it, Skip to drop it"))
                     .children(proposals)
@@ -2034,53 +2078,6 @@ impl Render for InboxTodoView {
                         ),
                 )
                 .children(aside_items)
-            })
-            .when(!items.is_empty(), |column| {
-                column.child(
-                    v_flex()
-                        .mt_2()
-                        .gap_1()
-                        .when_some(self.error.clone(), |d, error| {
-                            d.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().status().error)
-                                    .child(error),
-                            )
-                        })
-                        .when_some(report, |d, report| {
-                            d.child(div().text_sm().text_color(colors.text_muted).child(report))
-                        })
-                        // Hidden rather than removed, so choosing the first
-                        // item does not shift the list.
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .when(!has_choices, |row| row.invisible())
-                                .child(
-                                    Button::new("inbox-todo-send", send_label)
-                                        .disabled(!can_send)
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                            this.send(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("inbox-todo-clear", "Clear choices")
-                                        .disabled(!has_choices)
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                            let ids = chosen_ids.clone();
-                                            this.todos
-                                                .update(cx, |todos, cx| todos.clear_choices(&ids, cx));
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(colors.text_placeholder)
-                                        .child("cmd-enter applies. Go sends the item to its assigned agent, which closes it with `todo done` when finished; Skip and Done close it without sending anything."),
-                                ),
-                        ),
-                )
             })
             .child(self.render_done(&styles, cx))
             .into_any_element()
