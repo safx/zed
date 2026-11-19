@@ -99,6 +99,15 @@ impl Mode {
             Self::LimitedAuto => "Limited auto",
         }
     }
+
+    /// The overview tab is named after what the coordinator does: in
+    /// summary only mode it does nothing but summarize.
+    fn tab_label(self) -> &'static str {
+        match self {
+            Self::SummaryOnly => "Summarizer",
+            Self::LimitedAuto => "Coordinator",
+        }
+    }
 }
 
 /// Limited auto relies on launch flags that only Claude takes.
@@ -1439,14 +1448,14 @@ impl AgentiumApp {
             .waiting_since
             .is_some_and(|since| since.elapsed() > Duration::from_secs(60))
         {
-            runtime.error = Some("Coordinator did not become ready. Open the Coordinator tab to check it (its first start asks to trust its folder), then retry.".into());
+            runtime.error = Some("Coordinator did not become ready. Open its tab beside Overview to check it (its first start asks to trust its folder), then retry.".into());
             cx.notify();
             return;
         }
         match &view {
             CoordinatorView::Codex(codex) => {
                 if codex.read(cx).state() == crate::codex_acp_view::CodexAcpState::Error {
-                    runtime.error = Some("Coordinator connection failed. Open the Coordinator tab to check it, then retry or create a new session.".into());
+                    runtime.error = Some("Coordinator connection failed. Open its tab beside Overview to check it, then retry or create a new session.".into());
                     cx.notify();
                     return;
                 }
@@ -1521,7 +1530,7 @@ impl AgentiumApp {
             } else {
                 if sent_at.elapsed() > Duration::from_secs(300) {
                     runtime.error = Some(
-                        "Summary has not arrived. Open the Coordinator tab to check it, then retry."
+                        "Summary has not arrived. Open its tab beside Overview to check it, then retry."
                             .into(),
                     );
                     cx.notify();
@@ -1581,7 +1590,7 @@ impl AgentiumApp {
             } else {
                 if batch.at.elapsed() > HUB_BATCH_TIMEOUT {
                     runtime.error = Some(
-                        "The hub has not acknowledged its batch. Open the Coordinator tab to check it, then retry."
+                        "The hub has not acknowledged its batch. Open its tab beside Overview to check it, then retry."
                             .into(),
                     );
                     cx.notify();
@@ -2215,7 +2224,7 @@ impl AgentiumApp {
                 }),
             )
             .child(
-                Button::new("overview-tab-coordinator", "Coordinator")
+                Button::new("overview-tab-coordinator", mode.tab_label())
                     .toggle_state(showing_coordinator)
                     .when_some(state, |button, (_, color)| {
                         button.start_icon(
@@ -2404,7 +2413,7 @@ impl AgentiumApp {
                 .p_4()
                 .gap_2()
                 .child(
-                    Label::new("The Task Coordinator is off. When on, it summarizes this task's agents in Task Overview. Right-click the Coordinator tab to choose its mode and model.")
+                    Label::new("The Task Coordinator is off. When on, it summarizes this task's agents in Task Overview. Right-click this tab to choose its mode and model.")
                         .color(Color::Muted),
                 )
                 .child(Button::new("coordinator-enable", "Enable").on_click(cx.listener(
